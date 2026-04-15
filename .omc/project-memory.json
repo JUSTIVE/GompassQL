@@ -1,0 +1,306 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1776265365983,
+  "projectRoot": "/Users/ben/git/personal/GompassQL",
+  "techStack": {
+    "languages": [
+      {
+        "name": "JavaScript/TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "package.json"
+        ]
+      },
+      {
+        "name": "TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "tsconfig.json"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "react",
+        "version": "19",
+        "category": "frontend"
+      },
+      {
+        "name": "react-dom",
+        "version": "19",
+        "category": "frontend"
+      }
+    ],
+    "packageManager": "npm",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "npm run build",
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": "npm run dev",
+    "scripts": {
+      "dev": "bun --hot src/index.ts",
+      "start": "NODE_ENV=production bun src/index.ts",
+      "build": "bun run build.ts"
+    }
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": "type-based"
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "src"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 8,
+      "lastAccessed": 1776265365976,
+      "keyFiles": [
+        "APITester.tsx",
+        "App.tsx",
+        "frontend.tsx",
+        "index.css",
+        "index.html"
+      ]
+    },
+    "styles": {
+      "path": "styles",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776265365978,
+      "keyFiles": [
+        "globals.css"
+      ]
+    },
+    "src/components": {
+      "path": "src/components",
+      "purpose": "UI components",
+      "fileCount": 0,
+      "lastAccessed": 1776265365979,
+      "keyFiles": []
+    },
+    "src/lib": {
+      "path": "src/lib",
+      "purpose": "Library code",
+      "fileCount": 1,
+      "lastAccessed": 1776265365979,
+      "keyFiles": [
+        "utils.ts"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src/components/graph/SchemaGraph.tsx",
+      "accessCount": 10,
+      "lastAccessed": 1776267659067,
+      "type": "file"
+    },
+    {
+      "path": "src/components/AppShell.tsx",
+      "accessCount": 7,
+      "lastAccessed": 1776267568812,
+      "type": "file"
+    },
+    {
+      "path": "src/routes/Landing.tsx",
+      "accessCount": 6,
+      "lastAccessed": 1776267570247,
+      "type": "file"
+    },
+    {
+      "path": "src/routes/Schemas.tsx",
+      "accessCount": 5,
+      "lastAccessed": 1776266934514,
+      "type": "file"
+    },
+    {
+      "path": "src/routes/About.tsx",
+      "accessCount": 4,
+      "lastAccessed": 1776266935653,
+      "type": "file"
+    },
+    {
+      "path": "src/index.css",
+      "accessCount": 4,
+      "lastAccessed": 1776267245144,
+      "type": "file"
+    },
+    {
+      "path": "tsconfig.json",
+      "accessCount": 3,
+      "lastAccessed": 1776265882877,
+      "type": "file"
+    },
+    {
+      "path": "src/routes/Home.tsx",
+      "accessCount": 3,
+      "lastAccessed": 1776266184229,
+      "type": "file"
+    },
+    {
+      "path": "src/App.tsx",
+      "accessCount": 3,
+      "lastAccessed": 1776266808505,
+      "type": "file"
+    },
+    {
+      "path": "src/components/graph/SchemaNode.tsx",
+      "accessCount": 3,
+      "lastAccessed": 1776267647970,
+      "type": "file"
+    },
+    {
+      "path": "src/index.html",
+      "accessCount": 2,
+      "lastAccessed": 1776265855998,
+      "type": "file"
+    },
+    {
+      "path": "bun-env.d.ts",
+      "accessCount": 2,
+      "lastAccessed": 1776265881740,
+      "type": "file"
+    },
+    {
+      "path": "src/index.ts",
+      "accessCount": 2,
+      "lastAccessed": 1776265934508,
+      "type": "file"
+    },
+    {
+      "path": "src/routes/router.tsx",
+      "accessCount": 2,
+      "lastAccessed": 1776266778453,
+      "type": "file"
+    },
+    {
+      "path": "src/components/SdlEditor.tsx",
+      "accessCount": 2,
+      "lastAccessed": 1776267239948,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/layout.ts",
+      "accessCount": 2,
+      "lastAccessed": 1776267628738,
+      "type": "file"
+    },
+    {
+      "path": "src/components/graph/node-style.ts",
+      "accessCount": 2,
+      "lastAccessed": 1776267637079,
+      "type": "file"
+    },
+    {
+      "path": "package.json",
+      "accessCount": 1,
+      "lastAccessed": 1776265450020,
+      "type": "file"
+    },
+    {
+      "path": "components.json",
+      "accessCount": 1,
+      "lastAccessed": 1776265450755,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 1,
+      "lastAccessed": 1776265451928,
+      "type": "file"
+    },
+    {
+      "path": "src/frontend.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1776265455897,
+      "type": "file"
+    },
+    {
+      "path": "styles/globals.css",
+      "accessCount": 1,
+      "lastAccessed": 1776265456710,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/utils.ts",
+      "accessCount": 1,
+      "lastAccessed": 1776265457099,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/sdl-to-graph.ts",
+      "accessCount": 1,
+      "lastAccessed": 1776265677090,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/storage.ts",
+      "accessCount": 1,
+      "lastAccessed": 1776265686448,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/theme.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1776265693769,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/sample-sdl.ts",
+      "accessCount": 1,
+      "lastAccessed": 1776265698593,
+      "type": "file"
+    },
+    {
+      "path": "src/components/ui/badge.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1776265711381,
+      "type": "file"
+    },
+    {
+      "path": "src/components/theme-toggle.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1776265712451,
+      "type": "file"
+    },
+    {
+      "path": "src/routes/SchemaDetail.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1776265820390,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/schema-context.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1776266698457,
+      "type": "file"
+    },
+    {
+      "path": "src/routes/View.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1776266715908,
+      "type": "file"
+    },
+    {
+      "path": "src/components/tree/TreePanel.tsx",
+      "accessCount": 1,
+      "lastAccessed": 1776266744237,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
