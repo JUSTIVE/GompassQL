@@ -1,7 +1,11 @@
+import { Loader2 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { layoutGraph } from "@/lib/layout";
+import type { LayoutResult } from "@/lib/layout";
+import type {
+  LayoutWorkerRequest,
+  LayoutWorkerResponse,
+} from "@/lib/layout-worker";
 import type { GraphEdgeData, GraphNodeData } from "@/lib/sdl-to-graph";
-import { computeSimilarityPairs } from "@/lib/similarity";
 import { colorizeType } from "@/lib/type-colors";
 import {
   HEADER_H,
@@ -65,6 +69,8 @@ function getComputedCssVar(name: string, fallback: string): string {
   return val || fallback;
 }
 
+const EMPTY_LAYOUT: LayoutResult = { nodes: [], edgePaths: [] };
+
 export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -72,6 +78,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
   const viewRef = useRef({ x: 0, y: 0, k: 1 });
   const [viewTick, setViewTick] = useState(0);
   const dragRef = useRef({ active: false, lastX: 0, lastY: 0 });
+
+  // Layout runs off the main thread in a Web Worker so large schemas
+  // don't freeze the page. `isPending` is true from the moment a
+  // request is posted until the matching response arrives; stale
+  // responses (older `id`) are discarded.
+  const [layoutResult, setLayoutResult] = useState<LayoutResult>(EMPTY_LAYOUT);
+  const [isPending, setIsPending] = useState(nodes.length > 0);
+  const workerRef = useRef<Worker | null>(null);
+  const requestIdRef = useRef(0);
 
   useLayoutEffect(() => {
     const el = containerRef.current;
@@ -84,9 +99,37 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     return () => ro.disconnect();
   }, []);
 
-  const layoutResult = useMemo(() => {
-    if (nodes.length === 0) return { nodes: [], edgePaths: [] };
-    const input = nodes.map((n) => ({
+  // One worker per canvas instance. Module-type worker so it can import
+  // the layout + similarity modules directly.
+  useEffect(() => {
+    const worker = new Worker(new URL("@/lib/layout-worker.ts", import.meta.url), {
+      type: "module",
+    });
+    worker.onmessage = (e: MessageEvent<LayoutWorkerResponse>) => {
+      // Ignore results for any request that's been superseded.
+      if (e.data.id !== requestIdRef.current) return;
+      setLayoutResult(e.data.result);
+      setIsPending(false);
+    };
+    workerRef.current = worker;
+    return () => {
+      worker.terminate();
+      workerRef.current = null;
+    };
+  }, []);
+
+  // Post a layout request whenever the input graph changes.
+  useEffect(() => {
+    if (nodes.length === 0) {
+      // Empty input resolves instantly without a worker round-trip.
+      requestIdRef.current += 1;
+      setLayoutResult(EMPTY_LAYOUT);
+      setIsPending(false);
+      return;
+    }
+    const worker = workerRef.current;
+    if (!worker) return;
+    const layoutNodes = nodes.map((n) => ({
       id: n.id,
       width: NODE_WIDTH,
       height: estimateNodeHeight(
@@ -96,15 +139,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
         n.members?.length ?? 0,
       ),
     }));
-    const linkInput = edges
-      .filter((e) => e.source !== e.target)
-      .map((e) => ({ id: e.id, source: e.source, target: e.target, kind: e.kind }));
-    const hints = computeSimilarityPairs(nodes, edges).map((p) => ({
-      source: p.a,
-      target: p.b,
-      weight: p.score,
-    }));
-    return layoutGraph(input, linkInput, rootId ?? undefined, hints);
+    const id = ++requestIdRef.current;
+    setIsPending(true);
+    const request: LayoutWorkerRequest = {
+      id,
+      nodes,
+      edges,
+      layoutNodes,
+      rootId: rootId ?? null,
+    };
+    worker.postMessage(request);
   }, [nodes, edges, rootId]);
 
   const laidNodes = useMemo<LaidNode[]>(() => {
@@ -463,6 +507,23 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
         ref={canvasRef}
         style={{ width: size.w, height: size.h, display: "block" }}
       />
+      {isPending && (
+        <div
+          className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-background/60 backdrop-blur-sm"
+          role="status"
+          aria-live="polite"
+        >
+          <div className="flex flex-col items-center gap-3 rounded-xl border border-border bg-card/90 px-6 py-5 shadow-lg">
+            <Loader2 className="h-7 w-7 animate-spin text-primary" />
+            <div className="text-sm font-medium">
+              Laying out {nodes.length.toLocaleString()} types…
+            </div>
+            <div className="text-xs text-muted-foreground">
+              Large schemas may take a few seconds.
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
