@@ -1,11 +1,8 @@
 import { Loader2 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { LayoutResult } from "@/lib/layout";
-import type {
-  LayoutWorkerRequest,
-  LayoutWorkerResponse,
-} from "@/lib/layout-worker";
+import { layoutGraph, type LayoutResult } from "@/lib/layout";
 import type { GraphEdgeData, GraphNodeData } from "@/lib/sdl-to-graph";
+import { computeSimilarityPairs } from "@/lib/similarity";
 import { colorizeType } from "@/lib/type-colors";
 import {
   HEADER_H,
@@ -79,13 +76,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
   const [viewTick, setViewTick] = useState(0);
   const dragRef = useRef({ active: false, lastX: 0, lastY: 0 });
 
-  // Layout runs off the main thread in a Web Worker so large schemas
-  // don't freeze the page. `isPending` is true from the moment a
-  // request is posted until the matching response arrives; stale
-  // responses (older `id`) are discarded.
+  // Layout is expensive for large schemas. Rather than blocking the
+  // Visualize click on a synchronous run (which triggers the browser's
+  // "page unresponsive" dialog), we:
+  //   1. set `isPending` and let React paint the pending overlay,
+  //   2. yield two animation frames so the paint actually lands,
+  //   3. then run the layout synchronously on the main thread.
+  // Stale requests (user navigates away or changes roots mid-flight)
+  // are discarded via `requestIdRef`.
   const [layoutResult, setLayoutResult] = useState<LayoutResult>(EMPTY_LAYOUT);
   const [isPending, setIsPending] = useState(nodes.length > 0);
-  const workerRef = useRef<Worker | null>(null);
   const requestIdRef = useRef(0);
 
   useLayoutEffect(() => {
@@ -99,56 +99,64 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     return () => ro.disconnect();
   }, []);
 
-  // One worker per canvas instance. Module-type worker so it can import
-  // the layout + similarity modules directly.
-  useEffect(() => {
-    const worker = new Worker(new URL("@/lib/layout-worker.ts", import.meta.url), {
-      type: "module",
-    });
-    worker.onmessage = (e: MessageEvent<LayoutWorkerResponse>) => {
-      // Ignore results for any request that's been superseded.
-      if (e.data.id !== requestIdRef.current) return;
-      setLayoutResult(e.data.result);
-      setIsPending(false);
-    };
-    workerRef.current = worker;
-    return () => {
-      worker.terminate();
-      workerRef.current = null;
-    };
-  }, []);
-
-  // Post a layout request whenever the input graph changes.
   useEffect(() => {
     if (nodes.length === 0) {
-      // Empty input resolves instantly without a worker round-trip.
       requestIdRef.current += 1;
       setLayoutResult(EMPTY_LAYOUT);
       setIsPending(false);
       return;
     }
-    const worker = workerRef.current;
-    if (!worker) return;
-    const layoutNodes = nodes.map((n) => ({
-      id: n.id,
-      width: NODE_WIDTH,
-      height: estimateNodeHeight(
-        n.kind,
-        n.fields?.length ?? 0,
-        n.values?.length ?? 0,
-        n.members?.length ?? 0,
-      ),
-    }));
     const id = ++requestIdRef.current;
     setIsPending(true);
-    const request: LayoutWorkerRequest = {
-      id,
-      nodes,
-      edges,
-      layoutNodes,
-      rootId: rootId ?? null,
+
+    let raf1 = 0;
+    let raf2 = 0;
+    let cancelled = false;
+    // Double-rAF so the spinner paint cycle completes before the
+    // blocking layout starts. Single rAF is sometimes folded into the
+    // same frame as the pending setState commit.
+    raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        if (cancelled || id !== requestIdRef.current) return;
+        const layoutNodes = nodes.map((n) => ({
+          id: n.id,
+          width: NODE_WIDTH,
+          height: estimateNodeHeight(
+            n.kind,
+            n.fields?.length ?? 0,
+            n.values?.length ?? 0,
+            n.members?.length ?? 0,
+          ),
+        }));
+        const layoutEdges = edges
+          .filter((e) => e.source !== e.target)
+          .map((e) => ({
+            id: e.id,
+            source: e.source,
+            target: e.target,
+            kind: e.kind,
+          }));
+        const hints = computeSimilarityPairs(nodes, edges).map((p) => ({
+          source: p.a,
+          target: p.b,
+          weight: p.score,
+        }));
+        const result = layoutGraph(
+          layoutNodes,
+          layoutEdges,
+          rootId ?? undefined,
+          hints,
+        );
+        if (cancelled || id !== requestIdRef.current) return;
+        setLayoutResult(result);
+        setIsPending(false);
+      });
+    });
+    return () => {
+      cancelled = true;
+      if (raf1) cancelAnimationFrame(raf1);
+      if (raf2) cancelAnimationFrame(raf2);
     };
-    worker.postMessage(request);
   }, [nodes, edges, rootId]);
 
   const laidNodes = useMemo<LaidNode[]>(() => {
