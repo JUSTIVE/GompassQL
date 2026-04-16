@@ -64,6 +64,16 @@ export const KIND_COLORS: Record<NodeKind, string> = {
   Input: "#d946ef", // fuchsia-500
 };
 
+export const KIND_COLORS_DARK: Record<NodeKind, string> = {
+  Object: "#0369a1", // sky-700
+  Interface: "#5b21b6", // violet-800
+  Union: "#b45309", // amber-700
+  Enum: "#047857", // emerald-700
+  Scalar: "#be123c", // rose-700
+  Input: "#a21caf", // fuchsia-700
+};
+
+
 export const NODE_WIDTH = 220;
 export const HEADER_H = 42;
 export const ROW_H = 14;

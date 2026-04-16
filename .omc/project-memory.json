@@ -104,21 +104,63 @@
   },
   "hotPaths": [
     {
+      "path": "src/components/graph/SchemaSvg.tsx",
+      "accessCount": 32,
+      "lastAccessed": 1776303476413,
+      "type": "file"
+    },
+    {
+      "path": "src/components/graph/SchemaCanvas.tsx",
+      "accessCount": 23,
+      "lastAccessed": 1776304616909,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/layout.ts",
+      "accessCount": 17,
+      "lastAccessed": 1776304701233,
+      "type": "file"
+    },
+    {
+      "path": "src/routes/Landing.tsx",
+      "accessCount": 11,
+      "lastAccessed": 1776303854461,
+      "type": "file"
+    },
+    {
       "path": "src/components/graph/SchemaGraph.tsx",
       "accessCount": 10,
       "lastAccessed": 1776267659067,
       "type": "file"
     },
     {
-      "path": "src/components/AppShell.tsx",
-      "accessCount": 7,
-      "lastAccessed": 1776267568812,
+      "path": "src/components/graph/node-style.ts",
+      "accessCount": 8,
+      "lastAccessed": 1776303072285,
       "type": "file"
     },
     {
-      "path": "src/routes/Landing.tsx",
+      "path": "src/components/AppShell.tsx",
+      "accessCount": 8,
+      "lastAccessed": 1776303814730,
+      "type": "file"
+    },
+    {
+      "path": "src/components/tree/TreePanel.tsx",
+      "accessCount": 8,
+      "lastAccessed": 1776304452921,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/sdl-to-graph.ts",
+      "accessCount": 7,
+      "lastAccessed": 1776303875898,
+      "type": "file"
+    },
+    {
+      "path": "src/lib/type-colors.tsx",
       "accessCount": 6,
-      "lastAccessed": 1776267570247,
+      "lastAccessed": 1776303542083,
       "type": "file"
     },
     {
@@ -128,15 +170,27 @@
       "type": "file"
     },
     {
-      "path": "src/routes/About.tsx",
-      "accessCount": 4,
-      "lastAccessed": 1776266935653,
+      "path": "src/index.css",
+      "accessCount": 5,
+      "lastAccessed": 1776301777280,
       "type": "file"
     },
     {
-      "path": "src/index.css",
-      "accessCount": 4,
-      "lastAccessed": 1776267245144,
+      "path": "src/routes/View.tsx",
+      "accessCount": 5,
+      "lastAccessed": 1776303812565,
+      "type": "file"
+    },
+    {
+      "path": "src/routes/router.tsx",
+      "accessCount": 5,
+      "lastAccessed": 1776303839197,
+      "type": "file"
+    },
+    {
+      "path": "src/routes/About.tsx",
+      "accessCount": 5,
+      "lastAccessed": 1776303859829,
       "type": "file"
     },
     {
@@ -182,27 +236,21 @@
       "type": "file"
     },
     {
-      "path": "src/routes/router.tsx",
-      "accessCount": 2,
-      "lastAccessed": 1776266778453,
-      "type": "file"
-    },
-    {
       "path": "src/components/SdlEditor.tsx",
       "accessCount": 2,
       "lastAccessed": 1776267239948,
       "type": "file"
     },
     {
-      "path": "src/lib/layout.ts",
+      "path": "src/lib/schema-context.tsx",
       "accessCount": 2,
-      "lastAccessed": 1776267628738,
+      "lastAccessed": 1776301744885,
       "type": "file"
     },
     {
-      "path": "src/components/graph/node-style.ts",
+      "path": "styles/globals.css",
       "accessCount": 2,
-      "lastAccessed": 1776267637079,
+      "lastAccessed": 1776304450993,
       "type": "file"
     },
     {
@@ -230,21 +278,9 @@
       "type": "file"
     },
     {
-      "path": "styles/globals.css",
-      "accessCount": 1,
-      "lastAccessed": 1776265456710,
-      "type": "file"
-    },
-    {
       "path": "src/lib/utils.ts",
       "accessCount": 1,
       "lastAccessed": 1776265457099,
-      "type": "file"
-    },
-    {
-      "path": "src/lib/sdl-to-graph.ts",
-      "accessCount": 1,
-      "lastAccessed": 1776265677090,
       "type": "file"
     },
     {
@@ -284,22 +320,16 @@
       "type": "file"
     },
     {
-      "path": "src/lib/schema-context.tsx",
+      "path": "src/lib/reachable.ts",
       "accessCount": 1,
-      "lastAccessed": 1776266698457,
+      "lastAccessed": 1776301650665,
       "type": "file"
     },
     {
-      "path": "src/routes/View.tsx",
+      "path": "src",
       "accessCount": 1,
-      "lastAccessed": 1776266715908,
-      "type": "file"
-    },
-    {
-      "path": "src/components/tree/TreePanel.tsx",
-      "accessCount": 1,
-      "lastAccessed": 1776266744237,
-      "type": "file"
+      "lastAccessed": 1776303839566,
+      "type": "directory"
     }
   ],
   "userDirectives": []

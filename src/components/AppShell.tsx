@@ -12,7 +12,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const NAV = [
     { to: "/", label: "New" },
     ...(hasSchema ? [{ to: "/view" as const, label: "View" }] : []),
-    { to: "/schemas", label: "Saved" },
     { to: "/about", label: "About" },
   ];
 

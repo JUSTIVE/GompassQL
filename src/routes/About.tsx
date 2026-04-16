@@ -37,9 +37,6 @@ export function AboutRoute() {
         <Button asChild>
           <Link to="/">Start visualizing</Link>
         </Button>
-        <Button asChild variant="outline">
-          <Link to="/schemas">View saved</Link>
-        </Button>
       </div>
     </div>
   );

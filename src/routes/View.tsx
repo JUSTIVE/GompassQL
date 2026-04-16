@@ -1,6 +1,6 @@
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect } from "react";
-import { SchemaSvg } from "@/components/graph/SchemaSvg";
+import { SchemaCanvas } from "@/components/graph/SchemaCanvas";
 import { TreePanel } from "@/components/tree/TreePanel";
 import { useSchema } from "@/lib/schema-context";
 
@@ -24,7 +24,7 @@ export function ViewRoute() {
         <TreePanel />
       </aside>
       <section className="relative min-h-[500px] flex-1">
-        <SchemaSvg nodes={visibleNodes} edges={visibleEdges} focusId={focusId} rootId={rootType} />
+        <SchemaCanvas nodes={visibleNodes} edges={visibleEdges} focusId={focusId} rootId={rootType} />
       </section>
     </div>
   );

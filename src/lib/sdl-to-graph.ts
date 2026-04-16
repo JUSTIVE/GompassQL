@@ -27,6 +27,7 @@ export interface GraphEdgeData {
   source: string;
   target: string;
   sourceField?: string;
+  sourceFieldIndex?: number;
   label?: string;
   kind: "field" | "implements" | "union";
   nullable?: boolean;
@@ -111,7 +112,8 @@ export function sdlToGraph(sdl: string): ParsedGraph {
           interfaces,
         });
 
-        for (const field of fields) {
+        for (let fi = 0; fi < fields.length; fi++) {
+          const field = fields[fi]!;
           if (BUILTIN_SCALARS.has(field.typeName)) continue;
           if (field.typeName === def.name.value) continue;
           rawEdges.push({
@@ -119,6 +121,7 @@ export function sdlToGraph(sdl: string): ParsedGraph {
             source: def.name.value,
             target: field.typeName,
             sourceField: field.name,
+            sourceFieldIndex: fi,
             label: field.name,
             kind: "field",
             nullable: field.nullable,

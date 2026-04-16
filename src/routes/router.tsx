@@ -7,7 +7,6 @@ import {
 import { AppShell } from "@/components/AppShell";
 import { AboutRoute } from "./About";
 import { LandingRoute } from "./Landing";
-import { SchemasRoute } from "./Schemas";
 import { ViewRoute } from "./View";
 
 const rootRoute = createRootRoute({
@@ -30,12 +29,6 @@ const viewRoute = createRoute({
   component: ViewRoute,
 });
 
-const schemasRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/schemas",
-  component: SchemasRoute,
-});
-
 const aboutRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/about",
@@ -45,7 +38,6 @@ const aboutRoute = createRoute({
 const routeTree = rootRoute.addChildren([
   indexRoute,
   viewRoute,
-  schemasRoute,
   aboutRoute,
 ]);
 

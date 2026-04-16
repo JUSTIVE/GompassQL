@@ -1,12 +1,12 @@
 import { useNavigate } from "@tanstack/react-router";
-import { AlertCircle, Save, Sparkles, Upload, Wand2 } from "lucide-react";
+import { AlertCircle, Sparkles, Upload, Wand2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { SdlEditor } from "@/components/SdlEditor";
 import { Button } from "@/components/ui/button";
 import { SAMPLE_SDL } from "@/lib/sample-sdl";
 import { useSchema } from "@/lib/schema-context";
 import { sdlToGraph } from "@/lib/sdl-to-graph";
-import { upsertSchema } from "@/lib/storage";
+
 
 const SDL_EXT_RE = /\.(graphql|graphqls|gql|sdl|txt)$/i;
 
@@ -96,13 +96,6 @@ export function LandingRoute() {
     navigate({ to: "/view" });
   };
 
-  const saveAndVisualize = () => {
-    const v = validate();
-    if (!v) return;
-    upsertSchema({ name: v.name, sdl: v.sdl });
-    setSchema({ sdl: v.sdl, name: v.name });
-    navigate({ to: "/view" });
-  };
 
   return (
     <div className="absolute inset-0 mx-auto flex w-full max-w-3xl flex-col gap-4 overflow-hidden px-6 py-6">
@@ -179,10 +172,6 @@ export function LandingRoute() {
       ) : null}
 
       <div className="flex shrink-0 flex-wrap justify-end gap-2">
-        <Button variant="outline" onClick={saveAndVisualize} className="gap-2">
-          <Save className="h-4 w-4" />
-          Save & visualize
-        </Button>
         <Button onClick={visualize} size="lg" className="gap-2">
           <Wand2 className="h-4 w-4" />
           Visualize

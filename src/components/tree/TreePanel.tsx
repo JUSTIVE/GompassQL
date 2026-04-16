@@ -4,6 +4,7 @@ import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
 import { useSchema } from "@/lib/schema-context";
 import type { GraphNodeData } from "@/lib/sdl-to-graph";
+import { ColoredType } from "@/lib/type-colors";
 import { cn } from "@/lib/utils";
 
 const BUILTIN = new Set(["String", "Int", "Float", "Boolean", "ID"]);
@@ -50,7 +51,7 @@ export function TreePanel() {
     !BUILTIN.has(typeName) && byId.has(typeName);
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex h-full min-h-0 flex-col [&_::-webkit-scrollbar]:w-0 [&_::-webkit-scrollbar]:h-0 [scrollbar-width:none]">
       <div className="border-b border-border p-3">
         <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
           {name || "Schema"}
@@ -227,6 +228,7 @@ function TypeDetail({
                 <FieldRow
                   label={label}
                   typeLabel={f.type}
+                  description={f.description}
                   navigable={nav}
                   onClick={() => nav && onNavigate(f.typeName)}
                 />
@@ -245,11 +247,13 @@ function TypeDetail({
 function FieldRow({
   label,
   typeLabel,
+  description,
   navigable,
   onClick,
 }: {
   label: string;
   typeLabel: string;
+  description?: string;
   navigable: boolean;
   onClick: () => void;
 }) {
@@ -259,22 +263,29 @@ function FieldRow({
       disabled={!navigable}
       onClick={onClick}
       className={cn(
-        "group flex w-full items-center justify-between gap-2 rounded px-2 py-1 text-left",
+        "group flex w-full flex-col gap-0.5 rounded px-2 py-1 text-left",
         navigable
           ? "cursor-pointer hover:bg-secondary/60"
           : "cursor-default",
       )}
     >
-      <span className="min-w-0 truncate text-foreground">{label}</span>
-      <span
-        className={cn(
-          "flex shrink-0 items-center gap-1 text-muted-foreground",
-          navigable && "group-hover:text-foreground",
-        )}
-      >
-        {typeLabel}
-        {navigable && <ChevronRight className="h-3 w-3" />}
+      <span className="flex w-full items-center justify-between gap-2">
+        <span className="min-w-0 truncate text-foreground">{label}</span>
+        <span
+          className={cn(
+            "flex shrink-0 items-center gap-1",
+            navigable && "group-hover:opacity-80",
+          )}
+        >
+          {typeLabel ? <ColoredType type={typeLabel} /> : null}
+          {navigable && <ChevronRight className="h-3 w-3 text-muted-foreground" />}
+        </span>
       </span>
+      {description && (
+        <span className="text-[10px] leading-tight text-muted-foreground/70">
+          {description}
+        </span>
+      )}
     </button>
   );
 }
