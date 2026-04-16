@@ -1,11 +1,29 @@
 import { useNavigate } from "@tanstack/react-router";
-import { AlertCircle, Sparkles, Upload, Wand2 } from "lucide-react";
+import {
+  AlertCircle,
+  ChevronDown,
+  ChevronRight,
+  History,
+  Sparkles,
+  Trash2,
+  Upload,
+  Wand2,
+  X,
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { SdlEditor } from "@/components/SdlEditor";
 import { Button } from "@/components/ui/button";
 import { SAMPLE_SDL } from "@/lib/sample-sdl";
 import { useSchema } from "@/lib/schema-context";
 import { sdlToGraph } from "@/lib/sdl-to-graph";
+import {
+  addOrUpdateEntry,
+  clearHistory,
+  formatTimestamp,
+  type HistoryEntry,
+  loadHistory,
+  removeEntry,
+} from "@/lib/schema-history";
 
 
 const SDL_EXT_RE = /\.(graphql|graphqls|gql|sdl|txt)$/i;
@@ -28,6 +46,12 @@ export function LandingRoute() {
   const [error, setError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+
+  useEffect(() => {
+    setHistory(loadHistory());
+  }, []);
 
   const readFile = async (file: File) => {
     try {
@@ -93,7 +117,22 @@ export function LandingRoute() {
     const v = validate();
     if (!v) return;
     setSchema({ sdl: v.sdl, name: v.name });
+    setHistory((h) => addOrUpdateEntry(h, v.sdl, v.name));
     navigate({ to: "/view" });
+  };
+
+  const loadFromHistory = (entry: HistoryEntry) => {
+    setSdl(entry.sdl);
+    setDerivedName(entry.name);
+    setError(null);
+  };
+
+  const deleteHistoryEntry = (hash: string) => {
+    setHistory((h) => removeEntry(h, hash));
+  };
+
+  const resetHistory = () => {
+    setHistory(clearHistory());
   };
 
 
@@ -152,6 +191,70 @@ export function LandingRoute() {
           </span>
         )}
       </div>
+
+      {history.length > 0 && (
+        <div className="shrink-0 rounded-md border border-border bg-card">
+          <div className="flex items-center justify-between px-3 py-2">
+            <button
+              type="button"
+              onClick={() => setHistoryOpen((v) => !v)}
+              className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground"
+            >
+              {historyOpen ? (
+                <ChevronDown className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5" />
+              )}
+              <History className="h-3.5 w-3.5" />
+              <span>Recent schemas ({history.length})</span>
+            </button>
+            {historyOpen && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 gap-1 text-xs text-muted-foreground hover:text-destructive"
+                onClick={resetHistory}
+              >
+                <Trash2 className="h-3 w-3" />
+                Clear
+              </Button>
+            )}
+          </div>
+          {historyOpen && (
+            <ul className="max-h-48 overflow-auto border-t border-border">
+              {history.map((entry) => (
+                <li
+                  key={entry.hash}
+                  className="group flex items-center gap-2 border-b border-border/50 px-3 py-2 last:border-b-0 hover:bg-secondary/40"
+                >
+                  <button
+                    type="button"
+                    onClick={() => loadFromHistory(entry)}
+                    className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left"
+                  >
+                    <span className="w-full truncate text-sm font-medium">
+                      {entry.name}
+                    </span>
+                    <span className="text-[11px] text-muted-foreground">
+                      {entry.updatedAt !== entry.createdAt ? "updated " : "added "}
+                      {formatTimestamp(entry.updatedAt)}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Remove from history"
+                    onClick={() => deleteHistoryEntry(entry.hash)}
+                    className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-destructive group-hover:opacity-100"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       <div className="relative min-h-0 flex-1 overflow-hidden rounded-md border border-border bg-card">
         <SdlEditor

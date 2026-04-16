@@ -70,7 +70,11 @@ interface Props {
   edges: GraphEdgeData[];
   focusId?: string | null;
   rootId?: string | null;
+  onNavigate?: (typeId: string) => void;
 }
+
+const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
+const CLICK_DRAG_THRESHOLD = 4;
 
 function getComputedCssVar(name: string, fallback: string): string {
   if (typeof window === "undefined") return fallback;
@@ -90,14 +94,22 @@ function spriteDpr(): number {
   return Math.min(2, Math.max(1, window.devicePixelRatio || 1));
 }
 
-export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
+export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [size, setSize] = useState({ w: 1, h: 1 });
   const viewRef = useRef({ x: 0, y: 0, k: 1 });
   const [viewTick, setViewTick] = useState(0);
-  const dragRef = useRef({ active: false, lastX: 0, lastY: 0 });
+  const dragRef = useRef({
+    active: false,
+    lastX: 0,
+    lastY: 0,
+    startX: 0,
+    startY: 0,
+    moved: false,
+  });
   const rafRef = useRef<number | null>(null);
+  const [cursor, setCursor] = useState<"grab" | "pointer">("grab");
   const { resolved: themeResolved } = useTheme();
 
   // Layout runs off the main thread in a dedicated Web Worker bundled
@@ -370,21 +382,90 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
+  const screenToWorld = (clientX: number, clientY: number): Point | null => {
+    const el = containerRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const v = viewRef.current;
+    return {
+      x: (clientX - rect.left - v.x) / v.k,
+      y: (clientY - rect.top - v.y) / v.k,
+    };
+  };
+
+  const hitTestFieldTarget = (worldX: number, worldY: number): string | null => {
+    for (const n of laidNodes) {
+      const left = n.cx - n.w / 2;
+      const right = n.cx + n.w / 2;
+      const top = n.cy - n.h / 2;
+      const bottom = n.cy + n.h / 2;
+      if (worldX < left || worldX > right || worldY < top || worldY > bottom) continue;
+      const localY = worldY - top;
+      const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
+      if (localY < bodyTop) return null;
+      const rowIdx = Math.floor((localY - bodyTop) / ROW_H);
+      const data = n.data;
+      if (data.kind === "Object" || data.kind === "Interface" || data.kind === "Input") {
+        const f = data.fields?.[rowIdx];
+        if (!f) return null;
+        if (BUILTIN_SCALARS.has(f.typeName)) return null;
+        return nodeById.has(f.typeName) ? f.typeName : null;
+      }
+      if (data.kind === "Union") {
+        const m = data.members?.[rowIdx];
+        if (!m) return null;
+        if (BUILTIN_SCALARS.has(m)) return null;
+        return nodeById.has(m) ? m : null;
+      }
+      return null;
+    }
+    return null;
+  };
+
   const onMouseDown = (e: React.MouseEvent) => {
-    dragRef.current = { active: true, lastX: e.clientX, lastY: e.clientY };
+    dragRef.current = {
+      active: true,
+      lastX: e.clientX,
+      lastY: e.clientY,
+      startX: e.clientX,
+      startY: e.clientY,
+      moved: false,
+    };
   };
   const onMouseMove = (e: React.MouseEvent) => {
-    if (!dragRef.current.active) return;
-    const dx = e.clientX - dragRef.current.lastX;
-    const dy = e.clientY - dragRef.current.lastY;
-    dragRef.current.lastX = e.clientX;
-    dragRef.current.lastY = e.clientY;
-    const v = viewRef.current;
-    viewRef.current = { ...v, x: v.x + dx, y: v.y + dy };
-    setViewTick((t) => t + 1);
+    const drag = dragRef.current;
+    if (drag.active) {
+      const dx = e.clientX - drag.lastX;
+      const dy = e.clientY - drag.lastY;
+      drag.lastX = e.clientX;
+      drag.lastY = e.clientY;
+      if (
+        Math.abs(e.clientX - drag.startX) > CLICK_DRAG_THRESHOLD ||
+        Math.abs(e.clientY - drag.startY) > CLICK_DRAG_THRESHOLD
+      ) {
+        drag.moved = true;
+      }
+      const v = viewRef.current;
+      viewRef.current = { ...v, x: v.x + dx, y: v.y + dy };
+      setViewTick((t) => t + 1);
+      return;
+    }
+    if (!onNavigate) return;
+    const world = screenToWorld(e.clientX, e.clientY);
+    if (!world) return;
+    const hit = hitTestFieldTarget(world.x, world.y);
+    setCursor(hit ? "pointer" : "grab");
   };
   const endDrag = () => {
     dragRef.current.active = false;
+  };
+  const onClick = (e: React.MouseEvent) => {
+    if (!onNavigate) return;
+    if (dragRef.current.moved) return;
+    const world = screenToWorld(e.clientX, e.clientY);
+    if (!world) return;
+    const hit = hitTestFieldTarget(world.x, world.y);
+    if (hit) onNavigate(hit);
   };
 
   // RAF-coalesced draw. Every effect-triggering change enqueues one
@@ -429,7 +510,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
       onMouseMove={onMouseMove}
       onMouseUp={endDrag}
       onMouseLeave={endDrag}
-      style={{ cursor: "grab" }}
+      onClick={onClick}
+      style={{ cursor }}
     >
       <canvas ref={canvasRef} style={{ width: size.w, height: size.h, display: "block" }} />
       {lastTiming && (
