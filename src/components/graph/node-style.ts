@@ -73,7 +73,6 @@ export const KIND_COLORS_DARK: Record<NodeKind, string> = {
   Input: "#a21caf", // fuchsia-700
 };
 
-
 export const NODE_WIDTH = 220;
 export const HEADER_H = 42;
 export const ROW_H = 14;
@@ -100,8 +99,7 @@ export function estimateNodeHeight(
 
 /** Font used for the name row in a node header — referenced from both
  *  the width estimator and the canvas renderer so they agree. */
-export const NODE_NAME_FONT =
-  '600 13px ui-monospace, SFMono-Regular, Menlo, monospace';
+export const NODE_NAME_FONT = "600 13px ui-monospace, SFMono-Regular, Menlo, monospace";
 
 // Header side-padding (left + right) factored into the width budget.
 const NAME_H_PAD = 16;
@@ -111,9 +109,8 @@ const NODE_MAX_WIDTH = 900;
 // Global width multiplier — nodes render this much wider than the
 // name+pad requirement, so field-name / field-type rows have plenty
 // of breathing room and their truncation limits can grow
-// proportionally. Stacked 1.5× twice (2.25×) per the user request to
-// grow the node itself again on top of the field-text scaling.
-const NODE_WIDTH_SCALE = 2.25;
+
+const NODE_WIDTH_SCALE = 1.0;
 
 let measureCtx: CanvasRenderingContext2D | null = null;
 function getMeasureCtx(): CanvasRenderingContext2D | null {
@@ -137,18 +134,26 @@ function getMeasureCtx(): CanvasRenderingContext2D | null {
  * layout). The renderer should secondary-truncate if an individual
  * name still overflows the clamped width.
  */
-export function estimateNodeWidth(name: string): number {
+
+export function estimateNodeWidth(name: string, fields: [string, string][]): number {
   const ctx = getMeasureCtx();
   let textW: number;
+  let fieldMax: number = 0;
   if (ctx) {
     ctx.font = NODE_NAME_FONT;
     textW = ctx.measureText(name).width;
+    for (const field of fields) {
+      fieldMax = Math.max(
+        fieldMax,
+        ctx.measureText(field[0]).width + NAME_H_PAD + ctx.measureText(field[1]).width,
+      );
+    }
   } else {
     // SSR / no DOM fallback: conservative per-char estimate.
     textW = name.length * 9;
   }
   const required = NAME_H_PAD + Math.ceil(textW);
-  const base = Math.max(NODE_MIN_WIDTH, Math.min(NODE_MAX_WIDTH, required));
+  const base = Math.max(NODE_MIN_WIDTH, Math.min(NODE_MAX_WIDTH, required), fieldMax);
   return Math.round(base * NODE_WIDTH_SCALE);
 }
 

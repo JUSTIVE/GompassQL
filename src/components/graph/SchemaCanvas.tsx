@@ -152,7 +152,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     if (!worker) return;
     const layoutNodes = nodes.map((n) => ({
       id: n.id,
-      width: estimateNodeWidth(n.name),
+      width: estimateNodeWidth(n.name, n.fields?.map((x) => [x.name, x.typeName] as const) ?? []),
       height: estimateNodeHeight(
         n.kind,
         n.fields?.length ?? 0,
@@ -211,15 +211,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
       // source node by rewriting the first bezier's start + c1 (so the
       // curve *departs* horizontally at the row, then blends back into
       // the original c2/end — no seam, no kink, single smooth bezier).
-      if (
-        e.kind === "field" &&
-        e.sourceFieldIndex != null &&
-        b.cx > a.cx &&
-        segments.length > 0
-      ) {
+      if (e.kind === "field" && e.sourceFieldIndex != null && b.cx > a.cx && segments.length > 0) {
         const exitX = a.cx + a.w / 2;
-        const exitY =
-          a.cy - a.h / 2 + HEADER_H + TOP_BODY_PAD - 2 + e.sourceFieldIndex * ROW_H + 6;
+        const exitY = a.cy - a.h / 2 + HEADER_H + TOP_BODY_PAD - 2 + e.sourceFieldIndex * ROW_H + 6;
         const origC1 = segments[0]!.c1;
         const tangentLen = Math.hypot(origC1.x - start.x, origC1.y - start.y);
         const c1Offset = Math.max(tangentLen, 32);
@@ -439,9 +433,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     >
       <canvas ref={canvasRef} style={{ width: size.w, height: size.h, display: "block" }} />
       {lastTiming && (
-        <div
-          className="pointer-events-none absolute right-3 top-3 z-20 rounded-md border border-border bg-card/90 px-2 py-1 text-xs text-muted-foreground tabular-nums shadow-sm backdrop-blur"
-        >
+        <div className="pointer-events-none absolute right-3 top-3 z-20 rounded-md border border-border bg-card/90 px-2 py-1 text-xs text-muted-foreground tabular-nums shadow-sm backdrop-blur">
           layout {lastTiming.layoutMs.toFixed(0)}ms · total {lastTiming.totalMs.toFixed(0)}ms
         </div>
       )}
@@ -740,14 +732,14 @@ function drawNodeSprite(
     ctx.fillStyle = mutedFg;
     const values = n.data.values ?? [];
     for (let i = 0; i < values.length; i++) {
-      ctx.fillText(truncate(values[i]!.name, 26), 10, bodyY + i * ROW_H + 10);
+      ctx.fillText(values[i]!.name, 10, bodyY + i * ROW_H + 10);
     }
   } else if (n.data.kind === "Union") {
     ctx.font = `10px ${MONO}`;
     ctx.fillStyle = mutedFg;
     const members = n.data.members ?? [];
     for (let i = 0; i < members.length; i++) {
-      ctx.fillText("| " + truncate(members[i]!, 22), 10, bodyY + i * ROW_H + 10);
+      ctx.fillText("| " + members[i]!, 10, bodyY + i * ROW_H + 10);
     }
   } else if (n.data.kind === "Scalar") {
     ctx.font = `italic 10px ${MONO}`;
@@ -760,8 +752,8 @@ function drawNodeSprite(
       const f = fields[i]!;
       const fy = bodyY + i * ROW_H + 10;
       ctx.fillStyle = fgColor;
-      ctx.fillText(truncate(f.name, 21), 10, fy);
-      drawColoredType(ctx, truncate(f.type, 21), w - 10, fy, mutedFg);
+      ctx.fillText(f.name, 10, fy);
+      drawColoredType(ctx, f.type, w - 10, fy, mutedFg);
     }
   }
 }
@@ -828,9 +820,9 @@ function drawColoredType(
   void defaultColor;
 }
 
-function truncate(s: string, n: number) {
-  return s.length > n ? s.slice(0, n - 1) + "…" : s;
-}
+// function truncate(s: string, n: number) {
+//   return s.length > n ? s.slice(0, n - 1) + "…" : s;
+// }
 
 /**
  * Shorten `s` to the longest prefix (+ "…") that still fits within
