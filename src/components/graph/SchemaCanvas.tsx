@@ -468,6 +468,157 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
     if (hit) onNavigate(hit);
   };
 
+  // Touch gestures: 1-finger pan, 2-finger pinch zoom, tap-to-navigate.
+  // Refs hold the latest closures so the listener block can stay bound
+  // once instead of re-attaching on every render.
+  const hitTestRef = useRef(hitTestFieldTarget);
+  hitTestRef.current = hitTestFieldTarget;
+  const onNavigateRef = useRef(onNavigate);
+  onNavigateRef.current = onNavigate;
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    type Pt = { x: number; y: number; startX: number; startY: number };
+    const points = new Map<number, Pt>();
+    let mode: "none" | "pan" | "pinch" = "none";
+    let panMoved = false;
+    let pinchStartDist = 0;
+    let pinchStartK = 1;
+
+    const enterPan = () => {
+      mode = "pan";
+      panMoved = false;
+    };
+
+    const enterPinch = () => {
+      const arr = [...points.values()];
+      if (arr.length < 2) return;
+      pinchStartDist = Math.hypot(arr[0]!.x - arr[1]!.x, arr[0]!.y - arr[1]!.y);
+      pinchStartK = viewRef.current.k;
+      mode = "pinch";
+    };
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.cancelable) e.preventDefault();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i]!;
+        points.set(t.identifier, {
+          x: t.clientX,
+          y: t.clientY,
+          startX: t.clientX,
+          startY: t.clientY,
+        });
+      }
+      if (points.size === 1) enterPan();
+      else if (points.size >= 2) enterPinch();
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.cancelable) e.preventDefault();
+
+      // Snapshot pre-move positions so we can compute a per-finger
+      // delta even when several touches move in the same frame.
+      const before = new Map<number, { x: number; y: number }>();
+      for (const [id, p] of points) before.set(id, { x: p.x, y: p.y });
+
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i]!;
+        const existing = points.get(t.identifier);
+        if (!existing) continue;
+        existing.x = t.clientX;
+        existing.y = t.clientY;
+      }
+
+      if (mode === "pan" && points.size === 1) {
+        const arr = [...points.entries()];
+        const [id, pt] = arr[0]!;
+        const prev = before.get(id);
+        if (!prev) return;
+        const dx = pt.x - prev.x;
+        const dy = pt.y - prev.y;
+        if (
+          Math.abs(pt.x - pt.startX) > CLICK_DRAG_THRESHOLD ||
+          Math.abs(pt.y - pt.startY) > CLICK_DRAG_THRESHOLD
+        ) {
+          panMoved = true;
+        }
+        const v = viewRef.current;
+        viewRef.current = { ...v, x: v.x + dx, y: v.y + dy };
+        setViewTick((t) => t + 1);
+        return;
+      }
+
+      if (mode === "pinch" && points.size >= 2) {
+        const arr = [...points.values()];
+        const a = arr[0]!;
+        const b = arr[1]!;
+        const dist = Math.hypot(a.x - b.x, a.y - b.y);
+        if (pinchStartDist <= 0) return;
+        const newK = Math.max(0.05, Math.min(4, pinchStartK * (dist / pinchStartDist)));
+        const rect = el.getBoundingClientRect();
+        const cx = (a.x + b.x) / 2 - rect.left;
+        const cy = (a.y + b.y) / 2 - rect.top;
+        const v = viewRef.current;
+        const ratio = newK / v.k;
+        viewRef.current = {
+          k: newK,
+          x: cx - (cx - v.x) * ratio,
+          y: cy - (cy - v.y) * ratio,
+        };
+        setViewTick((t) => t + 1);
+      }
+    };
+
+    const onTouchEnd = (e: TouchEvent) => {
+      const ended: Touch[] = [];
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i]!;
+        if (points.has(t.identifier)) {
+          ended.push(t);
+          points.delete(t.identifier);
+        }
+      }
+
+      // Lifting one finger of a pinch leaves us in single-finger pan
+      // mode; reset the pan baseline so the next move doesn't jump.
+      if (mode === "pinch" && points.size === 1) {
+        const remaining = [...points.values()][0]!;
+        remaining.startX = remaining.x;
+        remaining.startY = remaining.y;
+        enterPan();
+        return;
+      }
+
+      if (points.size === 0) {
+        const wasTap = mode === "pan" && !panMoved && ended.length > 0;
+        mode = "none";
+        if (!wasTap) return;
+        const onNav = onNavigateRef.current;
+        if (!onNav) return;
+        const t = ended[ended.length - 1]!;
+        const rect = el.getBoundingClientRect();
+        const v = viewRef.current;
+        const wx = (t.clientX - rect.left - v.x) / v.k;
+        const wy = (t.clientY - rect.top - v.y) / v.k;
+        const hit = hitTestRef.current(wx, wy);
+        if (hit) onNav(hit);
+      }
+    };
+
+    el.addEventListener("touchstart", onTouchStart, { passive: false });
+    el.addEventListener("touchmove", onTouchMove, { passive: false });
+    el.addEventListener("touchend", onTouchEnd, { passive: false });
+    el.addEventListener("touchcancel", onTouchEnd, { passive: false });
+    return () => {
+      el.removeEventListener("touchstart", onTouchStart);
+      el.removeEventListener("touchmove", onTouchMove);
+      el.removeEventListener("touchend", onTouchEnd);
+      el.removeEventListener("touchcancel", onTouchEnd);
+    };
+  }, []);
+
   // RAF-coalesced draw. Every effect-triggering change enqueues one
   // frame; any enqueues before the frame fires collapse into that
   // frame. Prevents back-pressure during rapid pan/zoom events.
@@ -511,7 +662,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
       onMouseUp={endDrag}
       onMouseLeave={endDrag}
       onClick={onClick}
-      style={{ cursor }}
+      style={{ cursor, touchAction: "none" }}
     >
       <canvas ref={canvasRef} style={{ width: size.w, height: size.h, display: "block" }} />
       {lastTiming && (
