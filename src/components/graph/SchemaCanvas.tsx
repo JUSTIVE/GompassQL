@@ -340,14 +340,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
         ctx.setLineDash([]);
       }
 
-      // Draw smooth spline through waypoints.
-      drawCatmullRom(ctx, pts, 0.5);
+      // Soften corners and draw spline. Corner-softened waypoints keep
+      // the Catmull-Rom curve inside the routed corridor instead of
+      // bulging toward nearby nodes.
+      const softPts = softenCorners(pts, 14);
+      drawCatmullRom(ctx, softPts, 0.35);
       ctx.stroke();
       ctx.setLineDash([]);
 
       // Arrowhead from last segment direction.
-      const last = pts[pts.length - 1]!;
-      const prev = pts[pts.length - 2]!;
+      const last = softPts[softPts.length - 1]!;
+      const prev = softPts[softPts.length - 2]!;
       const adx = last.x - prev.x;
       const ady = last.y - prev.y;
       const alen = Math.hypot(adx, ady);
@@ -461,9 +464,149 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
 }
 
 /**
+ * Return true if the horizontal/vertical segment (ax,ay)-(bx,by)
+ * intersects the expanded rectangle of any node other than src/tgt.
+ * Only handles axis-aligned segments (one of the two deltas is zero).
+ */
+function segmentHitsAnyNode(
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+  src: LaidNode,
+  tgt: LaidNode,
+  nodes: LaidNode[],
+  clearance: number,
+): LaidNode | null {
+  const xMin = Math.min(ax, bx);
+  const xMax = Math.max(ax, bx);
+  const yMin = Math.min(ay, by);
+  const yMax = Math.max(ay, by);
+  for (const n of nodes) {
+    if (n.id === src.id || n.id === tgt.id) continue;
+    const nLeft = n.cx - n.w / 2 - clearance;
+    const nRight = n.cx + n.w / 2 + clearance;
+    const nTop = n.cy - n.h / 2 - clearance;
+    const nBottom = n.cy + n.h / 2 + clearance;
+    if (xMax >= nLeft && xMin <= nRight && yMax >= nTop && yMin <= nBottom) {
+      return n;
+    }
+  }
+  return null;
+}
+
+function pathIsClear(pts: Point[], src: LaidNode, tgt: LaidNode, nodes: LaidNode[], clearance: number): boolean {
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i]!;
+    const b = pts[i + 1]!;
+    if (segmentHitsAnyNode(a.x, a.y, b.x, b.y, src, tgt, nodes, clearance)) return false;
+  }
+  return true;
+}
+
+/**
+ * Insert short waypoints on either side of each interior corner. This
+ * constrains the Catmull-Rom spline so it rounds tightly inside the
+ * L-corner corridor instead of bulging toward the nearest obstacle.
+ */
+function softenCorners(pts: Point[], radius = 14): Point[] {
+  if (pts.length <= 2) return pts.slice();
+  const out: Point[] = [pts[0]!];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = pts[i - 1]!;
+    const cur = pts[i]!;
+    const next = pts[i + 1]!;
+    const dx1 = cur.x - prev.x;
+    const dy1 = cur.y - prev.y;
+    const d1 = Math.hypot(dx1, dy1);
+    const dx2 = next.x - cur.x;
+    const dy2 = next.y - cur.y;
+    const d2 = Math.hypot(dx2, dy2);
+    const r1 = Math.min(radius, d1 / 2.2);
+    const r2 = Math.min(radius, d2 / 2.2);
+    if (r1 > 1) {
+      out.push({ x: cur.x - (dx1 / d1) * r1, y: cur.y - (dy1 / d1) * r1 });
+    }
+    out.push(cur);
+    if (r2 > 1) {
+      out.push({ x: cur.x + (dx2 / d2) * r2, y: cur.y + (dy2 / d2) * r2 });
+    }
+  }
+  out.push(pts[pts.length - 1]!);
+  return out;
+}
+
+/**
+ * Find a clear horizontal Y band that spans from fromX to toX, starting
+ * from a preferred Y and walking outward. Returns a Y value where a
+ * horizontal segment [fromX..toX] does not hit any node (other than
+ * src/tgt). Falls back to routing outside the graph if no band exists.
+ */
+function findClearBandY(
+  preferredY: number,
+  fromX: number,
+  toX: number,
+  src: LaidNode,
+  tgt: LaidNode,
+  nodes: LaidNode[],
+  clearance: number,
+): number {
+  const xMin = Math.min(fromX, toX);
+  const xMax = Math.max(fromX, toX);
+  // Collect Y intervals of nodes that overlap [xMin, xMax].
+  const intervals: Array<[number, number]> = [];
+  let globalTop = Infinity;
+  let globalBottom = -Infinity;
+  for (const n of nodes) {
+    globalTop = Math.min(globalTop, n.cy - n.h / 2);
+    globalBottom = Math.max(globalBottom, n.cy + n.h / 2);
+    if (n.id === src.id || n.id === tgt.id) continue;
+    const nLeft = n.cx - n.w / 2 - clearance;
+    const nRight = n.cx + n.w / 2 + clearance;
+    if (nRight < xMin || nLeft > xMax) continue;
+    intervals.push([n.cy - n.h / 2 - clearance, n.cy + n.h / 2 + clearance]);
+  }
+  if (intervals.length === 0) return preferredY;
+
+  // Merge overlapping intervals.
+  intervals.sort((a, b) => a[0] - b[0]);
+  const merged: Array<[number, number]> = [];
+  for (const iv of intervals) {
+    const last = merged[merged.length - 1];
+    if (last && iv[0] <= last[1]) {
+      last[1] = Math.max(last[1], iv[1]);
+    } else {
+      merged.push([iv[0], iv[1]]);
+    }
+  }
+
+  // If preferred Y is already in a gap, use it.
+  const inBlock = merged.find((iv) => preferredY >= iv[0] && preferredY <= iv[1]);
+  if (!inBlock) return preferredY;
+
+  // Otherwise pick the nearest gap edge: just above or just below the
+  // block containing preferredY. Prefer the closer side.
+  const above = inBlock[0] - clearance;
+  const below = inBlock[1] + clearance;
+  const aboveClear = !merged.some((iv) => iv !== inBlock && above >= iv[0] && above <= iv[1]);
+  const belowClear = !merged.some((iv) => iv !== inBlock && below >= iv[0] && below <= iv[1]);
+  if (aboveClear && belowClear) {
+    return Math.abs(above - preferredY) <= Math.abs(below - preferredY) ? above : below;
+  }
+  if (aboveClear) return above;
+  if (belowClear) return below;
+  // Both sides abut another block — route outside the graph entirely.
+  const outsideTop = globalTop - clearance - 20;
+  const outsideBottom = globalBottom + clearance + 20;
+  return Math.abs(outsideTop - preferredY) <= Math.abs(outsideBottom - preferredY)
+    ? outsideTop
+    : outsideBottom;
+}
+
+/**
  * Orthogonal edge routing: horizontal/vertical segments through gaps
- * between node columns. Forward edges use an L/Z shape; back-edges
- * route above or below all nodes.
+ * between node columns. Searches multiple channel X positions and Y
+ * bands to avoid crossing any node rectangle.
  */
 function routeOrthogonal(
   sx: number,
@@ -474,72 +617,79 @@ function routeOrthogonal(
   targetNode: LaidNode,
   allNodes: LaidNode[],
 ): Point[] {
-  const CLEARANCE = 30;
+  const CLEARANCE = 24;
 
   if (tx > sx + 10) {
-    // Forward edge: route through the horizontal gap.
-    const midX = (sx + tx) / 2;
+    // Forward edge. Try the natural midX, then walk outward to find a
+    // vertical channel that's clear of all non-endpoint nodes.
+    const baseMid = (sx + tx) / 2;
+    const span = tx - sx;
+    const maxOff = Math.max(40, span * 0.45);
+    const candidates: number[] = [baseMid];
+    for (let off = 30; off <= maxOff; off += 30) {
+      candidates.push(baseMid - off);
+      candidates.push(baseMid + off);
+    }
 
-    // Check if the vertical segment at midX crosses any node.
-    const minY = Math.min(sy, ty);
-    const maxY = Math.max(sy, ty);
-    let blocked = false;
-    for (const n of allNodes) {
-      if (n.id === sourceNode.id || n.id === targetNode.id) continue;
-      const nLeft = n.cx - n.w / 2 - CLEARANCE;
-      const nRight = n.cx + n.w / 2 + CLEARANCE;
-      const nTop = n.cy - n.h / 2 - CLEARANCE;
-      const nBottom = n.cy + n.h / 2 + CLEARANCE;
-      if (midX >= nLeft && midX <= nRight && nTop <= maxY && nBottom >= minY) {
-        blocked = true;
-        break;
+    for (const mid of candidates) {
+      if (mid <= sx + 10 || mid >= tx - 10) continue;
+      const path: Point[] = [
+        { x: sx, y: sy },
+        { x: mid, y: sy },
+        { x: mid, y: ty },
+        { x: tx, y: ty },
+      ];
+      if (pathIsClear(path, sourceNode, targetNode, allNodes, CLEARANCE)) {
+        return path;
       }
     }
 
-    if (!blocked) {
-      return [
+    // No simple L/Z worked. Route via a clear horizontal band, picking
+    // the nearest gap to the average row. Two-bend Z through that band.
+    const avgY = (sy + ty) / 2;
+    const bandY = findClearBandY(avgY, sx, tx, sourceNode, targetNode, allNodes, CLEARANCE);
+    // Find clear midX that avoids nodes along both vertical legs.
+    for (const mid of candidates) {
+      if (mid <= sx + 10 || mid >= tx - 10) continue;
+      const path: Point[] = [
         { x: sx, y: sy },
-        { x: midX, y: sy },
-        { x: midX, y: ty },
+        { x: mid, y: sy },
+        { x: mid, y: bandY },
+        { x: mid + Math.sign(tx - sx) * 30, y: bandY },
+        { x: mid + Math.sign(tx - sx) * 30, y: ty },
         { x: tx, y: ty },
       ];
+      if (pathIsClear(path, sourceNode, targetNode, allNodes, CLEARANCE)) {
+        return path;
+      }
     }
-
-    // Blocked: route above or below the blocking area.
-    let topY = Infinity;
-    let bottomY = -Infinity;
-    for (const n of allNodes) {
-      topY = Math.min(topY, n.cy - n.h / 2);
-      bottomY = Math.max(bottomY, n.cy + n.h / 2);
-    }
-    const avgY = (sy + ty) / 2;
-    const useTop = Math.abs(avgY - topY) < Math.abs(avgY - bottomY);
-    const routeY = useTop ? topY - CLEARANCE - 20 : bottomY + CLEARANCE + 20;
-
+    // Last resort: route around the outside.
+    const exitX = sourceNode.cx + sourceNode.w / 2 + 16;
+    const entryX = targetNode.cx - targetNode.w / 2 - 16;
     return [
       { x: sx, y: sy },
-      { x: midX, y: sy },
-      { x: midX, y: routeY },
-      { x: midX + (tx - sx) * 0.3, y: routeY },
-      { x: midX + (tx - sx) * 0.3, y: ty },
+      { x: exitX, y: sy },
+      { x: exitX, y: bandY },
+      { x: entryX, y: bandY },
+      { x: entryX, y: ty },
       { x: tx, y: ty },
     ];
   }
 
-  // Back-edge or same-column: route around via top or bottom.
-  let topY = Infinity;
-  let bottomY = -Infinity;
-  for (const n of allNodes) {
-    topY = Math.min(topY, n.cy - n.h / 2);
-    bottomY = Math.max(bottomY, n.cy + n.h / 2);
-  }
+  // Back-edge or same-column: route around via top or bottom using the
+  // nearest clear band rather than the full envelope.
   const avgY = (sy + ty) / 2;
-  const useTop = Math.abs(avgY - topY) <= Math.abs(avgY - bottomY);
-  const routeY = useTop ? topY - CLEARANCE - 30 : bottomY + CLEARANCE + 30;
-
   const exitX = sourceNode.cx + sourceNode.w / 2 + 20;
   const entryX = targetNode.cx - targetNode.w / 2 - 20;
-
+  const routeY = findClearBandY(
+    avgY,
+    Math.min(exitX, entryX),
+    Math.max(exitX, entryX),
+    sourceNode,
+    targetNode,
+    allNodes,
+    CLEARANCE,
+  );
   return [
     { x: sx, y: sy },
     { x: exitX, y: sy },
