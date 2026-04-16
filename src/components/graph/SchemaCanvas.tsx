@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { layoutGraph } from "@/lib/layout";
 import type { GraphEdgeData, GraphNodeData } from "@/lib/sdl-to-graph";
+import { computeSimilarityPairs } from "@/lib/similarity";
 import { colorizeType } from "@/lib/type-colors";
 import {
   HEADER_H,
@@ -97,8 +98,14 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     }));
     const linkInput = edges
       .filter((e) => e.source !== e.target)
-      .map((e) => ({ source: e.source, target: e.target }));
-    const positioned = layoutGraph(input, linkInput, rootId ?? undefined);
+      .map((e) => ({ source: e.source, target: e.target, kind: e.kind }));
+    const similarityPairs = computeSimilarityPairs(nodes, edges);
+    const hints = similarityPairs.map((p) => ({
+      source: p.a,
+      target: p.b,
+      weight: p.score,
+    }));
+    const positioned = layoutGraph(input, linkInput, rootId ?? undefined, hints);
     const byId = new Map<string, GraphNodeData>();
     for (const n of nodes) byId.set(n.id, n);
     return positioned.map((p) => ({

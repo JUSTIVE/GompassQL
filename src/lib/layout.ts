@@ -19,6 +19,17 @@ export interface LayoutEdgeInput {
   kind?: string;
 }
 
+/**
+ * Layout-time hint: pull these two nodes closer together with the given
+ * weight (0..1). Hints are *additional* attractions on top of real edges
+ * and do not need to correspond to a GraphQL relationship.
+ */
+export interface SimilarityHint {
+  source: string;
+  target: string;
+  weight: number;
+}
+
 export interface PositionedNode extends LayoutNodeInput {
   x: number;
   y: number;
@@ -30,11 +41,16 @@ const RANK_SEP = 450;
  * Hybrid layout: BFS rank gives horizontal structure, d3-force handles
  * vertical positioning and edge-aware relaxation. Cycles are visible as
  * short back-edges rather than hidden by strict layering.
+ *
+ * `similarityHints` provides high-quality pairwise attractions derived
+ * from semantic / structural analysis (see `lib/similarity.ts`). When
+ * supplied, hints replace the built-in neighbour-Jaccard heuristic.
  */
 export function layoutGraph(
   nodes: LayoutNodeInput[],
   edges: LayoutEdgeInput[],
   rootId?: string,
+  similarityHints?: SimilarityHint[],
 ): PositionedNode[] {
   if (nodes.length === 0) return [];
 
@@ -139,15 +155,22 @@ export function layoutGraph(
     }
   }
 
-  // Compute clusters for distance-based grouping.
-  const clusters = buildClusters(nodes, edges, nodeSet);
+  // Build similarity links: prefer caller-supplied hints (which carry
+  // semantic + naming + Relay-aware signals), fall back to the built-in
+  // neighbour-Jaccard heuristic when none provided.
+  const similarityLinks = similarityHints && similarityHints.length > 0
+    ? hintsToLinks(similarityHints, nodeSet)
+    : buildSimilarityLinks(nodes, edges, nodeSet);
+
+  // Compute clusters for distance-based grouping. Seed union-find with
+  // strong similarity hints so semantically-related nodes also share a
+  // cluster (which shortens *real* edges between them).
+  const clusters = buildClusters(nodes, edges, nodeSet, similarityHints);
   const clusterOf = new Map<string, string>();
   for (const [root, members] of clusters) {
     for (const id of members) clusterOf.set(id, root);
   }
 
-  // Similarity links pull same-cluster nodes together tightly.
-  const similarityLinks = buildSimilarityLinks(nodes, edges, nodeSet);
   const allLinks: SimLink[] = [...simLinks, ...similarityLinks, ...unionPairLinks];
 
   const unionPairSet = new Set(
@@ -160,8 +183,12 @@ export function layoutGraph(
       forceLink<SimNode, SimLink>(allLinks)
         .id((d) => d.id)
         .distance((l) => {
-          const link = l as SimLink & { _similarity?: boolean };
-          if (link._similarity) return 50;
+          const link = l as SimLink & { _similarity?: boolean; _weight?: number };
+          if (link._similarity) {
+            // Stronger similarity → tighter pull. Range: 200 (w=0) → 50 (w=1).
+            const w = Math.max(0, Math.min(1, link._weight ?? 0.2));
+            return 200 - w * 150;
+          }
           const s = (l.source as SimNode).id;
           const t = (l.target as SimNode).id;
           const key = `${s}-${t}`;
@@ -171,7 +198,10 @@ export function layoutGraph(
         })
         .strength((l) => {
           const link = l as SimLink & { _similarity?: boolean; _weight?: number };
-          if (link._similarity) return (link._weight ?? 0.1) * 0.5;
+          if (link._similarity) {
+            const w = Math.max(0, Math.min(1, link._weight ?? 0.2));
+            return w * 0.5;
+          }
           const s = (l.source as SimNode).id;
           const t = (l.target as SimNode).id;
           const key = `${s}-${t}`;
@@ -210,18 +240,17 @@ export function layoutGraph(
 }
 
 /**
- * Build invisible "similarity" links between nodes that share neighbours.
- * The more neighbours two nodes share (Jaccard), the stronger the attraction.
- * Only emits links above a threshold to avoid quadratic blowup.
- */
-/**
- * Build clusters via union-find on Jaccard-similar node pairs.
+ * Build clusters via union-find. When `hints` are provided, every hint
+ * with weight ≥ 0.35 unions its endpoints — this propagates the
+ * semantic similarity signal into cluster membership. As a fallback /
+ * supplement, neighbour-Jaccard above 0.15 also unions a pair.
  * Returns Map<clusterRoot, Set<nodeId>>.
  */
 function buildClusters(
   nodes: LayoutNodeInput[],
   edges: LayoutEdgeInput[],
   nodeSet: Set<string>,
+  hints?: SimilarityHint[],
 ): Map<string, Set<string>> {
   const neighbours = new Map<string, Set<string>>();
   for (const nd of nodes) neighbours.set(nd.id, new Set());
@@ -245,18 +274,26 @@ function buildClusters(
     parent.set(find(a), find(b));
   };
 
-  const ids = nodes.map((nd) => nd.id);
-  for (let i = 0; i < ids.length; i++) {
-    const nA = neighbours.get(ids[i]!)!;
-    if (nA.size === 0) continue;
-    for (let j = i + 1; j < ids.length; j++) {
-      const nB = neighbours.get(ids[j]!)!;
-      if (nB.size === 0) continue;
-      let inter = 0;
-      for (const x of nA) if (nB.has(x)) inter++;
-      if (inter === 0) continue;
-      const jaccard = inter / (nA.size + nB.size - inter);
-      if (jaccard >= 0.15) union(ids[i]!, ids[j]!);
+  if (hints && hints.length > 0) {
+    for (const h of hints) {
+      if (h.weight < 0.35) continue;
+      if (!nodeSet.has(h.source) || !nodeSet.has(h.target)) continue;
+      union(h.source, h.target);
+    }
+  } else {
+    const ids = nodes.map((nd) => nd.id);
+    for (let i = 0; i < ids.length; i++) {
+      const nA = neighbours.get(ids[i]!)!;
+      if (nA.size === 0) continue;
+      for (let j = i + 1; j < ids.length; j++) {
+        const nB = neighbours.get(ids[j]!)!;
+        if (nB.size === 0) continue;
+        let inter = 0;
+        for (const x of nA) if (nB.has(x)) inter++;
+        if (inter === 0) continue;
+        const jaccard = inter / (nA.size + nB.size - inter);
+        if (jaccard >= 0.15) union(ids[i]!, ids[j]!);
+      }
     }
   }
 
@@ -269,6 +306,31 @@ function buildClusters(
   return groups;
 }
 
+/** Convert externally-supplied similarity hints into d3-force links. */
+function hintsToLinks(
+  hints: SimilarityHint[],
+  nodeSet: Set<string>,
+): Array<{ source: string; target: string; _similarity: true; _weight: number }> {
+  const out: Array<{ source: string; target: string; _similarity: true; _weight: number }> = [];
+  for (const h of hints) {
+    if (h.source === h.target) continue;
+    if (!nodeSet.has(h.source) || !nodeSet.has(h.target)) continue;
+    if (h.weight <= 0) continue;
+    out.push({
+      source: h.source,
+      target: h.target,
+      _similarity: true,
+      _weight: Math.min(1, h.weight),
+    });
+  }
+  return out;
+}
+
+/**
+ * Fallback similarity heuristic: Jaccard over shared neighbours. Used
+ * when no explicit hints are supplied. Caller-supplied hints from
+ * `lib/similarity.ts` produce higher-quality, semantic signals.
+ */
 function buildSimilarityLinks(
   nodes: LayoutNodeInput[],
   edges: LayoutEdgeInput[],
