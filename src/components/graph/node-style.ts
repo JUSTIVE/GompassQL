@@ -7,6 +7,10 @@ interface KindStyle {
   badge: string;
 }
 
+/**
+ * Tailwind-class style map used by the tree panel / badge UIs.
+ * SVG rendering uses KIND_COLORS below (raw color strings).
+ */
 export const KIND_STYLES: Record<NodeKind, KindStyle> = {
   Object: {
     label: "type",
@@ -46,10 +50,25 @@ export const KIND_STYLES: Record<NodeKind, KindStyle> = {
   },
 };
 
-const NODE_WIDTH = 220;
-const HEADER_H = 38;
-const ROW_H = 16;
-const PADDING = 10;
+/**
+ * Raw color values for SVG rendering. Derived from Tailwind's *-500 palette.
+ * Per spec (rule 6) only type/input/union/interface are colored distinctly;
+ * enum and scalar reuse type/interface tones.
+ */
+export const KIND_COLORS: Record<NodeKind, string> = {
+  Object: "#0ea5e9", // sky-500
+  Interface: "#8b5cf6", // violet-500
+  Union: "#f59e0b", // amber-500
+  Enum: "#10b981", // emerald-500
+  Scalar: "#f43f5e", // rose-500
+  Input: "#d946ef", // fuchsia-500
+};
+
+export const NODE_WIDTH = 220;
+export const HEADER_H = 42;
+export const ROW_H = 14;
+export const TOP_BODY_PAD = 8;
+export const BOTTOM_PAD = 10;
 
 export function estimateNodeHeight(
   kind: NodeKind,
@@ -65,7 +84,8 @@ export function estimateNodeHeight(
         : kind === "Scalar"
           ? 0
           : fieldCount;
-  return HEADER_H + PADDING + Math.max(rows, 0) * ROW_H + (rows === 0 ? 10 : 0);
+  const body = rows === 0 ? 14 : rows * ROW_H;
+  return HEADER_H + TOP_BODY_PAD + body + BOTTOM_PAD;
 }
 
 export const NODE_DIMENSIONS = { width: NODE_WIDTH };

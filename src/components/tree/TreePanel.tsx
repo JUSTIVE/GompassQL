@@ -10,15 +10,24 @@ const BUILTIN = new Set(["String", "Int", "Float", "Boolean", "ID"]);
 const ROOT_CANDIDATES = ["Query", "Mutation", "Subscription"];
 
 export function TreePanel() {
-  const { graph, rootType, setRootType, focusStack, pushFocus, popTo, name } = useSchema();
+  const {
+    graph,
+    visibleNodes,
+    rootType,
+    setRootType,
+    focusStack,
+    pushFocus,
+    popTo,
+    name,
+  } = useSchema();
 
   const byId = useMemo(
-    () => new Map(graph.nodes.map((n) => [n.id, n])),
-    [graph.nodes],
+    () => new Map(visibleNodes.map((n) => [n.id, n])),
+    [visibleNodes],
   );
   const roots = useMemo(
-    () => ROOT_CANDIDATES.filter((r) => byId.has(r)),
-    [byId],
+    () => ROOT_CANDIDATES.filter((r) => graph.nodes.some((n) => n.id === r)),
+    [graph.nodes],
   );
   const otherRoots = useMemo(
     () =>

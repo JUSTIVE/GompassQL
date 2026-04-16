@@ -1,11 +1,16 @@
 import { createContext, useCallback, useContext, useMemo, useState } from "react";
-import { sdlToGraph, type ParsedGraph } from "./sdl-to-graph";
+import { reachableFrom } from "./reachable";
+import { sdlToGraph, type GraphEdgeData, type GraphNodeData, type ParsedGraph } from "./sdl-to-graph";
 
 interface SchemaContextValue {
   sdl: string;
   name: string;
   graph: ParsedGraph;
   hasSchema: boolean;
+  /** Nodes reachable from the current root type. */
+  visibleNodes: GraphNodeData[];
+  /** Edges reachable from the current root type. */
+  visibleEdges: GraphEdgeData[];
   setSchema: (input: { sdl: string; name?: string }) => void;
   clearSchema: () => void;
 
@@ -57,6 +62,11 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     return graph.nodes[0]?.id ?? null;
   }, [graph, rootType]);
 
+  const visible = useMemo(() => {
+    if (!effectiveRoot) return { nodes: graph.nodes, edges: graph.edges };
+    return reachableFrom(graph.nodes, graph.edges, effectiveRoot);
+  }, [graph, effectiveRoot]);
+
   const setSchema = useCallback(
     ({ sdl: nextSdl, name: nextName }: { sdl: string; name?: string }) => {
       const n = nextName?.trim() || "Untitled schema";
@@ -65,7 +75,10 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
       setFocusStack([]);
       setRootTypeState(null);
       try {
-        sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ sdl: nextSdl, name: n }));
+        sessionStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify({ sdl: nextSdl, name: n }),
+        );
       } catch {
         // ignore
       }
@@ -103,6 +116,8 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     name,
     graph,
     hasSchema: graph.nodes.length > 0,
+    visibleNodes: visible.nodes,
+    visibleEdges: visible.edges,
     setSchema,
     clearSchema,
     rootType: effectiveRoot,

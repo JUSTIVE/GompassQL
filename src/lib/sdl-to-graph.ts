@@ -6,6 +6,7 @@ export interface GraphField {
   name: string;
   type: string;
   typeName: string;
+  nullable: boolean;
   args?: { name: string; type: string }[];
   description?: string;
 }
@@ -28,6 +29,7 @@ export interface GraphEdgeData {
   sourceField?: string;
   label?: string;
   kind: "field" | "implements" | "union";
+  nullable?: boolean;
 }
 
 export interface ParsedGraph {
@@ -83,6 +85,7 @@ export function sdlToGraph(sdl: string): ParsedGraph {
             name: f.name.value,
             type: t.rendered,
             typeName: t.base,
+            nullable: f.type.kind !== Kind.NON_NULL_TYPE,
             description: f.description?.value,
             args:
               "arguments" in f && f.arguments
@@ -118,6 +121,7 @@ export function sdlToGraph(sdl: string): ParsedGraph {
             sourceField: field.name,
             label: field.name,
             kind: "field",
+            nullable: field.nullable,
           });
         }
 

@@ -29,18 +29,3 @@ body {
 .cm-scroller {
   overflow: auto;
 }
-
-/* React Flow integrates with our theme tokens */
-.react-flow {
-  background-color: var(--background);
-  --xy-background-color-default: var(--background);
-  --xy-background-pattern-color-default: color-mix(in oklch, var(--muted-foreground) 35%, transparent);
-  --xy-edge-stroke-default: var(--color-chart-1);
-  --xy-edge-label-color-default: var(--muted-foreground);
-  --xy-controls-button-background-color-default: var(--card);
-  --xy-controls-button-background-color-hover-default: var(--secondary);
-  --xy-controls-button-color-default: var(--foreground);
-  --xy-controls-button-border-color-default: var(--border);
-  --xy-minimap-background-color-default: var(--card);
-  --xy-minimap-mask-background-color-default: color-mix(in oklch, var(--background) 70%, transparent);
-}
