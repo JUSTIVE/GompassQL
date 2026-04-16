@@ -1,13 +1,3 @@
-import {
-  forceCenter,
-  forceCollide,
-  forceLink,
-  forceManyBody,
-  forceSimulation,
-  forceX,
-  forceY,
-} from "d3-force";
-
 export interface LayoutNodeInput {
   id: string;
   width: number;
@@ -20,133 +10,166 @@ export interface LayoutEdgeInput {
 }
 
 export interface PositionedNode extends LayoutNodeInput {
-  /** Node center x */
-  x: number;
-  /** Node center y */
-  y: number;
-}
-
-interface SimNode extends LayoutNodeInput {
   x: number;
   y: number;
 }
 
-interface SimLink {
-  source: string | SimNode;
-  target: string | SimNode;
-}
+const RANK_SEP = 320;
+const NODE_SEP = 28;
 
+/**
+ * Topological-sort based layered layout.
+ *
+ * 1. BFS from `rootId` to assign a rank (depth) to each node.
+ *    Cycles are handled naturally: already-visited nodes keep their
+ *    earlier rank, so cycle edges become "back-edges" (right→left).
+ * 2. Within each rank, nodes are reordered via the median heuristic
+ *    (3 passes) to reduce edge crossings.
+ * 3. Nodes in the same rank are stacked vertically, centered at y=0.
+ */
 export function layoutGraph(
   nodes: LayoutNodeInput[],
   edges: LayoutEdgeInput[],
+  rootId?: string,
 ): PositionedNode[] {
   if (nodes.length === 0) return [];
 
-  const n = nodes.length;
-  const radius = Math.max(300, Math.sqrt(n) * 140);
+  const nodeSet = new Set(nodes.map((n) => n.id));
+  const adj = new Map<string, string[]>();
+  for (const e of edges) {
+    if (e.source === e.target) continue;
+    if (!nodeSet.has(e.source) || !nodeSet.has(e.target)) continue;
+    if (!adj.has(e.source)) adj.set(e.source, []);
+    adj.get(e.source)!.push(e.target);
+  }
 
-  const simNodes: SimNode[] = nodes.map((node, i) => {
-    const angle = (i / n) * Math.PI * 2;
-    return {
-      ...node,
-      x: Math.cos(angle) * radius,
-      y: Math.sin(angle) * radius,
-    };
-  });
+  // Detect root: prefer passed rootId, else node with 0 in-degree, else first.
+  let root = rootId;
+  if (!root || !nodeSet.has(root)) {
+    const hasIncoming = new Set<string>();
+    for (const e of edges) {
+      if (nodeSet.has(e.target)) hasIncoming.add(e.target);
+    }
+    root = nodes.find((n) => !hasIncoming.has(n.id))?.id ?? nodes[0]?.id;
+  }
+  if (!root) return [];
 
-  const simLinks: SimLink[] = edges
-    .filter((e) => e.source !== e.target)
-    .map((e) => ({ source: e.source, target: e.target }));
+  // BFS to assign ranks.
+  const rank = new Map<string, number>();
+  rank.set(root, 0);
+  const queue: string[] = [root];
+  let maxRank = 0;
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    const r = rank.get(id)!;
+    for (const nb of adj.get(id) ?? []) {
+      if (!rank.has(nb)) {
+        rank.set(nb, r + 1);
+        if (r + 1 > maxRank) maxRank = r + 1;
+        queue.push(nb);
+      }
+    }
+  }
+  // Assign unreached nodes (shouldn't happen with reachability filter).
+  for (const n of nodes) {
+    if (!rank.has(n.id)) {
+      rank.set(n.id, maxRank + 1);
+      maxRank = maxRank + 1;
+    }
+  }
 
-  const sim = forceSimulation<SimNode>(simNodes)
-    .force(
-      "link",
-      forceLink<SimNode, SimLink>(simLinks)
-        .id((d) => d.id)
-        .distance((l) => {
-          const s = l.source as SimNode;
-          const t = l.target as SimNode;
-          return (
-            Math.hypot(s.width, s.height) / 2 +
-            Math.hypot(t.width, t.height) / 2 +
-            80
-          );
-        })
-        .strength(0.3),
-    )
-    .force(
-      "charge",
-      forceManyBody<SimNode>().strength(-1100).distanceMax(1500),
-    )
-    .force("center", forceCenter<SimNode>(0, 0))
-    .force("x", forceX<SimNode>(0).strength(0.03))
-    .force("y", forceY<SimNode>(0).strength(0.03))
-    .force(
-      "collide",
-      forceCollide<SimNode>()
-        .radius((d) => Math.hypot(d.width, d.height) / 2 + 12)
-        .strength(1)
-        .iterations(3),
-    )
-    .stop();
+  // Group nodes by rank.
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const ranks = new Map<number, LayoutNodeInput[]>();
+  for (const n of nodes) {
+    const r = rank.get(n.id)!;
+    if (!ranks.has(r)) ranks.set(r, []);
+    ranks.get(r)!.push(n);
+  }
 
-  const ticks = Math.min(600, Math.max(200, Math.ceil(Math.sqrt(n) * 70)));
-  for (let i = 0; i < ticks; i++) sim.tick();
+  // Initial sort: alphabetical within each rank.
+  for (const group of ranks.values()) {
+    group.sort((a, b) => a.id.localeCompare(b.id));
+  }
 
-  resolveOverlaps(simNodes);
+  // Edge crossing reduction: median heuristic, 4 forward+backward sweeps.
+  for (let sweep = 0; sweep < 4; sweep++) {
+    // Forward sweep (rank 1 → maxRank)
+    for (let r = 1; r <= maxRank; r++) {
+      reorderByMedian(ranks, edges, rank, r, r - 1);
+    }
+    // Backward sweep (maxRank-1 → 0)
+    for (let r = maxRank - 1; r >= 0; r--) {
+      reorderByMedian(ranks, edges, rank, r, r + 1);
+    }
+  }
 
-  return simNodes.map((sn) => ({
-    id: sn.id,
-    width: sn.width,
-    height: sn.height,
-    x: sn.x,
-    y: sn.y,
-  }));
+  // Assign positions: x = rank * RANK_SEP, y = centered stack.
+  const result: PositionedNode[] = [];
+  for (const [r, group] of ranks) {
+    const totalH =
+      group.reduce((sum, n) => sum + n.height, 0) +
+      (group.length - 1) * NODE_SEP;
+    let y = -totalH / 2;
+    for (const n of group) {
+      result.push({
+        id: n.id,
+        width: n.width,
+        height: n.height,
+        x: r * RANK_SEP,
+        y: y + n.height / 2,
+      });
+      y += n.height + NODE_SEP;
+    }
+  }
+
+  return result;
 }
 
 /**
- * Iteratively separate any axis-aligned rectangles that still overlap
- * after the force simulation. Ensures the "no overlap" hard guarantee.
+ * Reorder nodes in `targetRank` so that each node's median position among
+ * its neighbours in `refRank` determines sort order. Reduces edge crossings.
  */
-function resolveOverlaps(nodes: SimNode[]) {
-  const PAD = 14;
-  const MAX_ITER = 80;
-  for (let iter = 0; iter < MAX_ITER; iter++) {
-    let moved = false;
-    for (let i = 0; i < nodes.length; i++) {
-      const a = nodes[i]!;
-      for (let j = i + 1; j < nodes.length; j++) {
-        const b = nodes[j]!;
-        const minDx = (a.width + b.width) / 2 + PAD;
-        const minDy = (a.height + b.height) / 2 + PAD;
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
-        const overlapX = minDx - Math.abs(dx);
-        const overlapY = minDy - Math.abs(dy);
-        if (overlapX > 0 && overlapY > 0) {
-          if (overlapX < overlapY) {
-            const push = overlapX / 2;
-            if (dx >= 0) {
-              a.x -= push;
-              b.x += push;
-            } else {
-              a.x += push;
-              b.x -= push;
-            }
-          } else {
-            const push = overlapY / 2;
-            if (dy >= 0) {
-              a.y -= push;
-              b.y += push;
-            } else {
-              a.y += push;
-              b.y -= push;
-            }
-          }
-          moved = true;
-        }
+function reorderByMedian(
+  ranks: Map<number, LayoutNodeInput[]>,
+  edges: LayoutEdgeInput[],
+  nodeRank: Map<string, number>,
+  targetRank: number,
+  refRank: number,
+) {
+  const group = ranks.get(targetRank);
+  const refGroup = ranks.get(refRank);
+  if (!group || !refGroup) return;
+
+  const refPos = new Map<string, number>();
+  refGroup.forEach((n, i) => refPos.set(n.id, i));
+
+  const medians = new Map<string, number>();
+  for (const n of group) {
+    const positions: number[] = [];
+    for (const e of edges) {
+      if (e.target === n.id && refPos.has(e.source)) {
+        positions.push(refPos.get(e.source)!);
+      }
+      if (e.source === n.id && refPos.has(e.target)) {
+        positions.push(refPos.get(e.target)!);
       }
     }
-    if (!moved) break;
+    if (positions.length > 0) {
+      positions.sort((a, b) => a - b);
+      medians.set(
+        n.id,
+        positions[Math.floor(positions.length / 2)]!,
+      );
+    }
   }
+
+  group.sort((a, b) => {
+    const ma = medians.get(a.id);
+    const mb = medians.get(b.id);
+    if (ma !== undefined && mb !== undefined) return ma - mb;
+    if (ma !== undefined) return -1;
+    if (mb !== undefined) return 1;
+    return 0;
+  });
 }

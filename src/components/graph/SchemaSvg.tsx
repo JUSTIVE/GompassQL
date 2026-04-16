@@ -33,6 +33,7 @@ interface Props {
   nodes: GraphNodeData[];
   edges: GraphEdgeData[];
   focusId?: string | null;
+  rootId?: string | null;
 }
 
 /**
@@ -58,7 +59,7 @@ function rectExit(
   return [cx + dx * t, cy + dy * t];
 }
 
-export function SchemaSvg({ nodes, edges, focusId }: Props) {
+export function SchemaSvg({ nodes, edges, focusId, rootId }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 1, h: 1 });
   const [view, setView] = useState({ x: 0, y: 0, k: 1 });
@@ -90,7 +91,7 @@ export function SchemaSvg({ nodes, edges, focusId }: Props) {
     const linkInput = edges
       .filter((e) => e.source !== e.target)
       .map((e) => ({ source: e.source, target: e.target }));
-    const positioned = layoutGraph(input, linkInput);
+    const positioned = layoutGraph(input, linkInput, rootId ?? undefined);
     const byId = new Map<string, GraphNodeData>();
     for (const n of nodes) byId.set(n.id, n);
     return positioned.map((p) => ({
@@ -101,7 +102,7 @@ export function SchemaSvg({ nodes, edges, focusId }: Props) {
       w: p.width,
       h: p.height,
     }));
-  }, [nodes, edges]);
+  }, [nodes, edges, rootId]);
 
   const nodeById = useMemo(() => {
     const m = new Map<string, LaidNode>();
@@ -186,29 +187,7 @@ export function SchemaSvg({ nodes, edges, focusId }: Props) {
     }));
   }, [focusId, nodeById, size.w, size.h]);
 
-  // Wheel zoom (native listener for preventDefault).
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      const rect = el.getBoundingClientRect();
-      const mx = e.clientX - rect.left;
-      const my = e.clientY - rect.top;
-      const scale = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-      setView((v) => {
-        const k = Math.max(0.1, Math.min(4, v.k * scale));
-        const ratio = k / v.k;
-        return {
-          k,
-          x: mx - (mx - v.x) * ratio,
-          y: my - (my - v.y) * ratio,
-        };
-      });
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, []);
+  // No zoom — only pan is allowed (rule 1: non-interactive graph).
 
   const onMouseDown = (e: React.MouseEvent) => {
     drag.current = { active: true, lastX: e.clientX, lastY: e.clientY };

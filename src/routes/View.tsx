@@ -24,7 +24,7 @@ export function ViewRoute() {
         <TreePanel />
       </aside>
       <section className="relative min-h-[500px] flex-1">
-        <SchemaSvg nodes={visibleNodes} edges={visibleEdges} focusId={focusId} />
+        <SchemaSvg nodes={visibleNodes} edges={visibleEdges} focusId={focusId} rootId={rootType} />
       </section>
     </div>
   );
