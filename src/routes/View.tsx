@@ -5,8 +5,14 @@ import { TreePanel } from "@/components/tree/TreePanel";
 import { useSchema } from "@/lib/schema-context";
 
 export function ViewRoute() {
-  const { focusStack, rootType, hasSchema, visibleNodes, visibleEdges } =
-    useSchema();
+  const {
+    focusStack,
+    rootType,
+    hasSchema,
+    visibleNodes,
+    visibleEdges,
+    pushFocus,
+  } = useSchema();
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -24,7 +30,13 @@ export function ViewRoute() {
         <TreePanel />
       </aside>
       <section className="relative min-h-[500px] flex-1">
-        <SchemaCanvas nodes={visibleNodes} edges={visibleEdges} focusId={focusId} rootId={rootType} />
+        <SchemaCanvas
+          nodes={visibleNodes}
+          edges={visibleEdges}
+          focusId={focusId}
+          rootId={rootType}
+          onNavigate={pushFocus}
+        />
       </section>
     </div>
   );

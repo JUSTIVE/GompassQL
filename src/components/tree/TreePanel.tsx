@@ -1,5 +1,5 @@
-import { ChevronRight } from "lucide-react";
-import { useMemo } from "react";
+import { ChevronDown, ChevronRight } from "lucide-react";
+import { useMemo, useState } from "react";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
 import { useSchema } from "@/lib/schema-context";
@@ -21,6 +21,7 @@ export function TreePanel() {
     popTo,
     name,
   } = useSchema();
+  const [allTypesOpen, setAllTypesOpen] = useState(false);
 
   const byId = useMemo(
     () => new Map(visibleNodes.map((n) => [n.id, n])),
@@ -49,6 +50,24 @@ export function TreePanel() {
 
   const isNavigable = (typeName: string) =>
     !BUILTIN.has(typeName) && byId.has(typeName);
+
+  const allTypesSorted = useMemo(
+    () => [...graph.nodes].sort((a, b) => a.name.localeCompare(b.name)),
+    [graph.nodes],
+  );
+
+  const jumpTo = (id: string) => {
+    if (id === rootType) {
+      popTo(-1);
+      return;
+    }
+    const idx = focusStack.indexOf(id);
+    if (idx >= 0) {
+      popTo(idx);
+      return;
+    }
+    pushFocus(id);
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col [&_::-webkit-scrollbar]:w-0 [&_::-webkit-scrollbar]:h-0 [scrollbar-width:none]">
@@ -91,6 +110,57 @@ export function TreePanel() {
           </select>
         )}
       </div>
+
+      {graph.nodes.length > 0 && (
+        <div className="border-b border-border">
+          <button
+            type="button"
+            onClick={() => setAllTypesOpen((v) => !v)}
+            className="flex w-full items-center gap-1 px-3 py-2 text-[10px] uppercase tracking-wider text-muted-foreground hover:bg-secondary/40"
+          >
+            {allTypesOpen ? (
+              <ChevronDown className="h-3 w-3" />
+            ) : (
+              <ChevronRight className="h-3 w-3" />
+            )}
+            <span>All types ({graph.nodes.length})</span>
+          </button>
+          {allTypesOpen && (
+            <ul className="max-h-48 overflow-auto border-t border-border">
+              {allTypesSorted.map((n) => {
+                const selected = n.id === currentId;
+                const style = KIND_STYLES[n.kind];
+                return (
+                  <li key={n.id}>
+                    <button
+                      type="button"
+                      onClick={() => jumpTo(n.id)}
+                      className={cn(
+                        "flex w-full items-center gap-2 px-3 py-1 text-left font-mono text-xs transition-colors",
+                        selected
+                          ? "bg-primary text-primary-foreground"
+                          : "text-foreground hover:bg-secondary/60",
+                      )}
+                    >
+                      <Badge
+                        className={cn(
+                          "shrink-0 px-1.5 py-0 text-[9px] leading-4",
+                          selected
+                            ? "bg-primary-foreground/20 text-primary-foreground"
+                            : style.badge,
+                        )}
+                      >
+                        {style.label}
+                      </Badge>
+                      <span className="truncate">{n.name}</span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      )}
 
       {path.length > 0 && (
         <div className="border-b border-border px-3 py-2">
