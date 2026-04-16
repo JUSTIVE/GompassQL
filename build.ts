@@ -135,9 +135,33 @@ const result = await Bun.build({
   ...cliConfig,
 });
 
+// Second build pass: the layout Web Worker. Bun's HTML-entrypoint
+// bundler doesn't rewrite `new Worker(new URL(...))`, so we emit the
+// worker as its own standalone chunk at a fixed URL. `naming` forces
+// a predictable filename so both dev (served via Bun.serve) and prod
+// (static asset) reach it at `/layout-worker.js`.
+const workerResult = await Bun.build({
+  entrypoints: [path.resolve("src/lib/layout-worker.ts")],
+  outdir,
+  target: "browser",
+  format: "esm",
+  minify: true,
+  sourcemap: "linked",
+  naming: "[name].[ext]",
+  define: {
+    "process.env.NODE_ENV": JSON.stringify("production"),
+  },
+});
+
 const end = performance.now();
 
-const outputTable = result.outputs.map(output => ({
+if (!workerResult.success) {
+  console.error("\n❌ Worker build failed:");
+  for (const log of workerResult.logs) console.error(log);
+  process.exit(1);
+}
+
+const outputTable = [...result.outputs, ...workerResult.outputs].map(output => ({
   File: path.relative(process.cwd(), output.path),
   Type: output.kind,
   Size: formatFileSize(output.size),
