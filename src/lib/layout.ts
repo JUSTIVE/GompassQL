@@ -1,11 +1,21 @@
-import {
-  forceCollide,
-  forceLink,
-  forceManyBody,
-  forceSimulation,
-  forceX,
-  forceY,
-} from "d3-force";
+/**
+ * Layered (Sugiyama-style) graph layout for GraphQL schema diagrams.
+ *
+ * Pipeline:
+ *   1. Rank assignment via BFS from the root.
+ *   2. Dummy-node insertion so every edge spans exactly one rank; dummies
+ *      reserve Y slots in intermediate columns so edges never need to be
+ *      rerouted around intervening nodes later on.
+ *   3. Barycenter sweeps to minimise edge crossings within each rank,
+ *      with similarity hints used as a stable tiebreaker so clustered
+ *      nodes sit adjacent.
+ *   4. Y assignment: stack-and-center followed by "pull toward neighbour
+ *      average" relaxation with a hard minimum-gap constraint.
+ *   5. Reconstruct orthogonal edge waypoints from the dummy chain.
+ *
+ * X coordinates are *strict* (`rank * RANK_SEP`) — columns never drift —
+ * which is the structural fix that makes clean edge routing possible.
+ */
 
 export interface LayoutNodeInput {
   id: string;
@@ -14,6 +24,7 @@ export interface LayoutNodeInput {
 }
 
 export interface LayoutEdgeInput {
+  id?: string;
   source: string;
   target: string;
   kind?: string;
@@ -35,378 +46,615 @@ export interface PositionedNode extends LayoutNodeInput {
   y: number;
 }
 
-const RANK_SEP = 450;
+export interface EdgePathPoint {
+  x: number;
+  y: number;
+}
 
-/**
- * Hybrid layout: BFS rank gives horizontal structure, d3-force handles
- * vertical positioning and edge-aware relaxation. Cycles are visible as
- * short back-edges rather than hidden by strict layering.
- *
- * `similarityHints` provides high-quality pairwise attractions derived
- * from semantic / structural analysis (see `lib/similarity.ts`). When
- * supplied, hints replace the built-in neighbour-Jaccard heuristic.
- */
+export interface EdgePath {
+  edgeId: string;
+  source: string;
+  target: string;
+  waypoints: EdgePathPoint[];
+}
+
+export interface LayoutResult {
+  nodes: PositionedNode[];
+  edgePaths: EdgePath[];
+}
+
+const RANK_SEP = 340;
+const Y_GAP = 32;
+const DUMMY_HEIGHT = 20;
+
 export function layoutGraph(
   nodes: LayoutNodeInput[],
   edges: LayoutEdgeInput[],
   rootId?: string,
   similarityHints?: SimilarityHint[],
-): PositionedNode[] {
-  if (nodes.length === 0) return [];
+): LayoutResult {
+  if (nodes.length === 0) return { nodes: [], edgePaths: [] };
 
-  const n = nodes.length;
-  const nodeSet = new Set(nodes.map((nd) => nd.id));
-
-  // BFS to assign ranks.
-  const adj = new Map<string, string[]>();
-  for (const e of edges) {
-    if (e.source === e.target) continue;
-    if (!nodeSet.has(e.source) || !nodeSet.has(e.target)) continue;
-    if (!adj.has(e.source)) adj.set(e.source, []);
-    adj.get(e.source)!.push(e.target);
-  }
-
-  let root = rootId;
-  if (!root || !nodeSet.has(root)) {
-    const hasIncoming = new Set<string>();
-    for (const e of edges) {
-      if (nodeSet.has(e.target)) hasIncoming.add(e.target);
-    }
-    root = nodes.find((nd) => !hasIncoming.has(nd.id))?.id ?? nodes[0]?.id;
-  }
-  if (!root) return [];
-
-  const rank = new Map<string, number>();
-  rank.set(root, 0);
-  const queue: string[] = [root];
-  let maxRank = 0;
-  while (queue.length > 0) {
-    const id = queue.shift()!;
-    const r = rank.get(id)!;
-    for (const nb of adj.get(id) ?? []) {
-      if (!rank.has(nb)) {
-        const nr = r + 1;
-        rank.set(nb, nr);
-        if (nr > maxRank) maxRank = nr;
-        queue.push(nb);
-      }
-    }
-  }
-  for (const nd of nodes) {
-    if (!rank.has(nd.id)) {
-      rank.set(nd.id, maxRank + 1);
-    }
-  }
-
-  // Count nodes per rank for initial vertical spread.
-  const rankCount = new Map<number, number>();
-  const rankIndex = new Map<string, number>();
-  for (const nd of nodes) {
-    const r = rank.get(nd.id)!;
-    const idx = rankCount.get(r) ?? 0;
-    rankCount.set(r, idx + 1);
-    rankIndex.set(nd.id, idx);
-  }
-
-  interface SimNode extends LayoutNodeInput {
-    x: number;
-    y: number;
-    targetX: number;
-  }
-  interface SimLink {
-    source: string | SimNode;
-    target: string | SimNode;
-  }
-
-  const simNodes: SimNode[] = nodes.map((nd) => {
-    const r = rank.get(nd.id)!;
-    const count = rankCount.get(r)!;
-    const idx = rankIndex.get(nd.id)!;
-    const spreadY = (idx - (count - 1) / 2) * (nd.height + 40);
-    const isRoot = nd.id === root;
-    return {
-      ...nd,
-      x: r * RANK_SEP,
-      y: isRoot ? 0 : spreadY,
-      targetX: r * RANK_SEP,
-      fx: isRoot ? 0 : undefined,
-      fy: isRoot ? 0 : undefined,
-    } as SimNode;
-  });
-
-  const simLinks: SimLink[] = edges
-    .filter((e) => e.source !== e.target && nodeSet.has(e.source) && nodeSet.has(e.target))
-    .map((e) => ({ source: e.source, target: e.target }));
-
-  // Extra tight links between members of the same union.
-  const unionMembers = new Map<string, string[]>();
-  for (const e of edges) {
-    if (e.kind === "union" && nodeSet.has(e.source) && nodeSet.has(e.target)) {
-      if (!unionMembers.has(e.source)) unionMembers.set(e.source, []);
-      unionMembers.get(e.source)!.push(e.target);
-    }
-  }
-  const unionPairLinks: SimLink[] = [];
-  for (const members of unionMembers.values()) {
-    for (let i = 0; i < members.length; i++) {
-      for (let j = i + 1; j < members.length; j++) {
-        unionPairLinks.push({ source: members[i]!, target: members[j]! });
-      }
-    }
-  }
-
-  // Build similarity links: prefer caller-supplied hints (which carry
-  // semantic + naming + Relay-aware signals), fall back to the built-in
-  // neighbour-Jaccard heuristic when none provided.
-  const similarityLinks = similarityHints && similarityHints.length > 0
-    ? hintsToLinks(similarityHints, nodeSet)
-    : buildSimilarityLinks(nodes, edges, nodeSet);
-
-  // Compute clusters for distance-based grouping. Seed union-find with
-  // strong similarity hints so semantically-related nodes also share a
-  // cluster (which shortens *real* edges between them).
-  const clusters = buildClusters(nodes, edges, nodeSet, similarityHints);
-  const clusterOf = new Map<string, string>();
-  for (const [root, members] of clusters) {
-    for (const id of members) clusterOf.set(id, root);
-  }
-
-  const allLinks: SimLink[] = [...simLinks, ...similarityLinks, ...unionPairLinks];
-
-  const unionPairSet = new Set(
-    unionPairLinks.map((l) => `${(l.source as string)}-${(l.target as string)}`),
+  const nodeSet = new Set(nodes.map((n) => n.id));
+  const cleanEdges = edges.filter(
+    (e) => e.source !== e.target && nodeSet.has(e.source) && nodeSet.has(e.target),
   );
 
-  const sim = forceSimulation<SimNode>(simNodes)
-    .force(
-      "link",
-      forceLink<SimNode, SimLink>(allLinks)
-        .id((d) => d.id)
-        .distance((l) => {
-          const link = l as SimLink & { _similarity?: boolean; _weight?: number };
-          if (link._similarity) {
-            // Stronger similarity → tighter pull. Range: 200 (w=0) → 50 (w=1).
-            const w = Math.max(0, Math.min(1, link._weight ?? 0.2));
-            return 200 - w * 150;
-          }
-          const s = (l.source as SimNode).id;
-          const t = (l.target as SimNode).id;
-          const key = `${s}-${t}`;
-          if (unionPairSet.has(key)) return 40;
-          const sameCluster = clusterOf.get(s) === clusterOf.get(t);
-          return sameCluster ? 140 : 320;
-        })
-        .strength((l) => {
-          const link = l as SimLink & { _similarity?: boolean; _weight?: number };
-          if (link._similarity) {
-            const w = Math.max(0, Math.min(1, link._weight ?? 0.2));
-            return w * 0.5;
-          }
-          const s = (l.source as SimNode).id;
-          const t = (l.target as SimNode).id;
-          const key = `${s}-${t}`;
-          if (unionPairSet.has(key)) return 0.6;
-          const sameCluster = clusterOf.get(s) === clusterOf.get(t);
-          return sameCluster ? 0.25 : 0.08;
-        }),
-    )
-    .force("charge", forceManyBody<SimNode>().strength(-700).distanceMax(1500))
-    .force(
-      "rankX",
-      forceX<SimNode>().x((d) => d.targetX).strength(0.6),
-    )
-    .force("centerY", forceY<SimNode>(0).strength(0.03))
-    .force(
-      "collide",
-      forceCollide<SimNode>()
-        .radius((d) => Math.max(d.width, d.height) / 2 + 20)
-        .strength(1)
-        .iterations(4),
-    )
-    .stop();
+  // ── 1) Rank assignment (BFS from root) ────────────────────────────────
+  const root = pickRoot(nodes, cleanEdges, rootId);
+  if (!root) return { nodes: [], edgePaths: [] };
+  const ranks = bfsRanks(nodes, cleanEdges, root);
 
-  const ticks = Math.min(500, Math.max(200, Math.ceil(Math.sqrt(n) * 60)));
-  for (let i = 0; i < ticks; i++) sim.tick();
+  // ── 2) Dummy-node insertion for multi-rank edges ──────────────────────
+  const split = splitLongEdges(nodes, cleanEdges, ranks);
+  const allNodes = split.allNodes;
+  const allEdges = split.allEdges;
+  const dummyChains = split.dummyChains;
+  const nodeById = new Map<string, LayoutNodeInput>(allNodes.map((n) => [n.id, n]));
 
-  resolveOverlaps(simNodes);
+  // Group by rank in insertion order for initial layering.
+  const layers = new Map<number, string[]>();
+  for (const n of allNodes) {
+    const r = ranks.get(n.id)!;
+    if (!layers.has(r)) layers.set(r, []);
+    layers.get(r)!.push(n.id);
+  }
+  const rankKeys = [...layers.keys()].sort((a, b) => a - b);
 
-  return simNodes.map((sn) => ({
-    id: sn.id,
-    width: sn.width,
-    height: sn.height,
-    x: sn.x,
-    y: sn.y,
-  }));
+  // ── 3) Barycenter ordering ────────────────────────────────────────────
+  const undirected = buildUndirected(allEdges);
+  // Inject strong-enough similarity hints as pseudo-edges so they influence
+  // ordering without being counted as crossings.
+  const hintEdges: LayoutEdgeInput[] = [];
+  if (similarityHints) {
+    for (const h of similarityHints) {
+      if (h.weight < 0.3) continue;
+      if (!nodeSet.has(h.source) || !nodeSet.has(h.target)) continue;
+      hintEdges.push({ source: h.source, target: h.target });
+    }
+  }
+  const orderingNeighbours = buildUndirected([...allEdges, ...hintEdges]);
+  orderByBarycenter(layers, rankKeys, orderingNeighbours, allEdges, undirected);
+
+  // Same-rank similarity hints are invisible to barycenter (which only
+  // looks at adjacent layers). Post-process: group nodes connected by
+  // strong same-rank hints into contiguous blocks, preserving overall
+  // ordering by each block's minimum position.
+  if (similarityHints && similarityHints.length > 0) {
+    regroupWithinRankBySimilarity(layers, ranks, similarityHints);
+  }
+
+  // ── 4) Y coordinate assignment ────────────────────────────────────────
+  const yOf = assignY(layers, rankKeys, nodeById, undirected);
+
+  // ── 5) Emit positioned real + dummy nodes (pre-normalisation) ────────
+  const positioned: PositionedNode[] = [];
+  for (const n of nodes) {
+    const r = ranks.get(n.id);
+    if (r == null) continue;
+    positioned.push({
+      id: n.id,
+      width: n.width,
+      height: n.height,
+      x: r * RANK_SEP,
+      y: yOf.get(n.id) ?? 0,
+    });
+  }
+  const dummyPos = new Map<string, { x: number; y: number }>();
+  for (const n of allNodes) {
+    if (!n.id.startsWith("__dummy_")) continue;
+    const r = ranks.get(n.id)!;
+    dummyPos.set(n.id, { x: r * RANK_SEP, y: yOf.get(n.id) ?? 0 });
+  }
+  // Normalise real nodes and dummies together so waypoint math lines up.
+  const shift = computeNormalisationShift(positioned);
+  for (const p of positioned) {
+    p.x += shift.dx;
+    p.y += shift.dy;
+  }
+  for (const [id, p] of dummyPos) {
+    dummyPos.set(id, { x: p.x + shift.dx, y: p.y + shift.dy });
+  }
+
+  // Column envelopes (post-normalisation top/bottom Y per rank). For
+  // back-edges we need the union across every rank the horizontal leg
+  // traverses so the loop-around Y clears the *entire* span, not just
+  // the source and target columns.
+  const columnEnvelope = new Map<number, { top: number; bottom: number }>();
+  for (const p of positioned) {
+    const r = ranks.get(p.id)!;
+    const cur = columnEnvelope.get(r);
+    const top = p.y - p.height / 2;
+    const bottom = p.y + p.height / 2;
+    if (!cur) columnEnvelope.set(r, { top, bottom });
+    else {
+      cur.top = Math.min(cur.top, top);
+      cur.bottom = Math.max(cur.bottom, bottom);
+    }
+  }
+  const envelopeForRange = (rs: number, rt: number): { top: number; bottom: number } => {
+    const lo = Math.min(rs, rt);
+    const hi = Math.max(rs, rt);
+    let top = Infinity;
+    let bottom = -Infinity;
+    for (const [r, env] of columnEnvelope) {
+      if (r < lo || r > hi) continue;
+      top = Math.min(top, env.top);
+      bottom = Math.max(bottom, env.bottom);
+    }
+    if (!isFinite(top)) return { top: 0, bottom: 0 };
+    return { top, bottom };
+  };
+
+  // ── 6) Edge paths (through dummy positions) ───────────────────────────
+  const paths: EdgePath[] = [];
+  const realPos = new Map<string, PositionedNode>(positioned.map((p) => [p.id, p]));
+  for (const e of cleanEdges) {
+    const a = realPos.get(e.source);
+    const b = realPos.get(e.target);
+    if (!a || !b) continue;
+    const key = edgeKey(e);
+    const chain = dummyChains.get(key) ?? [];
+    const rs = ranks.get(e.source)!;
+    const rt = ranks.get(e.target)!;
+    const isBack = b.x <= a.x + a.width / 2;
+    const env = isBack ? envelopeForRange(rs, rt) : columnEnvelope.get(rs);
+    const waypoints: EdgePathPoint[] = buildEdgeWaypoints(a, b, chain, dummyPos, env, env);
+    paths.push({
+      edgeId: e.id ?? key,
+      source: e.source,
+      target: e.target,
+      waypoints,
+    });
+  }
+
+  return { nodes: positioned, edgePaths: paths };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Rank assignment
+// ──────────────────────────────────────────────────────────────────────────
+
+function pickRoot(
+  nodes: LayoutNodeInput[],
+  edges: LayoutEdgeInput[],
+  rootId?: string,
+): string | undefined {
+  const nodeSet = new Set(nodes.map((n) => n.id));
+  if (rootId && nodeSet.has(rootId)) return rootId;
+  const hasIncoming = new Set<string>();
+  for (const e of edges) hasIncoming.add(e.target);
+  const firstZeroIn = nodes.find((n) => !hasIncoming.has(n.id));
+  return firstZeroIn?.id ?? nodes[0]?.id;
+}
+
+function bfsRanks(
+  nodes: LayoutNodeInput[],
+  edges: LayoutEdgeInput[],
+  root: string,
+): Map<string, number> {
+  const adj = new Map<string, string[]>();
+  for (const n of nodes) adj.set(n.id, []);
+  for (const e of edges) adj.get(e.source)?.push(e.target);
+
+  const ranks = new Map<string, number>();
+  ranks.set(root, 0);
+  let maxRank = 0;
+  const queue: string[] = [root];
+  while (queue.length > 0) {
+    const u = queue.shift()!;
+    const r = ranks.get(u)!;
+    for (const v of adj.get(u) ?? []) {
+      if (!ranks.has(v)) {
+        ranks.set(v, r + 1);
+        if (r + 1 > maxRank) maxRank = r + 1;
+        queue.push(v);
+      }
+    }
+  }
+  // Unreached nodes: place them one rank beyond the longest reached path.
+  for (const n of nodes) if (!ranks.has(n.id)) ranks.set(n.id, maxRank + 1);
+  return ranks;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Dummy-node insertion
+// ──────────────────────────────────────────────────────────────────────────
+
+function splitLongEdges(
+  nodes: LayoutNodeInput[],
+  edges: LayoutEdgeInput[],
+  ranks: Map<string, number>,
+): {
+  allNodes: LayoutNodeInput[];
+  allEdges: LayoutEdgeInput[];
+  dummyChains: Map<string, string[]>;
+} {
+  const allNodes = [...nodes];
+  const allEdges: LayoutEdgeInput[] = [];
+  const dummyChains = new Map<string, string[]>();
+  let counter = 0;
+  for (const e of edges) {
+    const rs = ranks.get(e.source);
+    const rt = ranks.get(e.target);
+    if (rs == null || rt == null) continue;
+    const span = rt - rs;
+    if (span <= 1) {
+      // Forward span-1 or back-edge: keep as-is (barycenter only uses
+      // forward spans, but we still emit the edge for waypoint building).
+      allEdges.push(e);
+      continue;
+    }
+    const chain: string[] = [];
+    let prev = e.source;
+    for (let r = rs + 1; r < rt; r++) {
+      const id = `__dummy_${counter++}`;
+      chain.push(id);
+      allNodes.push({ id, width: 0, height: DUMMY_HEIGHT });
+      ranks.set(id, r);
+      allEdges.push({ source: prev, target: id });
+      prev = id;
+    }
+    allEdges.push({ source: prev, target: e.target });
+    dummyChains.set(edgeKey(e), chain);
+  }
+  return { allNodes, allEdges, dummyChains };
+}
+
+function edgeKey(e: LayoutEdgeInput): string {
+  return e.id ?? `${e.source}|${e.target}|${e.kind ?? ""}`;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Barycenter ordering
+// ──────────────────────────────────────────────────────────────────────────
+
+function buildUndirected(edges: LayoutEdgeInput[]): Map<string, string[]> {
+  const adj = new Map<string, string[]>();
+  const ensure = (k: string) => {
+    if (!adj.has(k)) adj.set(k, []);
+    return adj.get(k)!;
+  };
+  for (const e of edges) {
+    ensure(e.source).push(e.target);
+    ensure(e.target).push(e.source);
+  }
+  return adj;
+}
+
+function orderByBarycenter(
+  layers: Map<number, string[]>,
+  rankKeys: number[],
+  orderingNeighbours: Map<string, string[]>,
+  crossingEdges: LayoutEdgeInput[],
+  crossingNeighbours: Map<string, string[]>,
+) {
+  const pos = new Map<string, number>();
+  const updatePos = () => {
+    pos.clear();
+    for (const r of rankKeys) {
+      const ids = layers.get(r)!;
+      for (let i = 0; i < ids.length; i++) pos.set(ids[i]!, i);
+    }
+  };
+  updatePos();
+
+  const computeCrossings = () => countCrossings(layers, rankKeys, crossingEdges, crossingNeighbours, pos);
+
+  let bestCrossings = computeCrossings();
+  let best = snapshot(layers);
+
+  const SWEEPS = 24;
+  for (let sweep = 0; sweep < SWEEPS; sweep++) {
+    const downward = sweep % 2 === 0;
+    const order = downward ? rankKeys : [...rankKeys].slice().reverse();
+    for (const r of order) {
+      const refR = downward ? r - 1 : r + 1;
+      const refIds = layers.get(refR);
+      if (!refIds || refIds.length === 0) continue;
+      const refPos = new Map<string, number>();
+      refIds.forEach((id, i) => refPos.set(id, i));
+      const ids = layers.get(r)!;
+      const bary = new Map<string, number>();
+      ids.forEach((id, i) => {
+        const nbrs = orderingNeighbours.get(id) ?? [];
+        const ps: number[] = [];
+        for (const nb of nbrs) {
+          const p = refPos.get(nb);
+          if (p != null) ps.push(p);
+        }
+        bary.set(id, ps.length > 0 ? ps.reduce((a, b) => a + b, 0) / ps.length : i);
+      });
+      ids.sort((a, b) => {
+        const da = bary.get(a)!;
+        const db = bary.get(b)!;
+        if (da !== db) return da - db;
+        return a.localeCompare(b);
+      });
+    }
+    updatePos();
+    const c = computeCrossings();
+    if (c < bestCrossings) {
+      bestCrossings = c;
+      best = snapshot(layers);
+      if (c === 0) break;
+    }
+  }
+  // Restore best.
+  for (const [r, ids] of best) layers.set(r, ids);
 }
 
 /**
- * Build clusters via union-find. When `hints` are provided, every hint
- * with weight ≥ 0.35 unions its endpoints — this propagates the
- * semantic similarity signal into cluster membership. As a fallback /
- * supplement, neighbour-Jaccard above 0.15 also unions a pair.
- * Returns Map<clusterRoot, Set<nodeId>>.
+ * Within each rank, union-find nodes connected by strong same-rank
+ * similarity hints, then reorder the rank so each cluster is contiguous.
+ * Cluster order is preserved by minimum member position (so the
+ * cross-rank ordering produced by barycenter is disturbed as little as
+ * possible).
  */
-function buildClusters(
-  nodes: LayoutNodeInput[],
-  edges: LayoutEdgeInput[],
-  nodeSet: Set<string>,
-  hints?: SimilarityHint[],
-): Map<string, Set<string>> {
-  const neighbours = new Map<string, Set<string>>();
-  for (const nd of nodes) neighbours.set(nd.id, new Set());
-  for (const e of edges) {
-    if (e.source === e.target) continue;
-    if (!nodeSet.has(e.source) || !nodeSet.has(e.target)) continue;
-    neighbours.get(e.source)?.add(e.target);
-    neighbours.get(e.target)?.add(e.source);
+function regroupWithinRankBySimilarity(
+  layers: Map<number, string[]>,
+  ranks: Map<string, number>,
+  hints: SimilarityHint[],
+) {
+  // Bucket hints per rank.
+  const byRank = new Map<number, Array<[string, string]>>();
+  for (const h of hints) {
+    if (h.weight < 0.35) continue;
+    const ra = ranks.get(h.source);
+    const rb = ranks.get(h.target);
+    if (ra == null || rb == null || ra !== rb) continue;
+    if (!byRank.has(ra)) byRank.set(ra, []);
+    byRank.get(ra)!.push([h.source, h.target]);
   }
-
-  const parent = new Map<string, string>();
-  for (const nd of nodes) parent.set(nd.id, nd.id);
-  const find = (a: string): string => {
-    while (parent.get(a) !== a) {
-      parent.set(a, parent.get(parent.get(a)!)!);
-      a = parent.get(a)!;
-    }
-    return a;
-  };
-  const union = (a: string, b: string) => {
-    parent.set(find(a), find(b));
-  };
-
-  if (hints && hints.length > 0) {
-    for (const h of hints) {
-      if (h.weight < 0.35) continue;
-      if (!nodeSet.has(h.source) || !nodeSet.has(h.target)) continue;
-      union(h.source, h.target);
-    }
-  } else {
-    const ids = nodes.map((nd) => nd.id);
-    for (let i = 0; i < ids.length; i++) {
-      const nA = neighbours.get(ids[i]!)!;
-      if (nA.size === 0) continue;
-      for (let j = i + 1; j < ids.length; j++) {
-        const nB = neighbours.get(ids[j]!)!;
-        if (nB.size === 0) continue;
-        let inter = 0;
-        for (const x of nA) if (nB.has(x)) inter++;
-        if (inter === 0) continue;
-        const jaccard = inter / (nA.size + nB.size - inter);
-        if (jaccard >= 0.15) union(ids[i]!, ids[j]!);
+  for (const [r, pairs] of byRank) {
+    const ids = layers.get(r);
+    if (!ids || ids.length < 3) continue;
+    const idSet = new Set(ids);
+    const parent = new Map<string, string>();
+    for (const id of ids) parent.set(id, id);
+    const find = (x: string): string => {
+      while (parent.get(x) !== x) {
+        parent.set(x, parent.get(parent.get(x)!)!);
+        x = parent.get(x)!;
       }
+      return x;
+    };
+    const union = (a: string, b: string) => parent.set(find(a), find(b));
+    for (const [a, b] of pairs) {
+      if (idSet.has(a) && idSet.has(b)) union(a, b);
     }
+    // Build cluster → members (preserve original order within cluster).
+    const clusters = new Map<string, string[]>();
+    const minPos = new Map<string, number>();
+    ids.forEach((id, i) => {
+      const c = find(id);
+      if (!clusters.has(c)) {
+        clusters.set(c, []);
+        minPos.set(c, i);
+      }
+      clusters.get(c)!.push(id);
+    });
+    // Sort clusters by their earliest member's position, then flatten.
+    const sorted = [...clusters.entries()].sort((a, b) => minPos.get(a[0])! - minPos.get(b[0])!);
+    const out: string[] = [];
+    for (const [, members] of sorted) out.push(...members);
+    layers.set(r, out);
   }
-
-  const groups = new Map<string, Set<string>>();
-  for (const nd of nodes) {
-    const root = find(nd.id);
-    if (!groups.has(root)) groups.set(root, new Set());
-    groups.get(root)!.add(nd.id);
-  }
-  return groups;
 }
 
-/** Convert externally-supplied similarity hints into d3-force links. */
-function hintsToLinks(
-  hints: SimilarityHint[],
-  nodeSet: Set<string>,
-): Array<{ source: string; target: string; _similarity: true; _weight: number }> {
-  const out: Array<{ source: string; target: string; _similarity: true; _weight: number }> = [];
-  for (const h of hints) {
-    if (h.source === h.target) continue;
-    if (!nodeSet.has(h.source) || !nodeSet.has(h.target)) continue;
-    if (h.weight <= 0) continue;
-    out.push({
-      source: h.source,
-      target: h.target,
-      _similarity: true,
-      _weight: Math.min(1, h.weight),
-    });
-  }
+function snapshot(layers: Map<number, string[]>): Map<number, string[]> {
+  const out = new Map<number, string[]>();
+  for (const [r, ids] of layers) out.set(r, ids.slice());
   return out;
 }
 
-/**
- * Fallback similarity heuristic: Jaccard over shared neighbours. Used
- * when no explicit hints are supplied. Caller-supplied hints from
- * `lib/similarity.ts` produce higher-quality, semantic signals.
- */
-function buildSimilarityLinks(
-  nodes: LayoutNodeInput[],
+function countCrossings(
+  layers: Map<number, string[]>,
+  rankKeys: number[],
   edges: LayoutEdgeInput[],
-  nodeSet: Set<string>,
-): Array<{ source: string; target: string; _similarity: true; _weight: number }> {
-  const neighbours = new Map<string, Set<string>>();
-  for (const nd of nodes) neighbours.set(nd.id, new Set());
-
-  for (const e of edges) {
-    if (e.source === e.target) continue;
-    if (!nodeSet.has(e.source) || !nodeSet.has(e.target)) continue;
-    neighbours.get(e.source)?.add(e.target);
-    neighbours.get(e.target)?.add(e.source);
-  }
-
-  const result: Array<{ source: string; target: string; _similarity: true; _weight: number }> = [];
-  const ids = nodes.map((nd) => nd.id);
-
-  for (let i = 0; i < ids.length; i++) {
-    const a = ids[i]!;
-    const nA = neighbours.get(a)!;
-    if (nA.size === 0) continue;
-    for (let j = i + 1; j < ids.length; j++) {
-      const b = ids[j]!;
-      const nB = neighbours.get(b)!;
-      if (nB.size === 0) continue;
-
-      let intersection = 0;
-      for (const x of nA) {
-        if (nB.has(x)) intersection++;
+  _neighbours: Map<string, string[]>,
+  pos: Map<string, number>,
+): number {
+  // Build per-rank-pair edge list.
+  let total = 0;
+  for (let i = 0; i < rankKeys.length - 1; i++) {
+    const rLo = rankKeys[i]!;
+    const rHi = rankKeys[i + 1]!;
+    const pairEdges: Array<[number, number]> = [];
+    for (const e of edges) {
+      const ps = pos.get(e.source);
+      const pt = pos.get(e.target);
+      if (ps == null || pt == null) continue;
+      const inLoHi = (layers.get(rLo)?.includes(e.source) ?? false) && (layers.get(rHi)?.includes(e.target) ?? false);
+      const inHiLo = (layers.get(rHi)?.includes(e.source) ?? false) && (layers.get(rLo)?.includes(e.target) ?? false);
+      if (!inLoHi && !inHiLo) continue;
+      if (inLoHi) pairEdges.push([ps, pt]);
+      else pairEdges.push([pt, ps]);
+    }
+    for (let a = 0; a < pairEdges.length; a++) {
+      for (let b = a + 1; b < pairEdges.length; b++) {
+        const [a1, a2] = pairEdges[a]!;
+        const [b1, b2] = pairEdges[b]!;
+        if ((a1 - b1) * (a2 - b2) < 0) total++;
       }
-      if (intersection === 0) continue;
-
-      const union = nA.size + nB.size - intersection;
-      const jaccard = intersection / union;
-      if (jaccard < 0.15) continue;
-
-      result.push({
-        source: a,
-        target: b,
-        _similarity: true,
-        _weight: jaccard * 0.25,
-      });
     }
   }
-
-  return result;
+  return total;
 }
 
-function resolveOverlaps(nodes: Array<{ id: string; width: number; height: number; x: number; y: number }>) {
-  const PAD = 20;
-  for (let iter = 0; iter < 120; iter++) {
-    let moved = false;
-    for (let i = 0; i < nodes.length; i++) {
-      const a = nodes[i]!;
-      for (let j = i + 1; j < nodes.length; j++) {
-        const b = nodes[j]!;
-        const minDx = (a.width + b.width) / 2 + PAD;
-        const minDy = (a.height + b.height) / 2 + PAD;
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
-        const overlapX = minDx - Math.abs(dx);
-        const overlapY = minDy - Math.abs(dy);
-        if (overlapX > 0 && overlapY > 0) {
-          const push = overlapY / 2 + 1;
-          if (dy >= 0) {
-            a.y -= push;
-            b.y += push;
-          } else {
-            a.y += push;
-            b.y -= push;
-          }
-          moved = true;
-        }
-      }
+// ──────────────────────────────────────────────────────────────────────────
+// Y coordinate assignment
+// ──────────────────────────────────────────────────────────────────────────
+
+function assignY(
+  layers: Map<number, string[]>,
+  rankKeys: number[],
+  nodeById: Map<string, LayoutNodeInput>,
+  undirected: Map<string, string[]>,
+): Map<string, number> {
+  const yOf = new Map<string, number>();
+
+  // Initial: centered stack per layer.
+  for (const r of rankKeys) {
+    const ids = layers.get(r)!;
+    let cursor = 0;
+    const centers: number[] = [];
+    for (const id of ids) {
+      const h = nodeById.get(id)?.height ?? DUMMY_HEIGHT;
+      centers.push(cursor + h / 2);
+      cursor += h + Y_GAP;
     }
-    if (!moved) break;
+    const total = cursor - Y_GAP;
+    const offset = -total / 2;
+    ids.forEach((id, i) => yOf.set(id, centers[i]! + offset));
   }
+
+  // Relaxation: pull toward average of neighbours across ranks, then
+  // compact with a hard minimum-gap constraint (forward + backward sweep).
+  const ITERS = 24;
+  for (let iter = 0; iter < ITERS; iter++) {
+    const mix = 1 - iter / (ITERS + 4); // diminishing step size
+    for (const r of rankKeys) {
+      const ids = layers.get(r)!;
+      if (ids.length === 0) continue;
+      // Compute ideal Y per node.
+      const ideal: number[] = new Array(ids.length);
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i]!;
+        const nbrs = undirected.get(id) ?? [];
+        let sum = 0;
+        let cnt = 0;
+        for (const nb of nbrs) {
+          const y = yOf.get(nb);
+          if (y != null) {
+            sum += y;
+            cnt += 1;
+          }
+        }
+        ideal[i] = cnt > 0 ? (yOf.get(id)! * (1 - mix) + (sum / cnt) * mix) : yOf.get(id)!;
+      }
+      for (let i = 0; i < ids.length; i++) yOf.set(ids[i]!, ideal[i]!);
+      // Hard compact: enforce min spacing respecting the layer order.
+      compactLayer(ids, yOf, nodeById);
+    }
+  }
+
+  return yOf;
+}
+
+function compactLayer(
+  ids: string[],
+  yOf: Map<string, number>,
+  nodeById: Map<string, LayoutNodeInput>,
+) {
+  const height = (id: string) => nodeById.get(id)?.height ?? DUMMY_HEIGHT;
+  // Forward pass: push overlapping nodes down.
+  for (let i = 1; i < ids.length; i++) {
+    const prev = ids[i - 1]!;
+    const cur = ids[i]!;
+    const minY = yOf.get(prev)! + height(prev) / 2 + height(cur) / 2 + Y_GAP;
+    if (yOf.get(cur)! < minY) yOf.set(cur, minY);
+  }
+  // Backward pass: pull the column center toward the average so it
+  // stays centred and symmetric top/bottom.
+  for (let i = ids.length - 2; i >= 0; i--) {
+    const next = ids[i + 1]!;
+    const cur = ids[i]!;
+    const maxY = yOf.get(next)! - height(next) / 2 - height(cur) / 2 - Y_GAP;
+    if (yOf.get(cur)! > maxY) yOf.set(cur, maxY);
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Edge waypoints
+// ──────────────────────────────────────────────────────────────────────────
+
+function buildEdgeWaypoints(
+  a: PositionedNode,
+  b: PositionedNode,
+  chain: string[],
+  dummyPos: Map<string, { x: number; y: number }>,
+  sourceEnv?: { top: number; bottom: number },
+  targetEnv?: { top: number; bottom: number },
+): EdgePathPoint[] {
+  const points: EdgePathPoint[] = [];
+  const GAP_FRAC = 0.5;
+  const exitX = a.x + a.width / 2;
+  const entryX = b.x - b.width / 2;
+  const sy = a.y;
+  const ty = b.y;
+
+  if (chain.length === 0) {
+    if (b.x > a.x + a.width / 2) {
+      // Forward span-1: L-shape through the column gap.
+      const midX = exitX + (entryX - exitX) * GAP_FRAC;
+      points.push({ x: exitX, y: sy });
+      points.push({ x: midX, y: sy });
+      points.push({ x: midX, y: ty });
+      points.push({ x: entryX, y: ty });
+    } else {
+      // Back-edge or same-column loop. Route fully above or below the
+      // *column envelope* so the horizontal leg can never clip any
+      // intermediate node in the same column.
+      const envTop = Math.min(
+        sourceEnv?.top ?? a.y - a.height / 2,
+        targetEnv?.top ?? b.y - b.height / 2,
+      );
+      const envBottom = Math.max(
+        sourceEnv?.bottom ?? a.y + a.height / 2,
+        targetEnv?.bottom ?? b.y + b.height / 2,
+      );
+      const avgY = (sy + ty) / 2;
+      const goBelow = Math.abs(avgY - envBottom) <= Math.abs(avgY - envTop);
+      const outY = goBelow ? envBottom + Y_GAP * 1.2 : envTop - Y_GAP * 1.2;
+      const outX = exitX + 60;
+      const inX = entryX - 60;
+      points.push({ x: exitX, y: sy });
+      points.push({ x: outX, y: sy });
+      points.push({ x: outX, y: outY });
+      points.push({ x: inX, y: outY });
+      points.push({ x: inX, y: ty });
+      points.push({ x: entryX, y: ty });
+    }
+    return points;
+  }
+
+  // Multi-rank: snake through dummy positions, with mid-gap bends so the
+  // edge doesn't run horizontally through any column.
+  points.push({ x: exitX, y: sy });
+  const first = dummyPos.get(chain[0]!)!;
+  const firstMid = exitX + (first.x - exitX) * GAP_FRAC;
+  points.push({ x: firstMid, y: sy });
+  points.push({ x: firstMid, y: first.y });
+  points.push({ x: first.x, y: first.y });
+  for (let i = 1; i < chain.length; i++) {
+    const prev = dummyPos.get(chain[i - 1]!)!;
+    const cur = dummyPos.get(chain[i]!)!;
+    const mid = prev.x + (cur.x - prev.x) * GAP_FRAC;
+    points.push({ x: mid, y: prev.y });
+    points.push({ x: mid, y: cur.y });
+    points.push({ x: cur.x, y: cur.y });
+  }
+  const last = dummyPos.get(chain[chain.length - 1]!)!;
+  const lastMid = last.x + (entryX - last.x) * GAP_FRAC;
+  points.push({ x: lastMid, y: last.y });
+  points.push({ x: lastMid, y: ty });
+  points.push({ x: entryX, y: ty });
+  return points;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Normalisation
+// ──────────────────────────────────────────────────────────────────────────
+
+function computeNormalisationShift(positioned: PositionedNode[]): { dx: number; dy: number } {
+  if (positioned.length === 0) return { dx: 0, dy: 0 };
+  let minX = Infinity;
+  let minY = Infinity;
+  for (const p of positioned) {
+    minX = Math.min(minX, p.x - p.width / 2);
+    minY = Math.min(minY, p.y - p.height / 2);
+  }
+  const PAD = 60;
+  return { dx: PAD - minX, dy: PAD - minY };
 }

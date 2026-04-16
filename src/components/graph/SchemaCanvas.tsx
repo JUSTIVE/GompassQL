@@ -84,8 +84,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     return () => ro.disconnect();
   }, []);
 
-  const laidNodes = useMemo<LaidNode[]>(() => {
-    if (nodes.length === 0) return [];
+  const layoutResult = useMemo(() => {
+    if (nodes.length === 0) return { nodes: [], edgePaths: [] };
     const input = nodes.map((n) => ({
       id: n.id,
       width: NODE_WIDTH,
@@ -98,17 +98,19 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     }));
     const linkInput = edges
       .filter((e) => e.source !== e.target)
-      .map((e) => ({ source: e.source, target: e.target, kind: e.kind }));
-    const similarityPairs = computeSimilarityPairs(nodes, edges);
-    const hints = similarityPairs.map((p) => ({
+      .map((e) => ({ id: e.id, source: e.source, target: e.target, kind: e.kind }));
+    const hints = computeSimilarityPairs(nodes, edges).map((p) => ({
       source: p.a,
       target: p.b,
       weight: p.score,
     }));
-    const positioned = layoutGraph(input, linkInput, rootId ?? undefined, hints);
+    return layoutGraph(input, linkInput, rootId ?? undefined, hints);
+  }, [nodes, edges, rootId]);
+
+  const laidNodes = useMemo<LaidNode[]>(() => {
     const byId = new Map<string, GraphNodeData>();
     for (const n of nodes) byId.set(n.id, n);
-    return positioned.map((p) => ({
+    return layoutResult.nodes.map((p) => ({
       id: p.id,
       data: byId.get(p.id)!,
       cx: p.x,
@@ -116,7 +118,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
       w: p.width,
       h: p.height,
     }));
-  }, [nodes, edges, rootId]);
+  }, [layoutResult, nodes]);
 
   const nodeById = useMemo(() => {
     const m = new Map<string, LaidNode>();
@@ -125,28 +127,43 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
   }, [laidNodes]);
 
   const laidEdges = useMemo<LaidEdge[]>(() => {
+    const byEdgeId = new Map<string, { waypoints: Point[] }>();
+    for (const p of layoutResult.edgePaths) {
+      byEdgeId.set(p.edgeId, { waypoints: p.waypoints });
+    }
     const out: LaidEdge[] = [];
     for (const e of edges) {
       if (e.source === e.target) continue;
       const a = nodeById.get(e.source);
       const b = nodeById.get(e.target);
       if (!a || !b) continue;
-
-      let sy: number;
+      const path = byEdgeId.get(e.id);
+      if (!path || path.waypoints.length < 2) continue;
+      // Layout emits waypoints from (source.right, source.center) to
+      // (target.left, target.center). For field-level edges, shift the
+      // source Y so the line exits at the field row instead of the node
+      // center, then reconstruct the initial horizontal segment to match.
+      const points: Point[] = path.waypoints.map((p) => ({ x: p.x, y: p.y }));
       if (e.kind === "field" && e.sourceFieldIndex != null) {
-        sy = a.cy - a.h / 2 + HEADER_H + TOP_BODY_PAD - 2 + e.sourceFieldIndex * ROW_H + 6;
-      } else {
-        sy = a.cy;
+        const fieldY = a.cy - a.h / 2 + HEADER_H + TOP_BODY_PAD - 2 + e.sourceFieldIndex * ROW_H + 6;
+        // Replace the leading horizontal run (same y as original first
+        // point) with the field-level y so the edge leaves the correct row.
+        const originalStartY = points[0]!.y;
+        for (let i = 0; i < points.length; i++) {
+          if (points[i]!.y !== originalStartY) break;
+          points[i] = { x: points[i]!.x, y: fieldY };
+        }
       }
-      const sx = a.cx + a.w / 2;
-      const tx = b.cx - b.w / 2;
-      const ty = b.cy;
-
-      const points = routeOrthogonal(sx, sy, tx, ty, a, b, laidNodes);
-      out.push({ sourceId: e.source, targetId: e.target, kind: e.kind, nullable: e.nullable ?? false, points });
+      out.push({
+        sourceId: e.source,
+        targetId: e.target,
+        kind: e.kind,
+        nullable: e.nullable ?? false,
+        points,
+      });
     }
     return out;
-  }, [edges, nodeById, laidNodes]);
+  }, [edges, layoutResult, nodeById]);
 
   const bounds = useMemo(() => {
     if (laidNodes.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
@@ -332,6 +349,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
 
       ctx.strokeStyle = stroke;
       ctx.lineWidth = 1.4;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
       if (e.kind === "implements") {
         ctx.setLineDash([6, 4]);
       } else if (e.kind === "field" && e.nullable) {
@@ -340,17 +359,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
         ctx.setLineDash([]);
       }
 
-      // Soften corners and draw spline. Corner-softened waypoints keep
-      // the Catmull-Rom curve inside the routed corridor instead of
-      // bulging toward nearby nodes.
-      const softPts = softenCorners(pts, 14);
-      drawCatmullRom(ctx, softPts, 0.35);
+      // Strict orthogonal polyline with rounded corners via arcTo. The
+      // layout already places waypoints through clear channels, so no
+      // re-routing or splining is needed here.
+      drawRoundedPolyline(ctx, pts, 8);
       ctx.stroke();
       ctx.setLineDash([]);
 
       // Arrowhead from last segment direction.
-      const last = softPts[softPts.length - 1]!;
-      const prev = softPts[softPts.length - 2]!;
+      const last = pts[pts.length - 1]!;
+      const prev = pts[pts.length - 2]!;
       const adx = last.x - prev.x;
       const ady = last.y - prev.y;
       const alen = Math.hypot(adx, ady);
@@ -463,278 +481,35 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.closePath();
 }
 
-/**
- * Return true if the horizontal/vertical segment (ax,ay)-(bx,by)
- * intersects the expanded rectangle of any node other than src/tgt.
- * Only handles axis-aligned segments (one of the two deltas is zero).
- */
-function segmentHitsAnyNode(
-  ax: number,
-  ay: number,
-  bx: number,
-  by: number,
-  src: LaidNode,
-  tgt: LaidNode,
-  nodes: LaidNode[],
-  clearance: number,
-): LaidNode | null {
-  const xMin = Math.min(ax, bx);
-  const xMax = Math.max(ax, bx);
-  const yMin = Math.min(ay, by);
-  const yMax = Math.max(ay, by);
-  for (const n of nodes) {
-    if (n.id === src.id || n.id === tgt.id) continue;
-    const nLeft = n.cx - n.w / 2 - clearance;
-    const nRight = n.cx + n.w / 2 + clearance;
-    const nTop = n.cy - n.h / 2 - clearance;
-    const nBottom = n.cy + n.h / 2 + clearance;
-    if (xMax >= nLeft && xMin <= nRight && yMax >= nTop && yMin <= nBottom) {
-      return n;
-    }
-  }
-  return null;
-}
-
-function pathIsClear(pts: Point[], src: LaidNode, tgt: LaidNode, nodes: LaidNode[], clearance: number): boolean {
-  for (let i = 0; i < pts.length - 1; i++) {
-    const a = pts[i]!;
-    const b = pts[i + 1]!;
-    if (segmentHitsAnyNode(a.x, a.y, b.x, b.y, src, tgt, nodes, clearance)) return false;
-  }
-  return true;
-}
 
 /**
- * Insert short waypoints on either side of each interior corner. This
- * constrains the Catmull-Rom spline so it rounds tightly inside the
- * L-corner corridor instead of bulging toward the nearest obstacle.
+ * Draw an orthogonal polyline with rounded corners using arcTo. Each
+ * interior corner is softened by a radius clamped to half the shorter
+ * adjacent segment so the line stays strictly inside the routed corridor.
  */
-function softenCorners(pts: Point[], radius = 14): Point[] {
-  if (pts.length <= 2) return pts.slice();
-  const out: Point[] = [pts[0]!];
-  for (let i = 1; i < pts.length - 1; i++) {
-    const prev = pts[i - 1]!;
-    const cur = pts[i]!;
-    const next = pts[i + 1]!;
-    const dx1 = cur.x - prev.x;
-    const dy1 = cur.y - prev.y;
-    const d1 = Math.hypot(dx1, dy1);
-    const dx2 = next.x - cur.x;
-    const dy2 = next.y - cur.y;
-    const d2 = Math.hypot(dx2, dy2);
-    const r1 = Math.min(radius, d1 / 2.2);
-    const r2 = Math.min(radius, d2 / 2.2);
-    if (r1 > 1) {
-      out.push({ x: cur.x - (dx1 / d1) * r1, y: cur.y - (dy1 / d1) * r1 });
-    }
-    out.push(cur);
-    if (r2 > 1) {
-      out.push({ x: cur.x + (dx2 / d2) * r2, y: cur.y + (dy2 / d2) * r2 });
-    }
-  }
-  out.push(pts[pts.length - 1]!);
-  return out;
-}
-
-/**
- * Find a clear horizontal Y band that spans from fromX to toX, starting
- * from a preferred Y and walking outward. Returns a Y value where a
- * horizontal segment [fromX..toX] does not hit any node (other than
- * src/tgt). Falls back to routing outside the graph if no band exists.
- */
-function findClearBandY(
-  preferredY: number,
-  fromX: number,
-  toX: number,
-  src: LaidNode,
-  tgt: LaidNode,
-  nodes: LaidNode[],
-  clearance: number,
-): number {
-  const xMin = Math.min(fromX, toX);
-  const xMax = Math.max(fromX, toX);
-  // Collect Y intervals of nodes that overlap [xMin, xMax].
-  const intervals: Array<[number, number]> = [];
-  let globalTop = Infinity;
-  let globalBottom = -Infinity;
-  for (const n of nodes) {
-    globalTop = Math.min(globalTop, n.cy - n.h / 2);
-    globalBottom = Math.max(globalBottom, n.cy + n.h / 2);
-    if (n.id === src.id || n.id === tgt.id) continue;
-    const nLeft = n.cx - n.w / 2 - clearance;
-    const nRight = n.cx + n.w / 2 + clearance;
-    if (nRight < xMin || nLeft > xMax) continue;
-    intervals.push([n.cy - n.h / 2 - clearance, n.cy + n.h / 2 + clearance]);
-  }
-  if (intervals.length === 0) return preferredY;
-
-  // Merge overlapping intervals.
-  intervals.sort((a, b) => a[0] - b[0]);
-  const merged: Array<[number, number]> = [];
-  for (const iv of intervals) {
-    const last = merged[merged.length - 1];
-    if (last && iv[0] <= last[1]) {
-      last[1] = Math.max(last[1], iv[1]);
-    } else {
-      merged.push([iv[0], iv[1]]);
-    }
-  }
-
-  // If preferred Y is already in a gap, use it.
-  const inBlock = merged.find((iv) => preferredY >= iv[0] && preferredY <= iv[1]);
-  if (!inBlock) return preferredY;
-
-  // Otherwise pick the nearest gap edge: just above or just below the
-  // block containing preferredY. Prefer the closer side.
-  const above = inBlock[0] - clearance;
-  const below = inBlock[1] + clearance;
-  const aboveClear = !merged.some((iv) => iv !== inBlock && above >= iv[0] && above <= iv[1]);
-  const belowClear = !merged.some((iv) => iv !== inBlock && below >= iv[0] && below <= iv[1]);
-  if (aboveClear && belowClear) {
-    return Math.abs(above - preferredY) <= Math.abs(below - preferredY) ? above : below;
-  }
-  if (aboveClear) return above;
-  if (belowClear) return below;
-  // Both sides abut another block — route outside the graph entirely.
-  const outsideTop = globalTop - clearance - 20;
-  const outsideBottom = globalBottom + clearance + 20;
-  return Math.abs(outsideTop - preferredY) <= Math.abs(outsideBottom - preferredY)
-    ? outsideTop
-    : outsideBottom;
-}
-
-/**
- * Orthogonal edge routing: horizontal/vertical segments through gaps
- * between node columns. Searches multiple channel X positions and Y
- * bands to avoid crossing any node rectangle.
- */
-function routeOrthogonal(
-  sx: number,
-  sy: number,
-  tx: number,
-  ty: number,
-  sourceNode: LaidNode,
-  targetNode: LaidNode,
-  allNodes: LaidNode[],
-): Point[] {
-  const CLEARANCE = 24;
-
-  if (tx > sx + 10) {
-    // Forward edge. Try the natural midX, then walk outward to find a
-    // vertical channel that's clear of all non-endpoint nodes.
-    const baseMid = (sx + tx) / 2;
-    const span = tx - sx;
-    const maxOff = Math.max(40, span * 0.45);
-    const candidates: number[] = [baseMid];
-    for (let off = 30; off <= maxOff; off += 30) {
-      candidates.push(baseMid - off);
-      candidates.push(baseMid + off);
-    }
-
-    for (const mid of candidates) {
-      if (mid <= sx + 10 || mid >= tx - 10) continue;
-      const path: Point[] = [
-        { x: sx, y: sy },
-        { x: mid, y: sy },
-        { x: mid, y: ty },
-        { x: tx, y: ty },
-      ];
-      if (pathIsClear(path, sourceNode, targetNode, allNodes, CLEARANCE)) {
-        return path;
-      }
-    }
-
-    // No simple L/Z worked. Route via a clear horizontal band, picking
-    // the nearest gap to the average row. Two-bend Z through that band.
-    const avgY = (sy + ty) / 2;
-    const bandY = findClearBandY(avgY, sx, tx, sourceNode, targetNode, allNodes, CLEARANCE);
-    // Find clear midX that avoids nodes along both vertical legs.
-    for (const mid of candidates) {
-      if (mid <= sx + 10 || mid >= tx - 10) continue;
-      const path: Point[] = [
-        { x: sx, y: sy },
-        { x: mid, y: sy },
-        { x: mid, y: bandY },
-        { x: mid + Math.sign(tx - sx) * 30, y: bandY },
-        { x: mid + Math.sign(tx - sx) * 30, y: ty },
-        { x: tx, y: ty },
-      ];
-      if (pathIsClear(path, sourceNode, targetNode, allNodes, CLEARANCE)) {
-        return path;
-      }
-    }
-    // Last resort: route around the outside.
-    const exitX = sourceNode.cx + sourceNode.w / 2 + 16;
-    const entryX = targetNode.cx - targetNode.w / 2 - 16;
-    return [
-      { x: sx, y: sy },
-      { x: exitX, y: sy },
-      { x: exitX, y: bandY },
-      { x: entryX, y: bandY },
-      { x: entryX, y: ty },
-      { x: tx, y: ty },
-    ];
-  }
-
-  // Back-edge or same-column: route around via top or bottom using the
-  // nearest clear band rather than the full envelope.
-  const avgY = (sy + ty) / 2;
-  const exitX = sourceNode.cx + sourceNode.w / 2 + 20;
-  const entryX = targetNode.cx - targetNode.w / 2 - 20;
-  const routeY = findClearBandY(
-    avgY,
-    Math.min(exitX, entryX),
-    Math.max(exitX, entryX),
-    sourceNode,
-    targetNode,
-    allNodes,
-    CLEARANCE,
-  );
-  return [
-    { x: sx, y: sy },
-    { x: exitX, y: sy },
-    { x: exitX, y: routeY },
-    { x: entryX, y: routeY },
-    { x: entryX, y: ty },
-    { x: tx, y: ty },
-  ];
-}
-
-/**
- * Draw a Catmull-Rom spline through the given points, converted to
- * cubic bezier segments for Canvas2D. Produces a smooth C1 curve
- * that passes through every waypoint.
- */
-function drawCatmullRom(
-  ctx: CanvasRenderingContext2D,
-  pts: Point[],
-  tension = 0.5,
-) {
+function drawRoundedPolyline(ctx: CanvasRenderingContext2D, pts: Point[], radius: number) {
   if (pts.length < 2) return;
+  ctx.beginPath();
   if (pts.length === 2) {
-    ctx.beginPath();
     ctx.moveTo(pts[0]!.x, pts[0]!.y);
     ctx.lineTo(pts[1]!.x, pts[1]!.y);
     return;
   }
-
-  ctx.beginPath();
   ctx.moveTo(pts[0]!.x, pts[0]!.y);
-
-  for (let i = 0; i < pts.length - 1; i++) {
-    const p0 = pts[Math.max(i - 1, 0)]!;
-    const p1 = pts[i]!;
-    const p2 = pts[i + 1]!;
-    const p3 = pts[Math.min(i + 2, pts.length - 1)]!;
-
-    const t = tension;
-    const cp1x = p1.x + (p2.x - p0.x) * t / 3;
-    const cp1y = p1.y + (p2.y - p0.y) * t / 3;
-    const cp2x = p2.x - (p3.x - p1.x) * t / 3;
-    const cp2y = p2.y - (p3.y - p1.y) * t / 3;
-
-    ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = pts[i - 1]!;
+    const cur = pts[i]!;
+    const next = pts[i + 1]!;
+    const d1 = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+    const d2 = Math.hypot(next.x - cur.x, next.y - cur.y);
+    const r = Math.max(0, Math.min(radius, d1 / 2, d2 / 2));
+    if (r < 1) {
+      ctx.lineTo(cur.x, cur.y);
+    } else {
+      ctx.arcTo(cur.x, cur.y, next.x, next.y, r);
+    }
   }
+  ctx.lineTo(pts[pts.length - 1]!.x, pts[pts.length - 1]!.y);
 }
 
 function drawColoredType(
