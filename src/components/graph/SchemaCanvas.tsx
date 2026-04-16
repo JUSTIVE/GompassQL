@@ -86,10 +86,29 @@ const EMPTY_LAYOUT: LayoutResult = { nodes: [], edgePaths: [] };
 const CULL_PAD = 100;
 const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
 
-// Per-node sprite DPR. Matches the window's DPR so text stays sharp,
-// capped at 2× to keep worst-case memory bounded (400 nodes × 220×200 ×
-// 4 bytes × 4 ≈ 140MB at DPR=2; higher DPR rarely looks better on text).
-function spriteDpr(): number {
+// Per-node sprite DPR is decided dynamically and rebuilds when the
+// user zooms in far enough that the baked bitmap would otherwise
+// blur. Discrete levels (1, 2, 3, 4) keep the cache from thrashing
+// while panning or making small zoom adjustments.
+const MAX_SPRITE_DPR = 4;
+
+function idealSpriteDpr(viewK: number): number {
+  const monitorDpr =
+    typeof window !== "undefined" ? Math.max(1, window.devicePixelRatio || 1) : 1;
+  const needed = Math.ceil(monitorDpr * Math.max(1, viewK));
+  return Math.min(MAX_SPRITE_DPR, Math.max(1, needed));
+}
+
+/** Caps sprite DPR so total sprite memory stays roughly bounded. */
+function memoryCappedDpr(ideal: number, nodeCount: number): number {
+  if (nodeCount <= 0) return ideal;
+  // Back-of-envelope: assume ~220×180 px average node area, 4 bytes
+  // per pixel. Target ≤ ~200 MB → dpr² ≤ 1250 / nodeCount.
+  const cap = Math.max(1, Math.floor(Math.sqrt(1250 / nodeCount)));
+  return Math.max(1, Math.min(ideal, cap));
+}
+
+function initialSpriteDpr(): number {
   if (typeof window === "undefined") return 1;
   return Math.min(2, Math.max(1, window.devicePixelRatio || 1));
 }
@@ -110,6 +129,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
   });
   const rafRef = useRef<number | null>(null);
   const [cursor, setCursor] = useState<"grab" | "pointer">("grab");
+  const [spriteDprLevel, setSpriteDprLevel] = useState(initialSpriteDpr);
   const { resolved: themeResolved } = useTheme();
 
   // Layout runs off the main thread in a dedicated Web Worker bundled
@@ -318,15 +338,33 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
     return { minX, minY, maxX, maxY };
   }, [laidNodes]);
 
-  // Sprite cache — one offscreen canvas per node, rebuilt whenever a
-  // new layout arrives or the theme changes. The map starts empty; the
-  // draw loop populates entries lazily so invisible nodes never pay
-  // the sprite-build cost. Dependencies baked into the map identity
-  // means stale sprites are garbage-collected as soon as inputs change.
+  // Sprite cache — one offscreen canvas per node, rebuilt when a new
+  // layout arrives, the theme changes, or the sprite DPR level goes
+  // up (so zoomed-in text still renders crisply). The map starts
+  // empty; the draw loop populates entries lazily so invisible nodes
+  // never pay the sprite-build cost.
   const spriteCache = useMemo(() => {
     return new Map<string, HTMLCanvasElement>();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [laidNodes, themeResolved]);
+  }, [laidNodes, themeResolved, spriteDprLevel]);
+
+  // Adaptive sprite DPR: upgrade when the current zoom level would
+  // start to blur the baked sprites, reset to a sensible baseline on
+  // layout change. Only upgrades during gestures (never downgrades)
+  // so pan + pinch stay a single bitmap blit per frame — no
+  // mid-gesture cache invalidation.
+  const prevLaidNodesRef = useRef<LaidNode[] | null>(null);
+  useEffect(() => {
+    const ideal = idealSpriteDpr(viewRef.current.k);
+    const capped = memoryCappedDpr(ideal, laidNodes.length);
+    if (prevLaidNodesRef.current !== laidNodes) {
+      prevLaidNodesRef.current = laidNodes;
+      const base = memoryCappedDpr(initialSpriteDpr(), laidNodes.length);
+      setSpriteDprLevel(Math.max(base, capped));
+      return;
+    }
+    setSpriteDprLevel((cur) => Math.max(cur, capped));
+  }, [viewTick, laidNodes]);
 
   // Auto-fit.
   const fittedKey = useRef("");
@@ -642,6 +680,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
         nodeById,
         focusId ?? null,
         spriteCache,
+        spriteDprLevel,
       );
     });
 
@@ -651,7 +690,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
         rafRef.current = null;
       }
     };
-  }, [laidNodes, laidEdges, edgeGroups, focusId, size, viewTick, nodeById, spriteCache]);
+  }, [laidNodes, laidEdges, edgeGroups, focusId, size, viewTick, nodeById, spriteCache, spriteDprLevel]);
 
   return (
     <div
@@ -711,6 +750,7 @@ function drawFrame(
   nodeById: Map<string, LaidNode>,
   focusId: string | null,
   spriteCache: Map<string, HTMLCanvasElement>,
+  spriteDprLevel: number,
 ) {
   const dpr = window.devicePixelRatio || 1;
   const targetW = Math.ceil(size.w * dpr);
@@ -750,12 +790,12 @@ function drawFrame(
   drawEdgeBatch(ctx, edgeGroups.fieldSolid, "#6366f1", [], vpLeft, vpTop, vpRight, vpBottom);
   ctx.setLineDash([]);
 
-  // PASS B — node chrome (background, header band, border) via the
-  // sprite cache. Sprites only carry vector chrome, never text — text
-  // is rasterized fresh in PASS B-text below at the current zoom level
-  // so glyphs stay sharp instead of upscaling a baked bitmap.
+  // PASS B — nodes. One drawImage per visible node using the sprite
+  // cache. Sprites carry the full card (chrome + text) at the current
+  // sprite DPR level; they're rebuilt only when the zoom level rises
+  // enough to warrant more resolution, so pan/zoom stays one blit per
+  // node per frame.
   const spriteContext = { cardColor, fgColor, mutedFg };
-  const visibleNodesForFrame: LaidNode[] = [];
   for (const n of laidNodes) {
     const nLeft = n.cx - n.w / 2;
     const nRight = n.cx + n.w / 2;
@@ -769,16 +809,8 @@ function drawFrame(
     ) {
       continue;
     }
-    const sprite = getOrBuildSprite(spriteCache, n, spriteContext);
+    const sprite = getOrBuildSprite(spriteCache, n, spriteContext, spriteDprLevel);
     if (sprite) ctx.drawImage(sprite, nLeft, nTop, n.w, n.h);
-    visibleNodesForFrame.push(n);
-  }
-
-  // PASS B-text — node labels drawn directly under the world transform
-  // so the browser anti-aliases glyphs at the final on-screen size. No
-  // bitmap upscaling means text reads cleanly at any zoom level.
-  for (const n of visibleNodesForFrame) {
-    drawNodeText(ctx, n, fgColor, mutedFg);
   }
 
   // PASS C — focus ring on top.
@@ -902,11 +934,11 @@ function getOrBuildSprite(
   cache: Map<string, HTMLCanvasElement>,
   n: LaidNode,
   ctxColors: SpriteCtx,
+  dpr: number,
 ): HTMLCanvasElement | null {
   const existing = cache.get(n.id);
   if (existing) return existing;
   if (typeof document === "undefined") return null;
-  const dpr = spriteDpr();
   const can = document.createElement("canvas");
   can.width = Math.ceil(n.w * dpr);
   can.height = Math.ceil(n.h * dpr);
@@ -921,7 +953,7 @@ function getOrBuildSprite(
 function drawNodeSprite(
   ctx: CanvasRenderingContext2D,
   n: LaidNode,
-  { cardColor }: SpriteCtx,
+  { cardColor, fgColor, mutedFg }: SpriteCtx,
 ) {
   const w = n.w;
   const h = n.h;
@@ -954,29 +986,12 @@ function drawNodeSprite(
   ctx.lineTo(w, HEADER_H);
   ctx.stroke();
   ctx.globalAlpha = 1;
-}
-
-/**
- * Draws all label text for a node in world coordinates. The caller
- * has already applied the view transform, so each glyph is rasterized
- * by the browser at its true on-screen pixel size — no bitmap blur
- * when the user zooms in.
- */
-function drawNodeText(
-  ctx: CanvasRenderingContext2D,
-  n: LaidNode,
-  fgColor: string,
-  mutedFg: string,
-) {
-  const left = n.cx - n.w / 2;
-  const top = n.cy - n.h / 2;
-  const w = n.w;
 
   // Kind label.
   ctx.font = `600 9px ${MONO}`;
   ctx.fillStyle = "#ffffff";
   ctx.globalAlpha = 0.6;
-  ctx.fillText(n.data.kind.toUpperCase(), left + 8, top + 14);
+  ctx.fillText(n.data.kind.toUpperCase(), 8, 14);
   ctx.globalAlpha = 1;
 
   // Name. fitText re-measures against the card's actual width so the
@@ -984,28 +999,28 @@ function drawNodeText(
   // accurate ellipsis.
   ctx.font = NODE_NAME_FONT;
   ctx.fillStyle = "#ffffff";
-  ctx.fillText(fitText(ctx, n.data.name, w - 16), left + 8, top + 30);
+  ctx.fillText(fitText(ctx, n.data.name, w - 16), 8, 30);
 
   // Body.
-  const bodyY = top + HEADER_H + TOP_BODY_PAD - 2;
+  const bodyY = HEADER_H + TOP_BODY_PAD - 2;
   if (n.data.kind === "Enum") {
     ctx.font = `10px ${MONO}`;
     ctx.fillStyle = mutedFg;
     const values = n.data.values ?? [];
     for (let i = 0; i < values.length; i++) {
-      ctx.fillText(values[i]!.name, left + 10, bodyY + i * ROW_H + 10);
+      ctx.fillText(values[i]!.name, 10, bodyY + i * ROW_H + 10);
     }
   } else if (n.data.kind === "Union") {
     ctx.font = `10px ${MONO}`;
     ctx.fillStyle = mutedFg;
     const members = n.data.members ?? [];
     for (let i = 0; i < members.length; i++) {
-      ctx.fillText("| " + members[i]!, left + 10, bodyY + i * ROW_H + 10);
+      ctx.fillText("| " + members[i]!, 10, bodyY + i * ROW_H + 10);
     }
   } else if (n.data.kind === "Scalar") {
     ctx.font = `italic 10px ${MONO}`;
     ctx.fillStyle = mutedFg;
-    ctx.fillText("custom scalar", left + 10, bodyY + 10);
+    ctx.fillText("custom scalar", 10, bodyY + 10);
   } else {
     const fields = n.data.fields ?? [];
     ctx.font = `10px ${MONO}`;
@@ -1013,8 +1028,8 @@ function drawNodeText(
       const f = fields[i]!;
       const fy = bodyY + i * ROW_H + 10;
       ctx.fillStyle = fgColor;
-      ctx.fillText(f.name, left + 10, fy);
-      drawColoredType(ctx, f.type, left + w - 10, fy, mutedFg);
+      ctx.fillText(f.name, 10, fy);
+      drawColoredType(ctx, f.type, w - 10, fy, mutedFg);
     }
   }
 }
