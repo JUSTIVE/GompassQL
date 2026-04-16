@@ -599,9 +599,12 @@ function drawFrame(
   drawEdgeBatch(ctx, edgeGroups.fieldSolid, "#6366f1", [], vpLeft, vpTop, vpRight, vpBottom);
   ctx.setLineDash([]);
 
-  // PASS B — nodes. One drawImage per visible node using the sprite
-  // cache. Sprites are built lazily on first visit.
+  // PASS B — node chrome (background, header band, border) via the
+  // sprite cache. Sprites only carry vector chrome, never text — text
+  // is rasterized fresh in PASS B-text below at the current zoom level
+  // so glyphs stay sharp instead of upscaling a baked bitmap.
   const spriteContext = { cardColor, fgColor, mutedFg };
+  const visibleNodesForFrame: LaidNode[] = [];
   for (const n of laidNodes) {
     const nLeft = n.cx - n.w / 2;
     const nRight = n.cx + n.w / 2;
@@ -617,6 +620,14 @@ function drawFrame(
     }
     const sprite = getOrBuildSprite(spriteCache, n, spriteContext);
     if (sprite) ctx.drawImage(sprite, nLeft, nTop, n.w, n.h);
+    visibleNodesForFrame.push(n);
+  }
+
+  // PASS B-text — node labels drawn directly under the world transform
+  // so the browser anti-aliases glyphs at the final on-screen size. No
+  // bitmap upscaling means text reads cleanly at any zoom level.
+  for (const n of visibleNodesForFrame) {
+    drawNodeText(ctx, n, fgColor, mutedFg);
   }
 
   // PASS C — focus ring on top.
@@ -759,7 +770,7 @@ function getOrBuildSprite(
 function drawNodeSprite(
   ctx: CanvasRenderingContext2D,
   n: LaidNode,
-  { cardColor, fgColor, mutedFg }: SpriteCtx,
+  { cardColor }: SpriteCtx,
 ) {
   const w = n.w;
   const h = n.h;
@@ -792,12 +803,29 @@ function drawNodeSprite(
   ctx.lineTo(w, HEADER_H);
   ctx.stroke();
   ctx.globalAlpha = 1;
+}
+
+/**
+ * Draws all label text for a node in world coordinates. The caller
+ * has already applied the view transform, so each glyph is rasterized
+ * by the browser at its true on-screen pixel size — no bitmap blur
+ * when the user zooms in.
+ */
+function drawNodeText(
+  ctx: CanvasRenderingContext2D,
+  n: LaidNode,
+  fgColor: string,
+  mutedFg: string,
+) {
+  const left = n.cx - n.w / 2;
+  const top = n.cy - n.h / 2;
+  const w = n.w;
 
   // Kind label.
   ctx.font = `600 9px ${MONO}`;
   ctx.fillStyle = "#ffffff";
   ctx.globalAlpha = 0.6;
-  ctx.fillText(n.data.kind.toUpperCase(), 8, 14);
+  ctx.fillText(n.data.kind.toUpperCase(), left + 8, top + 14);
   ctx.globalAlpha = 1;
 
   // Name. fitText re-measures against the card's actual width so the
@@ -805,28 +833,28 @@ function drawNodeSprite(
   // accurate ellipsis.
   ctx.font = NODE_NAME_FONT;
   ctx.fillStyle = "#ffffff";
-  ctx.fillText(fitText(ctx, n.data.name, w - 16), 8, 30);
+  ctx.fillText(fitText(ctx, n.data.name, w - 16), left + 8, top + 30);
 
   // Body.
-  const bodyY = HEADER_H + TOP_BODY_PAD - 2;
+  const bodyY = top + HEADER_H + TOP_BODY_PAD - 2;
   if (n.data.kind === "Enum") {
     ctx.font = `10px ${MONO}`;
     ctx.fillStyle = mutedFg;
     const values = n.data.values ?? [];
     for (let i = 0; i < values.length; i++) {
-      ctx.fillText(values[i]!.name, 10, bodyY + i * ROW_H + 10);
+      ctx.fillText(values[i]!.name, left + 10, bodyY + i * ROW_H + 10);
     }
   } else if (n.data.kind === "Union") {
     ctx.font = `10px ${MONO}`;
     ctx.fillStyle = mutedFg;
     const members = n.data.members ?? [];
     for (let i = 0; i < members.length; i++) {
-      ctx.fillText("| " + members[i]!, 10, bodyY + i * ROW_H + 10);
+      ctx.fillText("| " + members[i]!, left + 10, bodyY + i * ROW_H + 10);
     }
   } else if (n.data.kind === "Scalar") {
     ctx.font = `italic 10px ${MONO}`;
     ctx.fillStyle = mutedFg;
-    ctx.fillText("custom scalar", 10, bodyY + 10);
+    ctx.fillText("custom scalar", left + 10, bodyY + 10);
   } else {
     const fields = n.data.fields ?? [];
     ctx.font = `10px ${MONO}`;
@@ -834,8 +862,8 @@ function drawNodeSprite(
       const f = fields[i]!;
       const fy = bodyY + i * ROW_H + 10;
       ctx.fillStyle = fgColor;
-      ctx.fillText(f.name, 10, fy);
-      drawColoredType(ctx, f.type, w - 10, fy, mutedFg);
+      ctx.fillText(f.name, left + 10, fy);
+      drawColoredType(ctx, f.type, left + w - 10, fy, mutedFg);
     }
   }
 }
