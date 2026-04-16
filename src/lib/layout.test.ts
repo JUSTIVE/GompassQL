@@ -17,19 +17,38 @@ function rectOverlap(a: PositionedNode, b: PositionedNode): boolean {
   );
 }
 
-function segmentCrossesNode(ax: number, ay: number, bx: number, by: number, n: PositionedNode, pad = 1): boolean {
-  const xMin = Math.min(ax, bx);
-  const xMax = Math.max(ax, bx);
-  const yMin = Math.min(ay, by);
-  const yMax = Math.max(ay, by);
+/**
+ * Proper line-segment vs axis-aligned rectangle intersection using
+ * Liang-Barsky. A loose bounding-box test produces false positives on
+ * diagonal polyline segments (which dagre emits).
+ */
+function segmentCrossesNode(ax: number, ay: number, bx: number, by: number, n: PositionedNode, pad = 2): boolean {
   const nLeft = n.x - n.width / 2 + pad;
   const nRight = n.x + n.width / 2 - pad;
   const nTop = n.y - n.height / 2 + pad;
   const nBottom = n.y + n.height / 2 - pad;
-  // No overlap on X or Y axis → no crossing.
-  if (xMax <= nLeft || xMin >= nRight) return false;
-  if (yMax <= nTop || yMin >= nBottom) return false;
-  return true;
+  if (nLeft >= nRight || nTop >= nBottom) return false;
+  const dx = bx - ax;
+  const dy = by - ay;
+  let t0 = 0;
+  let t1 = 1;
+  const clip = (p: number, q: number): boolean => {
+    if (p === 0) return q >= 0;
+    const t = q / p;
+    if (p < 0) {
+      if (t > t1) return false;
+      if (t > t0) t0 = t;
+    } else {
+      if (t < t0) return false;
+      if (t < t1) t1 = t;
+    }
+    return true;
+  };
+  if (!clip(-dx, ax - nLeft)) return false;
+  if (!clip(dx, nRight - ax)) return false;
+  if (!clip(-dy, ay - nTop)) return false;
+  if (!clip(dy, nBottom - ay)) return false;
+  return t0 < t1;
 }
 
 function pathCrossesAnyNode(path: EdgePath, nodesById: Map<string, PositionedNode>): PositionedNode | null {
