@@ -1,21 +1,44 @@
 import { Loader2 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { LayoutResult } from "@/lib/layout";
-import type {
-  LayoutWorkerRequest,
-  LayoutWorkerResponse,
-} from "@/lib/layout-worker";
+import type { BezierSegment, LayoutResult } from "@/lib/layout";
+import type { LayoutWorkerRequest, LayoutWorkerResponse } from "@/lib/layout-worker";
 import type { GraphEdgeData, GraphNodeData } from "@/lib/sdl-to-graph";
+import { useTheme } from "@/lib/theme";
 import { colorizeType } from "@/lib/type-colors";
 import {
   HEADER_H,
   KIND_COLORS,
-  KIND_COLORS_DARK,
-  NODE_WIDTH,
+  NODE_NAME_FONT,
   ROW_H,
   TOP_BODY_PAD,
   estimateNodeHeight,
+  estimateNodeWidth,
 } from "./node-style";
+
+/**
+ * Canvas-based schema graph renderer.
+ *
+ * Rendering is structured for throughput on hundreds of nodes:
+ *
+ *   • Layout runs off the main thread in a worker; only positions/
+ *     beziers come back. No React reconciliation per node.
+ *   • Each node card (background + header + kind label + name + field
+ *     rows) is pre-rendered once to its own offscreen canvas — per-node
+ *     sprite caching. The main draw loop blits the sprite with a single
+ *     `drawImage` per visible node instead of 30+ `fillText` calls.
+ *     Cache is invalidated on theme change or new layout.
+ *   • Edges are batched by (color, dash) into four groups. Each group
+ *     draws with one `beginPath`, one `setLineDash`, one `stroke` and
+ *     one `fill` — draw calls and context-state changes scale with the
+ *     number of distinct styles, not with the number of edges.
+ *   • Viewport culling skips invisible nodes and edges (bbox test) so
+ *     only what's on-screen pays the draw cost.
+ *   • View changes (pan / zoom / focus) go through a `requestAnimation-
+ *     Frame`-coalesced path so rapid events don't stack up redraws.
+ *   • Canvas resolution is re-set only when the element actually
+ *     resizes; each draw reuses the existing backing store and skips
+ *     allocation churn.
+ */
 
 interface LaidNode {
   id: string;
@@ -36,7 +59,10 @@ interface LaidEdge {
   targetId: string;
   kind: GraphEdgeData["kind"];
   nullable: boolean;
-  points: Point[];
+  start: Point;
+  segments: BezierSegment[];
+  arrowTip?: Point;
+  bbox: { minX: number; minY: number; maxX: number; maxY: number };
 }
 
 interface Props {
@@ -46,23 +72,6 @@ interface Props {
   rootId?: string | null;
 }
 
-function rectExit(
-  cx: number,
-  cy: number,
-  halfW: number,
-  halfH: number,
-  dx: number,
-  dy: number,
-): [number, number] {
-  if (dx === 0 && dy === 0) return [cx, cy];
-  const absDx = Math.abs(dx);
-  const absDy = Math.abs(dy);
-  const tx = absDx === 0 ? Infinity : halfW / absDx;
-  const ty = absDy === 0 ? Infinity : halfH / absDy;
-  const t = Math.min(tx, ty);
-  return [cx + dx * t, cy + dy * t];
-}
-
 function getComputedCssVar(name: string, fallback: string): string {
   if (typeof window === "undefined") return fallback;
   const val = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -70,6 +79,16 @@ function getComputedCssVar(name: string, fallback: string): string {
 }
 
 const EMPTY_LAYOUT: LayoutResult = { nodes: [], edgePaths: [] };
+const CULL_PAD = 100;
+const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
+
+// Per-node sprite DPR. Matches the window's DPR so text stays sharp,
+// capped at 2× to keep worst-case memory bounded (400 nodes × 220×200 ×
+// 4 bytes × 4 ≈ 140MB at DPR=2; higher DPR rarely looks better on text).
+function spriteDpr(): number {
+  if (typeof window === "undefined") return 1;
+  return Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+}
 
 export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -78,14 +97,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
   const viewRef = useRef({ x: 0, y: 0, k: 1 });
   const [viewTick, setViewTick] = useState(0);
   const dragRef = useRef({ active: false, lastX: 0, lastY: 0 });
+  const rafRef = useRef<number | null>(null);
+  const { resolved: themeResolved } = useTheme();
 
   // Layout runs off the main thread in a dedicated Web Worker bundled
-  // separately at `/layout-worker.js` (see src/index.ts for dev,
-  // build.ts for prod). `isPending` is true from the moment a request
-  // is posted until the matching response arrives; stale responses
-  // (older `id`) are discarded.
+  // separately at `/layout-worker.js`. `isPending` is true from the
+  // moment a request is posted until the matching response arrives;
+  // stale responses (older `id`) are discarded.
   const [layoutResult, setLayoutResult] = useState<LayoutResult>(EMPTY_LAYOUT);
   const [isPending, setIsPending] = useState(nodes.length > 0);
+  const [lastTiming, setLastTiming] = useState<LayoutWorkerResponse["timings"] | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const requestIdRef = useRef(0);
 
@@ -104,13 +125,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
   useEffect(() => {
     const worker = new Worker("/layout-worker.js", { type: "module" });
     worker.onmessage = (e: MessageEvent<LayoutWorkerResponse>) => {
-      // Ignore responses superseded by a newer request.
       if (e.data.id !== requestIdRef.current) return;
       setLayoutResult(e.data.result);
+      setLastTiming(e.data.timings);
       setIsPending(false);
     };
     worker.onerror = (err) => {
-      // Surface worker errors without crashing the page.
       console.error("layout worker error:", err.message ?? err);
       setIsPending(false);
     };
@@ -121,7 +141,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     };
   }, []);
 
-  // Post a layout request whenever the input graph changes.
   useEffect(() => {
     if (nodes.length === 0) {
       requestIdRef.current += 1;
@@ -133,7 +152,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     if (!worker) return;
     const layoutNodes = nodes.map((n) => ({
       id: n.id,
-      width: NODE_WIDTH,
+      width: estimateNodeWidth(n.name),
       height: estimateNodeHeight(
         n.kind,
         n.fields?.length ?? 0,
@@ -173,10 +192,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
   }, [laidNodes]);
 
   const laidEdges = useMemo<LaidEdge[]>(() => {
-    const byEdgeId = new Map<string, { waypoints: Point[] }>();
-    for (const p of layoutResult.edgePaths) {
-      byEdgeId.set(p.edgeId, { waypoints: p.waypoints });
-    }
+    const byEdgeId = new Map<string, (typeof layoutResult.edgePaths)[number]>();
+    for (const p of layoutResult.edgePaths) byEdgeId.set(p.edgeId, p);
     const out: LaidEdge[] = [];
     for (const e of edges) {
       if (e.source === e.target) continue;
@@ -184,57 +201,109 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
       const b = nodeById.get(e.target);
       if (!a || !b) continue;
       const path = byEdgeId.get(e.id);
-      if (!path || path.waypoints.length < 2) continue;
-      const points: Point[] = path.waypoints.map((p) => ({ x: p.x, y: p.y }));
-      // Force every arrow tail to leave the source node from its right
-      // edge at the field's row (or node center for non-field edges).
-      // dagre's polyline-intersection sometimes places the first point
-      // inside the row area next to the type text, which visually looks
-      // like the arrow "starts at the type". Snapping to the node border
-      // gives every row a consistent clean exit. For back-edges
-      // (target.cx < source.cx) we keep dagre's natural exit side but
-      // still align the leading same-Y run to the field row.
-      const exitY =
-        e.kind === "field" && e.sourceFieldIndex != null
-          ? a.cy - a.h / 2 + HEADER_H + TOP_BODY_PAD - 2 + e.sourceFieldIndex * ROW_H + 6
-          : a.cy;
-      const isForward = b.cx > a.cx;
-      if (isForward) {
+      if (!path || path.segments.length === 0) continue;
+
+      let start: Point = { x: path.start.x, y: path.start.y };
+      let segments: BezierSegment[] = path.segments;
+      const arrowTip = path.arrowTip;
+
+      // Snap forward field-edges to the field row's right edge on the
+      // source node by rewriting the first bezier's start + c1 (so the
+      // curve *departs* horizontally at the row, then blends back into
+      // the original c2/end — no seam, no kink, single smooth bezier).
+      if (
+        e.kind === "field" &&
+        e.sourceFieldIndex != null &&
+        b.cx > a.cx &&
+        segments.length > 0
+      ) {
         const exitX = a.cx + a.w / 2;
-        points[0] = { x: exitX, y: exitY };
-        // If the next waypoint sits at a different Y, insert an L-elbow
-        // at (next.x, exitY) so the arrow leaves the node strictly
-        // horizontally before turning.
-        if (points.length >= 2) {
-          const next = points[1]!;
-          if (next.y !== exitY && next.x > exitX) {
-            points.splice(1, 0, { x: next.x, y: exitY });
-          }
-        }
-      } else if (e.kind === "field" && e.sourceFieldIndex != null) {
-        const originalStartY = points[0]!.y;
-        for (let i = 0; i < points.length; i++) {
-          if (points[i]!.y !== originalStartY) break;
-          points[i] = { x: points[i]!.x, y: exitY };
-        }
+        const exitY =
+          a.cy - a.h / 2 + HEADER_H + TOP_BODY_PAD - 2 + e.sourceFieldIndex * ROW_H + 6;
+        const origC1 = segments[0]!.c1;
+        const tangentLen = Math.hypot(origC1.x - start.x, origC1.y - start.y);
+        const c1Offset = Math.max(tangentLen, 32);
+        start = { x: exitX, y: exitY };
+        segments = [
+          {
+            c1: { x: exitX + c1Offset, y: exitY },
+            c2: segments[0]!.c2,
+            end: segments[0]!.end,
+          },
+          ...segments.slice(1),
+        ];
       }
+
+      // A cubic bezier's convex hull is contained in its four control
+      // points, so start + every (c1, c2, end) + arrowTip is a safe
+      // bounding box for culling.
+      let minX = start.x,
+        maxX = start.x,
+        minY = start.y,
+        maxY = start.y;
+      for (const s of segments) {
+        if (s.c1.x < minX) minX = s.c1.x;
+        else if (s.c1.x > maxX) maxX = s.c1.x;
+        if (s.c1.y < minY) minY = s.c1.y;
+        else if (s.c1.y > maxY) maxY = s.c1.y;
+        if (s.c2.x < minX) minX = s.c2.x;
+        else if (s.c2.x > maxX) maxX = s.c2.x;
+        if (s.c2.y < minY) minY = s.c2.y;
+        else if (s.c2.y > maxY) maxY = s.c2.y;
+        if (s.end.x < minX) minX = s.end.x;
+        else if (s.end.x > maxX) maxX = s.end.x;
+        if (s.end.y < minY) minY = s.end.y;
+        else if (s.end.y > maxY) maxY = s.end.y;
+      }
+      if (arrowTip) {
+        if (arrowTip.x < minX) minX = arrowTip.x;
+        else if (arrowTip.x > maxX) maxX = arrowTip.x;
+        if (arrowTip.y < minY) minY = arrowTip.y;
+        else if (arrowTip.y > maxY) maxY = arrowTip.y;
+      }
+
       out.push({
         sourceId: e.source,
         targetId: e.target,
         kind: e.kind,
         nullable: e.nullable ?? false,
-        points,
+        start,
+        segments,
+        arrowTip,
+        bbox: { minX, minY, maxX, maxY },
       });
     }
     return out;
   }, [edges, layoutResult, nodeById]);
 
+  // Edge groups — pre-partitioned by (color, dash) so the draw loop
+  // doesn't re-partition every frame. Each group renders with one
+  // beginPath / one stroke / one fill call regardless of edge count.
+  const edgeGroups = useMemo(() => {
+    const implementsGroup: LaidEdge[] = [];
+    const unionGroup: LaidEdge[] = [];
+    const fieldNullable: LaidEdge[] = [];
+    const fieldSolid: LaidEdge[] = [];
+    for (const e of laidEdges) {
+      if (e.kind === "implements") implementsGroup.push(e);
+      else if (e.kind === "union") unionGroup.push(e);
+      else if (e.kind === "field" && e.nullable) fieldNullable.push(e);
+      else fieldSolid.push(e);
+    }
+    return { implementsGroup, unionGroup, fieldNullable, fieldSolid };
+  }, [laidEdges]);
+
   const bounds = useMemo(() => {
     if (laidNodes.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let minX = Infinity,
+      minY = Infinity,
+      maxX = -Infinity,
+      maxY = -Infinity;
     for (const n of laidNodes) {
-      const x1 = n.cx - n.w / 2, y1 = n.cy - n.h / 2;
-      const x2 = n.cx + n.w / 2, y2 = n.cy + n.h / 2;
+      const x1 = n.cx - n.w / 2,
+        y1 = n.cy - n.h / 2;
+      const x2 = n.cx + n.w / 2,
+        y2 = n.cy + n.h / 2;
       if (x1 < minX) minX = x1;
       if (y1 < minY) minY = y1;
       if (x2 > maxX) maxX = x2;
@@ -242,6 +311,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     }
     return { minX, minY, maxX, maxY };
   }, [laidNodes]);
+
+  // Sprite cache — one offscreen canvas per node, rebuilt whenever a
+  // new layout arrives or the theme changes. The map starts empty; the
+  // draw loop populates entries lazily so invisible nodes never pay
+  // the sprite-build cost. Dependencies baked into the map identity
+  // means stale sprites are garbage-collected as soon as inputs change.
+  const spriteCache = useMemo(() => {
+    return new Map<string, HTMLCanvasElement>();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [laidNodes, themeResolved]);
 
   // Auto-fit.
   const fittedKey = useRef("");
@@ -260,13 +339,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     setViewTick((t) => t + 1);
   }, [laidNodes, size, bounds]);
 
-  // Focus pan.
+  // Focus pan + zoom. Raises zoom to a readable floor so selecting a
+  // type in the tree actually looks like the canvas moved TO it.
+  const FOCUS_MIN_ZOOM = 0.9;
   useEffect(() => {
     if (!focusId || size.w <= 1) return;
     const n = nodeById.get(focusId);
     if (!n) return;
     const v = viewRef.current;
-    viewRef.current = { ...v, x: size.w / 2 - n.cx * v.k, y: size.h / 2 - n.cy * v.k };
+    const k = Math.max(v.k, FOCUS_MIN_ZOOM);
+    viewRef.current = {
+      k,
+      x: size.w / 2 - n.cx * k,
+      y: size.h / 2 - n.cy * k,
+    };
     setViewTick((t) => t + 1);
   }, [focusId, nodeById, size.w, size.h]);
 
@@ -303,215 +389,43 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
     viewRef.current = { ...v, x: v.x + dx, y: v.y + dy };
     setViewTick((t) => t + 1);
   };
-  const endDrag = () => { dragRef.current.active = false; };
+  const endDrag = () => {
+    dragRef.current.active = false;
+  };
 
-  // Draw.
+  // RAF-coalesced draw. Every effect-triggering change enqueues one
+  // frame; any enqueues before the frame fires collapse into that
+  // frame. Prevents back-pressure during rapid pan/zoom events.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d", { alpha: false });
     if (!ctx) return;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = size.w * dpr;
-    canvas.height = size.h * dpr;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    const bgColor = getComputedCssVar("--background", "#ffffff");
-    const cardColor = getComputedCssVar("--card", "#ffffff");
-    const borderColor = getComputedCssVar("--border", "#e2e8f0");
-    const fgColor = getComputedCssVar("--foreground", "#0f172a");
-    const mutedFg = getComputedCssVar("--muted-foreground", "#64748b");
+    if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      drawFrame(
+        canvas,
+        ctx,
+        size,
+        viewRef.current,
+        laidNodes,
+        laidEdges,
+        edgeGroups,
+        nodeById,
+        focusId ?? null,
+        spriteCache,
+      );
+    });
 
-    ctx.fillStyle = bgColor;
-    ctx.fillRect(0, 0, size.w, size.h);
-
-    // Dot grid pattern.
-    {
-      const vw = viewRef.current;
-      const dotGap = 24;
-      const dotR = 1;
-      const dotColor = getComputedCssVar("--muted-foreground", "#94a3b8");
-      ctx.fillStyle = dotColor;
-      ctx.globalAlpha = 0.18;
-      const startX = (vw.x % (dotGap * vw.k)) / vw.k;
-      const startY = (vw.y % (dotGap * vw.k)) / vw.k;
-      for (let gx = startX; gx < size.w / vw.k; gx += dotGap) {
-        for (let gy = startY; gy < size.h / vw.k; gy += dotGap) {
-          ctx.fillRect(gx * vw.k, gy * vw.k, dotR, dotR);
-        }
+    return () => {
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
       }
-      ctx.globalAlpha = 1;
-    }
-
-    const v = viewRef.current;
-    ctx.save();
-    ctx.translate(v.x, v.y);
-    ctx.scale(v.k, v.k);
-
-    // Viewport culling: compute visible region in graph-space.
-    const vpLeft = -v.x / v.k;
-    const vpTop = -v.y / v.k;
-    const vpRight = (size.w - v.x) / v.k;
-    const vpBottom = (size.h - v.y) / v.k;
-    const CULL_PAD = 100;
-
-    const isNodeVisible = (n: LaidNode) => {
-      const nLeft = n.cx - n.w / 2;
-      const nRight = n.cx + n.w / 2;
-      const nTop = n.cy - n.h / 2;
-      const nBottom = n.cy + n.h / 2;
-      return nRight >= vpLeft - CULL_PAD && nLeft <= vpRight + CULL_PAD &&
-             nBottom >= vpTop - CULL_PAD && nTop <= vpBottom + CULL_PAD;
     };
-
-    const visibleNodes = laidNodes.filter(isNodeVisible);
-    const visibleNodeIds = new Set(visibleNodes.map(n => n.id));
-
-    const isEdgeVisible = (pts: Point[]) => {
-      for (const p of pts) {
-        if (p.x >= vpLeft - CULL_PAD && p.x <= vpRight + CULL_PAD &&
-            p.y >= vpTop - CULL_PAD && p.y <= vpBottom + CULL_PAD) return true;
-      }
-      return false;
-    };
-
-    // === PASS 1: Node backgrounds (cards + headers + borders) ===
-    const mono = "ui-monospace, SFMono-Regular, Menlo, monospace";
-    for (const n of visibleNodes) {
-      const x = n.cx - n.w / 2;
-      const y = n.cy - n.h / 2;
-      const color = KIND_COLORS[n.data.kind];
-      const focused = n.id === focusId;
-
-      roundRect(ctx, x, y, n.w, n.h, 6);
-      ctx.fillStyle = cardColor;
-      ctx.fill();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = focused ? 2.5 : 1.25;
-      ctx.globalAlpha = focused ? 1 : 0.75;
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-
-      ctx.save();
-      roundRect(ctx, x, y, n.w, HEADER_H, 6);
-      ctx.clip();
-      ctx.fillStyle = color;
-      ctx.fillRect(x, y, n.w, HEADER_H);
-      ctx.restore();
-    }
-
-    // === PASS 2: Edges (routed splines, on top of card backgrounds) ===
-    for (const e of laidEdges) {
-      if (!isEdgeVisible(e.points)) continue;
-      const pts = e.points;
-      if (pts.length < 2) continue;
-
-      const stroke =
-        e.kind === "implements" ? mutedFg
-        : e.kind === "union" ? "#eab308"
-        : "#6366f1";
-
-      ctx.strokeStyle = stroke;
-      ctx.lineWidth = 1.4;
-      ctx.lineJoin = "round";
-      ctx.lineCap = "round";
-      if (e.kind === "implements") {
-        ctx.setLineDash([6, 4]);
-      } else if (e.kind === "field" && e.nullable) {
-        ctx.setLineDash([4, 3]);
-      } else {
-        ctx.setLineDash([]);
-      }
-
-      // Strict orthogonal polyline with rounded corners via arcTo. The
-      // layout already places waypoints through clear channels, so no
-      // re-routing or splining is needed here.
-      drawRoundedPolyline(ctx, pts, 8);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      // Arrowhead from last segment direction.
-      const last = pts[pts.length - 1]!;
-      const prev = pts[pts.length - 2]!;
-      const adx = last.x - prev.x;
-      const ady = last.y - prev.y;
-      const alen = Math.hypot(adx, ady);
-      if (alen > 0) {
-        const ax = adx / alen;
-        const ay = ady / alen;
-        const sz = 7;
-        ctx.fillStyle = stroke;
-        ctx.beginPath();
-        ctx.moveTo(last.x, last.y);
-        ctx.lineTo(last.x - ax * sz + ay * sz * 0.4, last.y - ay * sz - ax * sz * 0.4);
-        ctx.lineTo(last.x - ax * sz - ay * sz * 0.4, last.y - ay * sz + ax * sz * 0.4);
-        ctx.closePath();
-        ctx.fill();
-      }
-    }
-
-    // === PASS 3: Node text (on top of edges) ===
-    for (const n of visibleNodes) {
-      const x = n.cx - n.w / 2;
-      const y = n.cy - n.h / 2;
-      const color = KIND_COLORS[n.data.kind];
-
-      // Header separator.
-      ctx.strokeStyle = color;
-      ctx.globalAlpha = 0.4;
-      ctx.lineWidth = 0.75;
-      ctx.beginPath();
-      ctx.moveTo(x, y + HEADER_H);
-      ctx.lineTo(x + n.w, y + HEADER_H);
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-
-      // Kind label.
-      ctx.font = `600 9px ${mono}`;
-      ctx.fillStyle = "#ffffff";
-      ctx.globalAlpha = 0.6;
-      ctx.fillText(n.data.kind.toUpperCase(), x + 8, y + 14);
-      ctx.globalAlpha = 1;
-
-      // Name.
-      ctx.font = `600 13px ${mono}`;
-      ctx.fillStyle = "#ffffff";
-      ctx.fillText(truncate(n.data.name, 22), x + 8, y + 30);
-
-      // Body.
-      const bodyY = y + HEADER_H + TOP_BODY_PAD - 2;
-      if (n.data.kind === "Enum") {
-        ctx.font = `10px ${mono}`;
-        ctx.fillStyle = mutedFg;
-        for (let i = 0; i < (n.data.values?.length ?? 0); i++) {
-          ctx.fillText(truncate(n.data.values![i]!, 26), x + 10, bodyY + i * ROW_H + 10);
-        }
-      } else if (n.data.kind === "Union") {
-        ctx.font = `10px ${mono}`;
-        ctx.fillStyle = mutedFg;
-        for (let i = 0; i < (n.data.members?.length ?? 0); i++) {
-          ctx.fillText("| " + truncate(n.data.members![i]!, 22), x + 10, bodyY + i * ROW_H + 10);
-        }
-      } else if (n.data.kind === "Scalar") {
-        ctx.font = `italic 10px ${mono}`;
-        ctx.fillStyle = mutedFg;
-        ctx.fillText("custom scalar", x + 10, bodyY + 10);
-      } else {
-        const fields = n.data.fields ?? [];
-        ctx.font = `10px ${mono}`;
-        for (let i = 0; i < fields.length; i++) {
-          const f = fields[i]!;
-          const fy = bodyY + i * ROW_H + 10;
-          ctx.fillStyle = fgColor;
-          ctx.fillText(truncate(f.name, 14), x + 10, fy);
-          // Colored type.
-          drawColoredType(ctx, truncate(f.type, 14), x + n.w - 10, fy, mutedFg);
-        }
-      }
-    }
-
-    ctx.restore();
-  }, [laidNodes, laidEdges, focusId, size, viewTick]);
+  }, [laidNodes, laidEdges, edgeGroups, focusId, size, viewTick, nodeById, spriteCache]);
 
   return (
     <div
@@ -523,10 +437,14 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
       onMouseLeave={endDrag}
       style={{ cursor: "grab" }}
     >
-      <canvas
-        ref={canvasRef}
-        style={{ width: size.w, height: size.h, display: "block" }}
-      />
+      <canvas ref={canvasRef} style={{ width: size.w, height: size.h, display: "block" }} />
+      {lastTiming && (
+        <div
+          className="pointer-events-none absolute right-3 top-3 z-20 rounded-md border border-border bg-card/90 px-2 py-1 text-xs text-muted-foreground tabular-nums shadow-sm backdrop-blur"
+        >
+          layout {lastTiming.layoutMs.toFixed(0)}ms · total {lastTiming.totalMs.toFixed(0)}ms
+        </div>
+      )}
       {isPending && (
         <div
           className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-background/60 backdrop-blur-sm"
@@ -548,7 +466,316 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
   );
 }
 
-function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+// ─── Draw frame ──────────────────────────────────────────────────────
+
+interface EdgeGroups {
+  implementsGroup: LaidEdge[];
+  unionGroup: LaidEdge[];
+  fieldNullable: LaidEdge[];
+  fieldSolid: LaidEdge[];
+}
+
+function drawFrame(
+  canvas: HTMLCanvasElement,
+  ctx: CanvasRenderingContext2D,
+  size: { w: number; h: number },
+  view: { x: number; y: number; k: number },
+  laidNodes: LaidNode[],
+  laidEdges: LaidEdge[],
+  edgeGroups: EdgeGroups,
+  nodeById: Map<string, LaidNode>,
+  focusId: string | null,
+  spriteCache: Map<string, HTMLCanvasElement>,
+) {
+  const dpr = window.devicePixelRatio || 1;
+  const targetW = Math.ceil(size.w * dpr);
+  const targetH = Math.ceil(size.h * dpr);
+  if (canvas.width !== targetW) canvas.width = targetW;
+  if (canvas.height !== targetH) canvas.height = targetH;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const bgColor = getComputedCssVar("--background", "#ffffff");
+  const cardColor = getComputedCssVar("--card", "#ffffff");
+  const fgColor = getComputedCssVar("--foreground", "#0f172a");
+  const mutedFg = getComputedCssVar("--muted-foreground", "#64748b");
+
+  ctx.fillStyle = bgColor;
+  ctx.fillRect(0, 0, size.w, size.h);
+
+  drawDotGrid(ctx, size, view, mutedFg);
+
+  ctx.save();
+  ctx.translate(view.x, view.y);
+  ctx.scale(view.k, view.k);
+
+  const vpLeft = -view.x / view.k;
+  const vpTop = -view.y / view.k;
+  const vpRight = (size.w - view.x) / view.k;
+  const vpBottom = (size.h - view.y) / view.k;
+
+  ctx.lineWidth = 1.4;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+
+  // PASS A — edges, batched by style. Each group is one beginPath/
+  // stroke and one beginPath/fill regardless of member count.
+  drawEdgeBatch(ctx, edgeGroups.implementsGroup, mutedFg, [6, 4], vpLeft, vpTop, vpRight, vpBottom);
+  drawEdgeBatch(ctx, edgeGroups.unionGroup, "#eab308", [], vpLeft, vpTop, vpRight, vpBottom);
+  drawEdgeBatch(ctx, edgeGroups.fieldNullable, "#6366f1", [4, 3], vpLeft, vpTop, vpRight, vpBottom);
+  drawEdgeBatch(ctx, edgeGroups.fieldSolid, "#6366f1", [], vpLeft, vpTop, vpRight, vpBottom);
+  ctx.setLineDash([]);
+
+  // PASS B — nodes. One drawImage per visible node using the sprite
+  // cache. Sprites are built lazily on first visit.
+  const spriteContext = { cardColor, fgColor, mutedFg };
+  for (const n of laidNodes) {
+    const nLeft = n.cx - n.w / 2;
+    const nRight = n.cx + n.w / 2;
+    const nTop = n.cy - n.h / 2;
+    const nBottom = n.cy + n.h / 2;
+    if (
+      nRight < vpLeft - CULL_PAD ||
+      nLeft > vpRight + CULL_PAD ||
+      nBottom < vpTop - CULL_PAD ||
+      nTop > vpBottom + CULL_PAD
+    ) {
+      continue;
+    }
+    const sprite = getOrBuildSprite(spriteCache, n, spriteContext);
+    if (sprite) ctx.drawImage(sprite, nLeft, nTop, n.w, n.h);
+  }
+
+  // PASS C — focus ring on top.
+  if (focusId) {
+    const n = nodeById.get(focusId);
+    if (n) {
+      const color = KIND_COLORS[n.data.kind];
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2.5;
+      roundRect(ctx, n.cx - n.w / 2, n.cy - n.h / 2, n.w, n.h, 6);
+      ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+
+  // Silence unused — keep laidEdges in scope for future hit-testing.
+  void laidEdges;
+}
+
+function drawDotGrid(
+  ctx: CanvasRenderingContext2D,
+  size: { w: number; h: number },
+  view: { x: number; y: number; k: number },
+  dotColor: string,
+) {
+  const dotGap = 24;
+  const dotR = 1;
+  ctx.fillStyle = dotColor;
+  ctx.globalAlpha = 0.18;
+  const step = dotGap * view.k;
+  const startX = ((view.x % step) + step) % step;
+  const startY = ((view.y % step) + step) % step;
+  for (let px = startX; px < size.w; px += step) {
+    for (let py = startY; py < size.h; py += step) {
+      ctx.fillRect(px, py, dotR, dotR);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawEdgeBatch(
+  ctx: CanvasRenderingContext2D,
+  edges: LaidEdge[],
+  color: string,
+  dash: number[],
+  vpLeft: number,
+  vpTop: number,
+  vpRight: number,
+  vpBottom: number,
+) {
+  if (edges.length === 0) return;
+
+  // One path for every stroke in this style group.
+  ctx.strokeStyle = color;
+  ctx.setLineDash(dash);
+  ctx.beginPath();
+  let anyVisible = false;
+  for (const e of edges) {
+    const bb = e.bbox;
+    if (
+      bb.maxX < vpLeft - CULL_PAD ||
+      bb.minX > vpRight + CULL_PAD ||
+      bb.maxY < vpTop - CULL_PAD ||
+      bb.minY > vpBottom + CULL_PAD
+    ) {
+      continue;
+    }
+    anyVisible = true;
+    ctx.moveTo(e.start.x, e.start.y);
+    for (const seg of e.segments) {
+      ctx.bezierCurveTo(seg.c1.x, seg.c1.y, seg.c2.x, seg.c2.y, seg.end.x, seg.end.y);
+    }
+    if (e.arrowTip) ctx.lineTo(e.arrowTip.x, e.arrowTip.y);
+  }
+  if (!anyVisible) return;
+  ctx.stroke();
+
+  // One path for every arrowhead fill in this group. Dashes don't
+  // apply to fill() but reset for safety downstream.
+  ctx.setLineDash([]);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  for (const e of edges) {
+    const bb = e.bbox;
+    if (
+      bb.maxX < vpLeft - CULL_PAD ||
+      bb.minX > vpRight + CULL_PAD ||
+      bb.maxY < vpTop - CULL_PAD ||
+      bb.minY > vpBottom + CULL_PAD
+    ) {
+      continue;
+    }
+    const lastSeg = e.segments[e.segments.length - 1]!;
+    const tangentFrom = e.arrowTip ? lastSeg.end : lastSeg.c2;
+    const tangentTo = e.arrowTip ?? lastSeg.end;
+    const adx = tangentTo.x - tangentFrom.x;
+    const ady = tangentTo.y - tangentFrom.y;
+    const alen = Math.hypot(adx, ady);
+    if (alen <= 0) continue;
+    const ax = adx / alen;
+    const ay = ady / alen;
+    const sz = 7;
+    ctx.moveTo(tangentTo.x, tangentTo.y);
+    ctx.lineTo(tangentTo.x - ax * sz + ay * sz * 0.4, tangentTo.y - ay * sz - ax * sz * 0.4);
+    ctx.lineTo(tangentTo.x - ax * sz - ay * sz * 0.4, tangentTo.y - ay * sz + ax * sz * 0.4);
+    ctx.closePath();
+  }
+  ctx.fill();
+}
+
+// ─── Sprite cache ────────────────────────────────────────────────────
+
+interface SpriteCtx {
+  cardColor: string;
+  fgColor: string;
+  mutedFg: string;
+}
+
+function getOrBuildSprite(
+  cache: Map<string, HTMLCanvasElement>,
+  n: LaidNode,
+  ctxColors: SpriteCtx,
+): HTMLCanvasElement | null {
+  const existing = cache.get(n.id);
+  if (existing) return existing;
+  if (typeof document === "undefined") return null;
+  const dpr = spriteDpr();
+  const can = document.createElement("canvas");
+  can.width = Math.ceil(n.w * dpr);
+  can.height = Math.ceil(n.h * dpr);
+  const c = can.getContext("2d");
+  if (!c) return null;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawNodeSprite(c, n, ctxColors);
+  cache.set(n.id, can);
+  return can;
+}
+
+function drawNodeSprite(
+  ctx: CanvasRenderingContext2D,
+  n: LaidNode,
+  { cardColor, fgColor, mutedFg }: SpriteCtx,
+) {
+  const w = n.w;
+  const h = n.h;
+  const color = KIND_COLORS[n.data.kind];
+
+  // Card background + unfocused border. Focus ring is drawn on the
+  // main canvas so sprites don't need to rebuild on focus change.
+  roundRect(ctx, 0, 0, w, h, 6);
+  ctx.fillStyle = cardColor;
+  ctx.fill();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.25;
+  ctx.globalAlpha = 0.75;
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  // Header band — rounded on top, flat on the bottom so it butts up
+  // cleanly against the body separator without the subtle corner
+  // curves the full rounded-rect used to leave behind.
+  roundRectTopOnly(ctx, 0, 0, w, HEADER_H, 6);
+  ctx.fillStyle = color;
+  ctx.fill();
+
+  // Header separator.
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = 0.4;
+  ctx.lineWidth = 0.75;
+  ctx.beginPath();
+  ctx.moveTo(0, HEADER_H);
+  ctx.lineTo(w, HEADER_H);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  // Kind label.
+  ctx.font = `600 9px ${MONO}`;
+  ctx.fillStyle = "#ffffff";
+  ctx.globalAlpha = 0.6;
+  ctx.fillText(n.data.kind.toUpperCase(), 8, 14);
+  ctx.globalAlpha = 1;
+
+  // Name. fitText re-measures against the card's actual width so the
+  // clamped MAX_WIDTH case (absurdly long names) still gets a pixel-
+  // accurate ellipsis.
+  ctx.font = NODE_NAME_FONT;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(fitText(ctx, n.data.name, w - 16), 8, 30);
+
+  // Body.
+  const bodyY = HEADER_H + TOP_BODY_PAD - 2;
+  if (n.data.kind === "Enum") {
+    ctx.font = `10px ${MONO}`;
+    ctx.fillStyle = mutedFg;
+    const values = n.data.values ?? [];
+    for (let i = 0; i < values.length; i++) {
+      ctx.fillText(truncate(values[i]!.name, 26), 10, bodyY + i * ROW_H + 10);
+    }
+  } else if (n.data.kind === "Union") {
+    ctx.font = `10px ${MONO}`;
+    ctx.fillStyle = mutedFg;
+    const members = n.data.members ?? [];
+    for (let i = 0; i < members.length; i++) {
+      ctx.fillText("| " + truncate(members[i]!, 22), 10, bodyY + i * ROW_H + 10);
+    }
+  } else if (n.data.kind === "Scalar") {
+    ctx.font = `italic 10px ${MONO}`;
+    ctx.fillStyle = mutedFg;
+    ctx.fillText("custom scalar", 10, bodyY + 10);
+  } else {
+    const fields = n.data.fields ?? [];
+    ctx.font = `10px ${MONO}`;
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i]!;
+      const fy = bodyY + i * ROW_H + 10;
+      ctx.fillStyle = fgColor;
+      ctx.fillText(truncate(f.name, 21), 10, fy);
+      drawColoredType(ctx, truncate(f.type, 21), w - 10, fy, mutedFg);
+    }
+  }
+}
+
+// ─── Drawing helpers ─────────────────────────────────────────────────
+
+function roundRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
   ctx.beginPath();
   ctx.moveTo(x + r, y);
   ctx.lineTo(x + w - r, y);
@@ -562,35 +789,25 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.closePath();
 }
 
-
-/**
- * Draw an orthogonal polyline with rounded corners using arcTo. Each
- * interior corner is softened by a radius clamped to half the shorter
- * adjacent segment so the line stays strictly inside the routed corridor.
- */
-function drawRoundedPolyline(ctx: CanvasRenderingContext2D, pts: Point[], radius: number) {
-  if (pts.length < 2) return;
+/** Rectangle with rounded top corners and flat bottom. Used for the
+ *  header band so its bottom sits flush against the body separator. */
+function roundRectTopOnly(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
   ctx.beginPath();
-  if (pts.length === 2) {
-    ctx.moveTo(pts[0]!.x, pts[0]!.y);
-    ctx.lineTo(pts[1]!.x, pts[1]!.y);
-    return;
-  }
-  ctx.moveTo(pts[0]!.x, pts[0]!.y);
-  for (let i = 1; i < pts.length - 1; i++) {
-    const prev = pts[i - 1]!;
-    const cur = pts[i]!;
-    const next = pts[i + 1]!;
-    const d1 = Math.hypot(cur.x - prev.x, cur.y - prev.y);
-    const d2 = Math.hypot(next.x - cur.x, next.y - cur.y);
-    const r = Math.max(0, Math.min(radius, d1 / 2, d2 / 2));
-    if (r < 1) {
-      ctx.lineTo(cur.x, cur.y);
-    } else {
-      ctx.arcTo(cur.x, cur.y, next.x, next.y, r);
-    }
-  }
-  ctx.lineTo(pts[pts.length - 1]!.x, pts[pts.length - 1]!.y);
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h);
+  ctx.lineTo(x, y + h);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
 }
 
 function drawColoredType(
@@ -608,8 +825,27 @@ function drawColoredType(
     ctx.fillText(seg.text, cx, y);
     cx += ctx.measureText(seg.text).width;
   }
+  void defaultColor;
 }
 
 function truncate(s: string, n: number) {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+/**
+ * Shorten `s` to the longest prefix (+ "…") that still fits within
+ * `maxWidth` pixels using the currently-set canvas font.
+ */
+function fitText(ctx: CanvasRenderingContext2D, s: string, maxWidth: number): string {
+  if (ctx.measureText(s).width <= maxWidth) return s;
+  const ellipsis = "…";
+  let lo = 0;
+  let hi = s.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    const cand = s.slice(0, mid) + ellipsis;
+    if (ctx.measureText(cand).width <= maxWidth) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo > 0 ? s.slice(0, lo) + ellipsis : ellipsis;
 }

@@ -1,13 +1,16 @@
-import dagre from "@dagrejs/dagre";
+import { instance, type Graph, type Viz } from "@viz-js/viz";
 
 /**
- * Thin wrapper around dagre that accepts our layout inputs, injects
- * similarity hints as weak pseudo-edges (so dagre's crossing-reduction
- * pulls clustered nodes adjacent), runs the layered layout, and returns
- * positions plus dagre's own edge waypoints.
+ * Thin wrapper around GraphViz (via WebAssembly). Accepts our layout
+ * inputs, injects similarity hints as non-constraining invisible edges
+ * so GraphViz's crossing-reduction still considers them during within-
+ * rank ordering, runs `dot`, and returns node positions plus edge paths
+ * as cubic-bezier segments (same shape `dot` emits them in) — the canvas
+ * renderer draws them via `bezierCurveTo` so dashed strokes look clean.
  *
- * Keeping the surrounding interfaces stable means `SchemaCanvas`
- * consumes this result without changes.
+ * We previously used @dagrejs/dagre. Same ranking algorithm (network
+ * simplex), but dagre's JS port stalls on ~400-type schemas, while
+ * GraphViz's native C compiled to WASM finishes in under a second.
  */
 
 export interface LayoutNodeInput {
@@ -44,11 +47,23 @@ export interface EdgePathPoint {
   y: number;
 }
 
+/** One cubic bezier segment. The path's implicit start is the previous
+ *  segment's `end` (or `EdgePath.start` for the first segment). */
+export interface BezierSegment {
+  c1: EdgePathPoint;
+  c2: EdgePathPoint;
+  end: EdgePathPoint;
+}
+
 export interface EdgePath {
   edgeId: string;
   source: string;
   target: string;
-  waypoints: EdgePathPoint[];
+  /** First point of the bezier path — anchor for the first segment. */
+  start: EdgePathPoint;
+  segments: BezierSegment[];
+  /** Arrow tip (if GraphViz emitted one, usually past the target node). */
+  arrowTip?: EdgePathPoint;
 }
 
 export interface LayoutResult {
@@ -56,59 +71,69 @@ export interface LayoutResult {
   edgePaths: EdgePath[];
 }
 
-const HINT_EDGE_PREFIX = "__hint__";
-// Real edges carry weight 4 so the hint pseudo-edges (weight up to 1)
-// never outrank real structure in dagre's ordering and ranking phases.
+// GraphViz thinks in inches; we feed pixels in. 72 points = 1 inch,
+// and 1 point ≈ 1 CSS pixel, so output coordinates (emitted in points)
+// come back in the same pixel-space we started from.
+const PX_PER_INCH = 72;
+
+// Real-edge weight. GraphViz defaults to 1 for edges; we bump real
+// edges so that hint pseudo-edges (weight ≤ 1) can't outrank real
+// structural edges during crossing reduction.
 const REAL_EDGE_WEIGHT = 4;
 
-export function layoutGraph(
+const HINT_EDGE_ID_PREFIX = "__hint__";
+
+let vizPromise: Promise<Viz> | null = null;
+function getViz(): Promise<Viz> {
+  if (!vizPromise) vizPromise = instance();
+  return vizPromise;
+}
+
+/**
+ * Preload the WASM module. Safe to call multiple times — the promise
+ * is cached. Callers that know they'll need layout soon can invoke
+ * this eagerly so the first render doesn't pay the cold-start cost.
+ */
+export function preloadLayoutEngine(): Promise<void> {
+  return getViz().then(() => undefined);
+}
+
+export async function layoutGraph(
   nodes: LayoutNodeInput[],
   edges: LayoutEdgeInput[],
   rootId?: string,
   similarityHints?: SimilarityHint[],
-): LayoutResult {
+): Promise<LayoutResult> {
   if (nodes.length === 0) return { nodes: [], edgePaths: [] };
+  // `rootId` is informational — in `dot`, ranks are derived from the
+  // edge structure.
+  void rootId;
 
-  const g = new dagre.graphlib.Graph({ multigraph: true, directed: true });
-  g.setGraph({
-    // Left-to-right layered layout. Generous nodesep/edgesep gives
-    // dagre room to place its virtual-edge control points well clear
-    // of real node rectangles, so the straight segments between
-    // consecutive control points don't need to re-route to avoid
-    // neighbours in the same column.
-    rankdir: "LR",
-    ranksep: 160,
-    nodesep: 80,
-    edgesep: 40,
-    marginx: 60,
-    marginy: 60,
-    acyclicer: "greedy",
-    ranker: "network-simplex",
-  });
-  g.setDefaultEdgeLabel(() => ({}));
+  const viz = await getViz();
 
   const nodeSet = new Set(nodes.map((n) => n.id));
-  for (const n of nodes) {
-    g.setNode(n.id, { width: n.width, height: n.height });
-  }
 
-  const edgeIdByKey = new Map<string, string>();
+  const vizNodes = nodes.map((n) => ({
+    name: n.id,
+    attributes: {
+      width: n.width / PX_PER_INCH,
+      height: n.height / PX_PER_INCH,
+    },
+  }));
+
   const realEdges = edges.filter(
     (e) => e.source !== e.target && nodeSet.has(e.source) && nodeSet.has(e.target),
   );
-  realEdges.forEach((e, i) => {
-    const name = e.id ?? `e${i}:${e.source}->${e.target}`;
-    edgeIdByKey.set(name, e.id ?? name);
-    g.setEdge(e.source, e.target, { weight: REAL_EDGE_WEIGHT, minlen: 1 }, name);
-  });
 
-  // Inject similarity hints as weak pseudo-edges. Low weight (< real)
-  // means they only influence crossing reduction and barycenter
-  // ordering — they don't override real structural ranks. minlen: 1
-  // matches real edges (dagre rejects minlen 0 with some failure
-  // modes on same-rank endpoints). When source/target happen to be
-  // siblings at the same rank, dagre's acyclicer reverses and the
-  // hint simply biases ordering in its layer.
+  const vizEdges: NonNullable<Graph["edges"]> = realEdges.map((e, i) => ({
+    tail: e.source,
+    head: e.target,
+    attributes: {
+      id: e.id ?? `e${i}:${e.source}->${e.target}`,
+      weight: REAL_EDGE_WEIGHT,
+    },
+  }));
+
   if (similarityHints) {
     const realPairs = new Set<string>();
     for (const e of realEdges) {
@@ -122,171 +147,166 @@ export function layoutGraph(
       if (h.source === h.target) continue;
       const key = `${h.source}|${h.target}`;
       if (realPairs.has(key)) continue;
-      const name = `${HINT_EDGE_PREFIX}${hintCounter++}`;
-      g.setEdge(
-        h.source,
-        h.target,
-        { weight: Math.max(0.05, Math.min(1, h.weight)), minlen: 1 },
-        name,
-      );
+      vizEdges.push({
+        tail: h.source,
+        head: h.target,
+        attributes: {
+          id: `${HINT_EDGE_ID_PREFIX}${hintCounter++}`,
+          weight: Math.max(0.05, Math.min(1, h.weight)),
+          constraint: false,
+          style: "invis",
+        },
+      });
       realPairs.add(key);
       realPairs.add(`${h.target}|${h.source}`);
     }
   }
 
-  // `rootId` is informational in a dagre-driven layout — the network
-  // simplex ranker picks ranks from the edge structure. We don't need
-  // to override anything; BFS from rootId is not how dagre works.
-  void rootId;
+  const graph: Graph = {
+    directed: true,
+    graphAttributes: {
+      rankdir: "LR",
+      ranksep: 2.0,
+      nodesep: 0.5,
+    },
+    nodeAttributes: {
+      shape: "box",
+      fixedsize: true,
+    },
+    nodes: vizNodes,
+    edges: vizEdges,
+  };
 
-  dagre.layout(g);
+  // `yInvert: true` flips GraphViz's bottom-origin Y to screen-style
+  // top-origin Y, matching our canvas.
+  const rendered = viz.renderJSON(graph, {
+    engine: "dot",
+    yInvert: true,
+  }) as VizGraphJson;
 
-  // Extract node positions.
-  const positioned: PositionedNode[] = [];
-  for (const n of nodes) {
-    const laid = g.node(n.id);
-    if (!laid) continue;
-    positioned.push({
-      id: n.id,
-      width: n.width,
-      height: n.height,
-      x: laid.x,
-      y: laid.y,
-    });
+  return parseRendered(rendered, nodes);
+}
+
+// ─── GraphViz JSON parsing ───────────────────────────────────────────
+
+interface VizGraphJson {
+  bb?: string;
+  objects?: Array<{
+    _gvid?: number;
+    name?: string;
+    pos?: string;
+  }>;
+  edges?: Array<{
+    _gvid?: number;
+    tail: number;
+    head: number;
+    pos?: string;
+    id?: string;
+  }>;
+}
+
+function parseRendered(
+  json: VizGraphJson,
+  inputs: LayoutNodeInput[],
+): LayoutResult {
+  const objects = json.objects ?? [];
+  const posById = new Map<string, { x: number; y: number }>();
+  for (const obj of objects) {
+    if (!obj.name || !obj.pos) continue;
+    const p = parsePoint(obj.pos);
+    if (p) posById.set(obj.name, p);
   }
 
-  // Extract edge waypoints (skip hint pseudo-edges). dagre's polyline
-  // mostly threads through reserved column Y-slots, but a few diagonals
-  // still graze neighbour nodes in densely-packed layouts. Post-process
-  // each segment: if it clips a non-endpoint node, insert an L-detour
-  // around that node and re-check. Segments that are already clear pass
-  // through unchanged — we keep dagre's diagonals wherever they work.
+  const positioned: PositionedNode[] = [];
+  for (const n of inputs) {
+    const p = posById.get(n.id);
+    if (!p) continue;
+    positioned.push({ id: n.id, width: n.width, height: n.height, x: p.x, y: p.y });
+  }
+
   const paths: EdgePath[] = [];
-  for (const edgeObj of g.edges()) {
-    if (edgeObj.name && edgeObj.name.startsWith(HINT_EDGE_PREFIX)) continue;
-    const e = g.edge(edgeObj) as { points?: Array<{ x: number; y: number }> };
-    if (!e || !e.points || e.points.length < 2) continue;
-    const edgeId = (edgeObj.name && edgeIdByKey.get(edgeObj.name)) || edgeObj.name || `${edgeObj.v}->${edgeObj.w}`;
-    const raw = e.points.map((p) => ({ x: p.x, y: p.y }));
-    const detoured = detourAroundNodes(raw, edgeObj.v, edgeObj.w, positioned);
+  for (const e of json.edges ?? []) {
+    if (!e.pos) continue;
+    const id = (e.id ?? "") as string;
+    if (id.startsWith(HINT_EDGE_ID_PREFIX)) continue;
+    const tailName = objects[e.tail]?.name;
+    const headName = objects[e.head]?.name;
+    if (!tailName || !headName) continue;
+    const parsed = parseSpline(e.pos);
+    if (!parsed || parsed.segments.length === 0) continue;
     paths.push({
-      edgeId,
-      source: edgeObj.v,
-      target: edgeObj.w,
-      waypoints: detoured,
+      edgeId: id || `${tailName}->${headName}`,
+      source: tailName,
+      target: headName,
+      start: parsed.start,
+      segments: parsed.segments,
+      arrowTip: parsed.arrowTip,
     });
   }
 
   return { nodes: positioned, edgePaths: paths };
 }
 
-const DETOUR_PAD = 12;
-const DETOUR_MAX_ITERS = 16;
+function parsePoint(s: string): EdgePathPoint | null {
+  const [xs, ys] = s.split(",");
+  const x = parseFloat(xs ?? "");
+  const y = parseFloat(ys ?? "");
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x, y };
+}
 
-/**
- * Liang-Barsky line-segment vs axis-aligned rect intersection. Returns
- * the node whose rectangle the segment clips (excluding the src/tgt of
- * the current edge), or null when clear.
- */
-function firstBlocker(
-  ax: number,
-  ay: number,
-  bx: number,
-  by: number,
-  srcId: string,
-  tgtId: string,
-  nodes: PositionedNode[],
-): PositionedNode | null {
-  const dx = bx - ax;
-  const dy = by - ay;
-  let best: PositionedNode | null = null;
-  let bestT = Infinity;
-  for (const n of nodes) {
-    if (n.id === srcId || n.id === tgtId) continue;
-    const nL = n.x - n.width / 2;
-    const nR = n.x + n.width / 2;
-    const nT = n.y - n.height / 2;
-    const nB = n.y + n.height / 2;
-    let t0 = 0;
-    let t1 = 1;
-    const clip = (p: number, q: number): boolean => {
-      if (p === 0) return q >= 0;
-      const t = q / p;
-      if (p < 0) {
-        if (t > t1) return false;
-        if (t > t0) t0 = t;
-      } else {
-        if (t < t0) return false;
-        if (t < t1) t1 = t;
-      }
-      return true;
-    };
-    if (!clip(-dx, ax - nL)) continue;
-    if (!clip(dx, nR - ax)) continue;
-    if (!clip(-dy, ay - nT)) continue;
-    if (!clip(dy, nB - ay)) continue;
-    if (t0 >= t1) continue;
-    // Closest blocker wins — use entry parameter t0.
-    if (t0 < bestT) {
-      bestT = t0;
-      best = n;
-    }
-  }
-  return best;
+interface ParsedSpline {
+  start: EdgePathPoint;
+  segments: BezierSegment[];
+  arrowTip?: EdgePathPoint;
 }
 
 /**
- * Walk the polyline. For each segment that clips a node, try a Z-detour
- * above AND below the blocker, pick whichever resulting three-segment
- * path is fully clear (no sub-segment clips the blocker). Repeat until
- * stable or DETOUR_MAX_ITERS.
+ * Parse GraphViz's spline `pos` format into cubic bezier segments.
+ *
+ * Format is whitespace-separated tokens:
+ *   `[e,ex,ey]? [s,sx,sy]? p0,p0 p1,p1 p2,p2 …`
+ * The optional `e,…` / `s,…` give the arrow end / start points. The
+ * remaining tokens form a cubic B-spline: one start anchor followed
+ * by groups of three control points per segment — `(c1, c2, end)`
+ * triplets. We pass these straight through so the canvas can draw
+ * them with `bezierCurveTo`, which produces clean dashed strokes
+ * without the arcTo-chained-arcs artifacts that a sampled polyline
+ * renderer suffers from.
  */
-function detourAroundNodes(
-  raw: EdgePathPoint[],
-  srcId: string,
-  tgtId: string,
-  nodes: PositionedNode[],
-): EdgePathPoint[] {
-  let pts: EdgePathPoint[] = raw.slice();
-  for (let iter = 0; iter < DETOUR_MAX_ITERS; iter++) {
-    let changed = false;
-    const out: EdgePathPoint[] = [pts[0]!];
-    for (let i = 0; i < pts.length - 1; i++) {
-      const a = pts[i]!;
-      const b = pts[i + 1]!;
-      const blocker = firstBlocker(a.x, a.y, b.x, b.y, srcId, tgtId, nodes);
-      if (!blocker) {
-        out.push(b);
-        continue;
-      }
-      const top = blocker.y - blocker.height / 2 - DETOUR_PAD;
-      const bottom = blocker.y + blocker.height / 2 + DETOUR_PAD;
-      const tryRoute = (routeY: number): [EdgePathPoint, EdgePathPoint] | null => {
-        const p1: EdgePathPoint = { x: a.x, y: routeY };
-        const p2: EdgePathPoint = { x: b.x, y: routeY };
-        if (firstBlocker(a.x, a.y, p1.x, p1.y, srcId, tgtId, nodes)) return null;
-        if (firstBlocker(p1.x, p1.y, p2.x, p2.y, srcId, tgtId, nodes)) return null;
-        if (firstBlocker(p2.x, p2.y, b.x, b.y, srcId, tgtId, nodes)) return null;
-        return [p1, p2];
-      };
-      const midY = (a.y + b.y) / 2;
-      const firstSide = Math.abs(midY - top) <= Math.abs(midY - bottom) ? top : bottom;
-      const secondSide = firstSide === top ? bottom : top;
-      const detour = tryRoute(firstSide) ?? tryRoute(secondSide);
-      if (!detour) {
-        // Neither side cleared — leave the segment as-is. A future
-        // iteration or a different blocker may fix it, but avoid an
-        // infinite loop.
-        out.push(b);
-        continue;
-      }
-      out.push(detour[0]);
-      out.push(detour[1]);
-      out.push(b);
-      changed = true;
+function parseSpline(pos: string): ParsedSpline | null {
+  const tokens = pos.split(/\s+/).filter(Boolean);
+  let arrowEnd: EdgePathPoint | null = null;
+  const ctrl: EdgePathPoint[] = [];
+  for (const tok of tokens) {
+    const parts = tok.split(",");
+    if (parts[0] === "e" && parts.length >= 3) {
+      const x = parseFloat(parts[1]!);
+      const y = parseFloat(parts[2]!);
+      if (Number.isFinite(x) && Number.isFinite(y)) arrowEnd = { x, y };
+    } else if (parts[0] === "s" && parts.length >= 3) {
+      // Arrow-start is rare in our edges and redundant with ctrl[0] in
+      // practice. Ignore it so downstream consumers have a simple API.
+    } else if (parts.length === 2) {
+      const x = parseFloat(parts[0]!);
+      const y = parseFloat(parts[1]!);
+      if (Number.isFinite(x) && Number.isFinite(y)) ctrl.push({ x, y });
     }
-    pts = out;
-    if (!changed) break;
   }
-  return pts;
+  if (ctrl.length < 4) return null;
+
+  const segments: BezierSegment[] = [];
+  for (let i = 0; i + 3 < ctrl.length; i += 3) {
+    segments.push({
+      c1: ctrl[i + 1]!,
+      c2: ctrl[i + 2]!,
+      end: ctrl[i + 3]!,
+    });
+  }
+
+  return {
+    start: ctrl[0]!,
+    segments,
+    arrowTip: arrowEnd ?? undefined,
+  };
 }

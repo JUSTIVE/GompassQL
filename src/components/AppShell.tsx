@@ -21,7 +21,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="flex items-center gap-6">
           <Link to="/" className="flex items-center gap-2 font-semibold">
             <Compass className="h-5 w-5 text-primary" />
-            <span>GompassQL</span>
+            <span>Graviz</span>
           </Link>
           <nav className="flex items-center gap-1">
             {NAV.map((item) => {

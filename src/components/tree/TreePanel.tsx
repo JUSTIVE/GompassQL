@@ -192,8 +192,15 @@ function TypeDetail({
       {node.kind === "Enum" ? (
         <ul className="space-y-0.5 font-mono text-xs text-muted-foreground">
           {node.values?.map((v) => (
-            <li key={v} className="rounded px-2 py-1">
-              {v}
+            <li key={v.name} className="rounded px-2 py-1">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-foreground">{v.name}</span>
+                {v.description && (
+                  <span className="text-[11px] font-sans leading-snug text-muted-foreground">
+                    {v.description}
+                  </span>
+                )}
+              </div>
             </li>
           ))}
           {(!node.values || node.values.length === 0) && (
@@ -221,12 +228,10 @@ function TypeDetail({
         <ul className="space-y-0.5 font-mono text-xs">
           {node.fields?.map((f) => {
             const nav = isNavigable(f.typeName);
-            const label =
-              f.name + (f.args && f.args.length > 0 ? `(${f.args.length})` : "");
             return (
               <li key={f.name}>
                 <FieldRow
-                  label={label}
+                  label={f.name}
                   typeLabel={f.type}
                   description={f.description}
                   navigable={nav}
@@ -282,7 +287,7 @@ function FieldRow({
         </span>
       </span>
       {description && (
-        <span className="text-[10px] leading-tight text-muted-foreground/70">
+        <span className="font-sans text-[11px] leading-snug text-muted-foreground">
           {description}
         </span>
       )}

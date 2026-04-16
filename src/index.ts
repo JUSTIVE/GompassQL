@@ -1,7 +1,11 @@
 import { serve } from "bun";
 import { join } from "path";
 import index from "./index.html";
+import setupLocatorUI from "@locator/runtime";
 
+if (process.env.NODE_ENV === "development") {
+  setupLocatorUI();
+}
 /**
  * Bundle the layout worker on demand. Bun's HTML-entrypoint bundler
  * doesn't rewrite `new Worker(new URL(...))` into a separate emitted
@@ -61,7 +65,7 @@ const server = serve({
       },
     },
 
-    "/api/hello/:name": async req => {
+    "/api/hello/:name": async (req) => {
       const name = req.params.name;
       return Response.json({
         message: `Hello, ${name}!`,

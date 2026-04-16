@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cat /private/tmp/claude-501/-Users-ben-git-personal-GompassQL/162168c6-c4cc-4206-908c-d8fb038511e5/tasks/bvyolbdma.output; echo \\\"---\\\"; lsof -nP -iTCP:3000 -sTCP:LISTEN 2>/dev/null; lsof ...",
-  "error": "Exit code 1\n🚀 Server running at http://localhost:3000/\n---\nCOMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\nnode    70684  ben   31u  IPv6 0x910a118f1e1e6912      0t0  TCP [::1]:3000 (LISTEN)\nbun     82349  ben    6u  IPv6 0x251fef6ec7ed8789      0t0  TCP *:3000 (LISTEN)\nCOMMAND  PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\nnode    6033  ben   38u  IPv6 0x63c1e6a8018a339c      0t0  TCP [::1]:3001 (LISTEN)\n[rerun: b13]",
-  "timestamp": "2026-04-15T15:12:02.793Z",
-  "retry_count": 1
+  "tool_input_preview": "{\"command\":\"gh api \\\"repos/IvanGoncharov/dotviz\\\" --jq '.default_branch' 2>/dev/null\",\"description\":\"Get default branch of dotviz repo\"}",
+  "error": "Exit code 1\n{\"message\":\"Not Found\",\"documentation_url\":\"https://docs.github.com/rest/repos/repos#get-a-repository\",\"status\":\"404\"}",
+  "timestamp": "2026-04-16T13:17:55.024Z",
+  "retry_count": 2
 }

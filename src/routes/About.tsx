@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 export function AboutRoute() {
   return (
     <div className="mx-auto w-full max-w-2xl flex-1 overflow-auto px-6 py-12">
-      <h1 className="text-3xl font-semibold tracking-tight">GompassQL</h1>
+      <h1 className="text-3xl font-semibold tracking-tight">Graviz</h1>
       <p className="mt-3 text-muted-foreground">
         Paste a GraphQL SDL and get an interactive map of your schema. A type tree
         lets you navigate from root operations outward; the canvas shows the

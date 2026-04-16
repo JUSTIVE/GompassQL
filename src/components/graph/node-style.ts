@@ -98,4 +98,58 @@ export function estimateNodeHeight(
   return HEADER_H + TOP_BODY_PAD + body + BOTTOM_PAD;
 }
 
+/** Font used for the name row in a node header — referenced from both
+ *  the width estimator and the canvas renderer so they agree. */
+export const NODE_NAME_FONT =
+  '600 13px ui-monospace, SFMono-Regular, Menlo, monospace';
+
+// Header side-padding (left + right) factored into the width budget.
+const NAME_H_PAD = 16;
+const NODE_MIN_WIDTH = 220;
+const NODE_MAX_WIDTH = 900;
+
+// Global width multiplier — nodes render this much wider than the
+// name+pad requirement, so field-name / field-type rows have plenty
+// of breathing room and their truncation limits can grow
+// proportionally. Stacked 1.5× twice (2.25×) per the user request to
+// grow the node itself again on top of the field-text scaling.
+const NODE_WIDTH_SCALE = 2.25;
+
+let measureCtx: CanvasRenderingContext2D | null = null;
+function getMeasureCtx(): CanvasRenderingContext2D | null {
+  if (measureCtx) return measureCtx;
+  if (typeof document === "undefined") return null;
+  const c = document.createElement("canvas");
+  const ctx = c.getContext("2d");
+  if (ctx) measureCtx = ctx;
+  return measureCtx;
+}
+
+/**
+ * Width needed so the given type name renders in full in the node
+ * header. We measure the actual pixel width in the header font rather
+ * than guessing a per-char average — GraphViz monospace glyphs vary
+ * wider than expected once bold is applied, so a character-count
+ * estimate was letting real schemas still ellipse.
+ *
+ * Clamped between a sane minimum (so short names don't produce tiny
+ * nodes) and a maximum (so one absurdly long name doesn't explode
+ * layout). The renderer should secondary-truncate if an individual
+ * name still overflows the clamped width.
+ */
+export function estimateNodeWidth(name: string): number {
+  const ctx = getMeasureCtx();
+  let textW: number;
+  if (ctx) {
+    ctx.font = NODE_NAME_FONT;
+    textW = ctx.measureText(name).width;
+  } else {
+    // SSR / no DOM fallback: conservative per-char estimate.
+    textW = name.length * 9;
+  }
+  const required = NAME_H_PAD + Math.ceil(textW);
+  const base = Math.max(NODE_MIN_WIDTH, Math.min(NODE_MAX_WIDTH, required));
+  return Math.round(base * NODE_WIDTH_SCALE);
+}
+
 export const NODE_DIMENSIONS = { width: NODE_WIDTH };

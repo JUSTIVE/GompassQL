@@ -11,13 +11,18 @@ export interface GraphField {
   description?: string;
 }
 
+export interface EnumValue {
+  name: string;
+  description?: string;
+}
+
 export interface GraphNodeData {
   id: string;
   name: string;
   kind: NodeKind;
   description?: string;
   fields?: GraphField[];
-  values?: string[];
+  values?: EnumValue[];
   members?: string[];
   interfaces?: string[];
 }
@@ -147,7 +152,11 @@ export function sdlToGraph(sdl: string): ParsedGraph {
           name: def.name.value,
           kind: "Enum",
           description: def.description?.value,
-          values: def.values?.map((v) => v.name.value) ?? [],
+          values:
+            def.values?.map((v) => ({
+              name: v.name.value,
+              description: v.description?.value,
+            })) ?? [],
         });
         break;
       case Kind.UNION_TYPE_DEFINITION: {
