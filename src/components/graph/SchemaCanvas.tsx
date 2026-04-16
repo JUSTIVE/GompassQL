@@ -183,19 +183,37 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId }: Props) {
       if (!a || !b) continue;
       const path = byEdgeId.get(e.id);
       if (!path || path.waypoints.length < 2) continue;
-      // Layout emits waypoints from (source.right, source.center) to
-      // (target.left, target.center). For field-level edges, shift the
-      // source Y so the line exits at the field row instead of the node
-      // center, then reconstruct the initial horizontal segment to match.
       const points: Point[] = path.waypoints.map((p) => ({ x: p.x, y: p.y }));
-      if (e.kind === "field" && e.sourceFieldIndex != null) {
-        const fieldY = a.cy - a.h / 2 + HEADER_H + TOP_BODY_PAD - 2 + e.sourceFieldIndex * ROW_H + 6;
-        // Replace the leading horizontal run (same y as original first
-        // point) with the field-level y so the edge leaves the correct row.
+      // Force every arrow tail to leave the source node from its right
+      // edge at the field's row (or node center for non-field edges).
+      // dagre's polyline-intersection sometimes places the first point
+      // inside the row area next to the type text, which visually looks
+      // like the arrow "starts at the type". Snapping to the node border
+      // gives every row a consistent clean exit. For back-edges
+      // (target.cx < source.cx) we keep dagre's natural exit side but
+      // still align the leading same-Y run to the field row.
+      const exitY =
+        e.kind === "field" && e.sourceFieldIndex != null
+          ? a.cy - a.h / 2 + HEADER_H + TOP_BODY_PAD - 2 + e.sourceFieldIndex * ROW_H + 6
+          : a.cy;
+      const isForward = b.cx > a.cx;
+      if (isForward) {
+        const exitX = a.cx + a.w / 2;
+        points[0] = { x: exitX, y: exitY };
+        // If the next waypoint sits at a different Y, insert an L-elbow
+        // at (next.x, exitY) so the arrow leaves the node strictly
+        // horizontally before turning.
+        if (points.length >= 2) {
+          const next = points[1]!;
+          if (next.y !== exitY && next.x > exitX) {
+            points.splice(1, 0, { x: next.x, y: exitY });
+          }
+        }
+      } else if (e.kind === "field" && e.sourceFieldIndex != null) {
         const originalStartY = points[0]!.y;
         for (let i = 0; i < points.length; i++) {
           if (points[i]!.y !== originalStartY) break;
-          points[i] = { x: points[i]!.x, y: fieldY };
+          points[i] = { x: points[i]!.x, y: exitY };
         }
       }
       out.push({
