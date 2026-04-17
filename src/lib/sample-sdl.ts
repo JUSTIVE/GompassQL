@@ -58,11 +58,30 @@ type Query {
 
 type Mutation {
   createPost(input: CreatePostInput!): Post!
+  publishPost(post: PublishPostInput!, options: PublishOptionsInput!): PublishResult!
+}
+
+type PublishResult {
+  post: Post!
+  notifiedUsers: [User!]!
+  scheduledAt: DateTime
 }
 
 input CreatePostInput {
   title: String!
   body: String!
+  tags: [ID!]
+}
+
+input PublishPostInput {
+  postId: ID!
+  title: String
+  body: String
+}
+
+input PublishOptionsInput {
+  notifyFollowers: Boolean!
+  scheduledAt: DateTime
   tags: [ID!]
 }
 `;

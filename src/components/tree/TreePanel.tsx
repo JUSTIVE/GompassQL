@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight, Clock, Search, Share2, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
 import { useSchema } from "@/lib/schema-context";
@@ -138,6 +138,10 @@ export function TreePanel() {
   const byId = useMemo(
     () => new Map(visibleNodes.map((n) => [n.id, n])),
     [visibleNodes],
+  );
+  const nodesById = useMemo(
+    () => new Map(graph.nodes.map((n) => [n.id, n])),
+    [graph.nodes],
   );
   const roots = useMemo(
     () => ROOT_CANDIDATES.filter((r) => graph.nodes.some((n) => n.id === r)),
@@ -518,7 +522,8 @@ export function TreePanel() {
           <TypeDetail
             node={current}
             isNavigable={isNavigable}
-            onNavigate={pushFocus}
+            onNavigate={jumpTo}
+            nodesById={nodesById}
           />
         )}
       </div>
@@ -562,12 +567,17 @@ function TypeDetail({
   node,
   isNavigable,
   onNavigate,
+  nodesById,
 }: {
   node: GraphNodeData;
   isNavigable: (t: string) => boolean;
   onNavigate: (id: string) => void;
+  nodesById: Map<string, GraphNodeData>;
 }) {
   const style = KIND_STYLES[node.kind];
+
+  const chainNavigable = (typeName: string) =>
+    !BUILTIN.has(typeName) && nodesById.has(typeName);
 
   return (
     <div className="p-3">
@@ -625,9 +635,8 @@ function TypeDetail({
             <li key={m}>
               <FieldRow
                 label={`| ${m}`}
-                typeLabel=""
-                navigable={isNavigable(m)}
-                onClick={() => isNavigable(m) && onNavigate(m)}
+                chain={[{ label: "", typeName: m, navigable: chainNavigable(m) }]}
+                onNavigate={onNavigate}
               />
             </li>
           ))}
@@ -639,16 +648,31 @@ function TypeDetail({
       ) : (
         <ul className="space-y-0.5 font-mono text-xs">
           {node.fields?.map((f) => {
-            const nav = isNavigable(f.typeName);
+            const inputArgs = (f.args ?? []).filter((a) => {
+              if (BUILTIN.has(a.typeName)) return false;
+              return nodesById.get(a.typeName)?.kind === "Input";
+            });
+            const chain: ChainItem[] = [
+              ...inputArgs.map((a) => ({
+                label: a.type,
+                typeName: a.typeName,
+                navigable: chainNavigable(a.typeName),
+              })),
+              {
+                label: f.type,
+                typeName: f.typeName,
+                navigable: chainNavigable(f.typeName),
+                isRelayConnection: f.isRelayConnection,
+              },
+            ];
             return (
               <li key={f.name}>
                 <FieldRow
                   label={f.name}
-                  typeLabel={f.type}
+                  chain={chain}
                   description={f.description}
-                  navigable={nav}
-                  isRelayConnection={f.isRelayConnection}
-                  onClick={() => nav && onNavigate(f.typeName)}
+                  args={f.args}
+                  onNavigate={onNavigate}
                 />
               </li>
             );
@@ -662,46 +686,127 @@ function TypeDetail({
   );
 }
 
-function FieldRow({
-  label,
-  typeLabel,
-  description,
-  navigable,
-  isRelayConnection,
-  onClick,
-}: {
+interface ChainItem {
   label: string;
-  typeLabel: string;
-  description?: string;
+  typeName: string;
   navigable: boolean;
   isRelayConnection?: boolean;
-  onClick: () => void;
+}
+
+function FieldRow({
+  label,
+  chain,
+  description,
+  args,
+  onNavigate,
+}: {
+  label: string;
+  chain: ChainItem[];
+  description?: string;
+  args?: { name: string; type: string; typeName: string }[];
+  onNavigate: (id: string) => void;
 }) {
+  const [hovered, setHovered] = useState(false);
+  const single = chain.length === 1 ? chain[0]! : null;
+
+  const requiredArgCount = args?.filter((a) => a.type.endsWith("!")).length ?? 0;
+  const hasArgs = (args?.length ?? 0) > 0;
+
+  const arityBadge = hasArgs ? (
+    <span className="font-mono text-[10px] text-muted-foreground/60">
+      ({requiredArgCount}/{args!.length})
+    </span>
+  ) : null;
+
+  const argsDetail = hovered && hasArgs ? (
+    <ul className="mt-0.5 space-y-px border-l border-border pl-2">
+      {args!.map((a) => (
+        <li key={a.name} className="flex items-center gap-1.5 font-mono text-[10px]">
+          <span className="text-muted-foreground">{a.name}:</span>
+          <ColoredType type={a.type} />
+        </li>
+      ))}
+    </ul>
+  ) : null;
+
+  const typeChip = (item: ChainItem) =>
+    item.navigable ? (
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); onNavigate(item.typeName); }}
+        className="flex items-center gap-0.5 rounded px-1 hover:bg-secondary/80"
+      >
+        {item.isRelayConnection && item.label && (
+          <Share2 className="h-2.5 w-2.5 shrink-0 text-violet-500 opacity-70" />
+        )}
+        {item.label ? <ColoredType type={item.label} /> : null}
+        <ChevronRight className="h-3 w-3 text-muted-foreground" />
+      </button>
+    ) : (
+      <span className="flex items-center gap-0.5">
+        {item.isRelayConnection && item.label && (
+          <Share2 className="h-2.5 w-2.5 shrink-0 text-violet-500 opacity-70" />
+        )}
+        {item.label ? <ColoredType type={item.label} /> : null}
+      </span>
+    );
+
+  if (single) {
+    return (
+      <button
+        type="button"
+        disabled={!single.navigable}
+        onClick={() => single.navigable && onNavigate(single.typeName)}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        className={cn(
+          "group flex w-full flex-col gap-0.5 rounded px-2 py-1 text-left",
+          single.navigable ? "cursor-pointer hover:bg-secondary/60" : "cursor-default",
+        )}
+      >
+        <span className="flex w-full items-center justify-between gap-2">
+          <span className="flex min-w-0 items-center gap-1 truncate text-foreground">
+            {label}
+            {arityBadge}
+          </span>
+          <span className={cn("flex shrink-0 items-center gap-1", single.navigable && "group-hover:opacity-80")}>
+            {single.isRelayConnection && single.label && (
+              <Share2 className="h-2.5 w-2.5 shrink-0 text-violet-500 opacity-70" />
+            )}
+            {single.label ? <ColoredType type={single.label} /> : null}
+            {single.navigable && <ChevronRight className="h-3 w-3 text-muted-foreground" />}
+          </span>
+        </span>
+        {description && (
+          <span className="font-sans text-[11px] leading-snug text-muted-foreground">
+            {description}
+          </span>
+        )}
+        {argsDetail}
+      </button>
+    );
+  }
+
   return (
-    <button
-      type="button"
-      disabled={!navigable}
-      onClick={onClick}
-      className={cn(
-        "group flex w-full flex-col gap-0.5 rounded px-2 py-1 text-left",
-        navigable
-          ? "cursor-pointer hover:bg-secondary/60"
-          : "cursor-default",
-      )}
+    <div
+      className="flex w-full flex-col gap-0.5 rounded px-2 py-1 hover:bg-secondary/60"
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
     >
       <span className="flex w-full items-center justify-between gap-2">
-        <span className="min-w-0 truncate text-foreground">{label}</span>
-        <span
-          className={cn(
-            "flex shrink-0 items-center gap-1",
-            navigable && "group-hover:opacity-80",
-          )}
-        >
-          {isRelayConnection && typeLabel && (
-            <Share2 className="h-2.5 w-2.5 shrink-0 text-violet-500 opacity-70" />
-          )}
-          {typeLabel ? <ColoredType type={typeLabel} /> : null}
-          {navigable && <ChevronRight className="h-3 w-3 text-muted-foreground" />}
+        <span className="flex min-w-0 items-center gap-1 truncate text-foreground">
+          {label}
+          {arityBadge}
+        </span>
+        <span className="flex shrink-0 items-center gap-1">
+          {chain.map((item, i) => (
+            <Fragment key={i}>
+              {i > 0 && (
+                <span className="text-[10px] text-muted-foreground/50">→</span>
+              )}
+              {typeChip(item)}
+            </Fragment>
+          ))}
         </span>
       </span>
       {description && (
@@ -709,7 +814,8 @@ function FieldRow({
           {description}
         </span>
       )}
-    </button>
+      {argsDetail}
+    </div>
   );
 }
 

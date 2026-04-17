@@ -8,7 +8,7 @@ export interface GraphField {
   typeName: string;
   nullable: boolean;
   isRelayConnection?: boolean;
-  args?: { name: string; type: string }[];
+  args?: { name: string; type: string; typeName: string }[];
   description?: string;
 }
 
@@ -35,7 +35,7 @@ export interface GraphEdgeData {
   sourceField?: string;
   sourceFieldIndex?: number;
   label?: string;
-  kind: "field" | "implements" | "union";
+  kind: "field" | "implements" | "union" | "arg";
   nullable?: boolean;
 }
 
@@ -127,6 +127,7 @@ export function sdlToGraph(sdl: string): ParsedGraph {
                 ? f.arguments.map((a) => ({
                     name: a.name.value,
                     type: renderType(a.type).rendered,
+                    typeName: renderType(a.type).base,
                   }))
                 : undefined,
           });
@@ -224,6 +225,9 @@ export function sdlToGraph(sdl: string): ParsedGraph {
   }
 
   // Now build edges from the (post-unwrap) field/interface/union data.
+  const nodeKindById = new Map<string, NodeKind>();
+  for (const n of nodes) nodeKindById.set(n.id, n.kind);
+
   const rawEdges: GraphEdgeData[] = [];
   for (const n of nodes) {
     if (n.fields) {
@@ -231,16 +235,46 @@ export function sdlToGraph(sdl: string): ParsedGraph {
         const field = n.fields[fi]!;
         if (BUILTIN_SCALARS.has(field.typeName)) continue;
         if (field.typeName === n.name) continue;
-        rawEdges.push({
-          id: `${n.name}.${field.name}->${field.typeName}`,
-          source: n.name,
-          target: field.typeName,
-          sourceField: field.name,
-          sourceFieldIndex: fi,
-          label: field.name,
-          kind: "field",
-          nullable: field.nullable,
-        });
+
+        // Collect Input-typed args (in declaration order) to build a
+        // visual chain: source → input0 → input1 → … → returnType.
+        const inputArgTypeNames = (field.args ?? [])
+          .map((a) => a.typeName)
+          .filter(
+            (tn) => !BUILTIN_SCALARS.has(tn) && nodeKindById.get(tn) === "Input",
+          );
+
+        if (inputArgTypeNames.length > 0) {
+          const chain = [...inputArgTypeNames, field.typeName];
+          for (let ci = 0; ci < chain.length; ci++) {
+            const src = ci === 0 ? n.name : chain[ci - 1]!;
+            const tgt = chain[ci]!;
+            rawEdges.push({
+              id:
+                ci === 0
+                  ? `${n.name}.${field.name}->${tgt}`
+                  : `${n.name}.${field.name}:chain${ci}->${tgt}`,
+              source: src,
+              target: tgt,
+              sourceField: ci === 0 ? field.name : undefined,
+              sourceFieldIndex: ci === 0 ? fi : undefined,
+              label: ci === 0 ? field.name : undefined,
+              kind: ci === 0 ? "field" : "arg",
+              nullable: ci === 0 ? field.nullable : false,
+            });
+          }
+        } else {
+          rawEdges.push({
+            id: `${n.name}.${field.name}->${field.typeName}`,
+            source: n.name,
+            target: field.typeName,
+            sourceField: field.name,
+            sourceFieldIndex: fi,
+            label: field.name,
+            kind: "field",
+            nullable: field.nullable,
+          });
+        }
       }
     }
     if (n.interfaces) {

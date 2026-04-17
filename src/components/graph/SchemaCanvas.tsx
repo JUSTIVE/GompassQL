@@ -215,14 +215,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
   const laidNodes = useMemo<LaidNode[]>(() => {
     const byId = new Map<string, GraphNodeData>();
     for (const n of nodes) byId.set(n.id, n);
-    return layoutResult.nodes.map((p) => ({
-      id: p.id,
-      data: byId.get(p.id)!,
-      cx: p.x,
-      cy: p.y,
-      w: p.width,
-      h: p.height,
-    }));
+    return layoutResult.nodes
+      .filter((p) => byId.has(p.id))
+      .map((p) => ({
+        id: p.id,
+        data: byId.get(p.id)!,
+        cx: p.x,
+        cy: p.y,
+        w: p.width,
+        h: p.height,
+      }));
   }, [layoutResult, nodes]);
 
   const nodeById = useMemo(() => {
@@ -318,13 +320,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
     const unionGroup: LaidEdge[] = [];
     const fieldNullable: LaidEdge[] = [];
     const fieldSolid: LaidEdge[] = [];
+    const argGroup: LaidEdge[] = [];
     for (const e of laidEdges) {
       if (e.kind === "implements") implementsGroup.push(e);
       else if (e.kind === "union") unionGroup.push(e);
+      else if (e.kind === "arg") argGroup.push(e);
       else if (e.kind === "field" && e.nullable) fieldNullable.push(e);
       else fieldSolid.push(e);
     }
-    return { implementsGroup, unionGroup, fieldNullable, fieldSolid };
+    return { implementsGroup, unionGroup, fieldNullable, fieldSolid, argGroup };
   }, [laidEdges]);
 
   const bounds = useMemo(() => {
@@ -790,6 +794,7 @@ interface EdgeGroups {
   unionGroup: LaidEdge[];
   fieldNullable: LaidEdge[];
   fieldSolid: LaidEdge[];
+  argGroup: LaidEdge[];
 }
 
 function drawFrame(
@@ -842,6 +847,7 @@ function drawFrame(
   drawEdgeBatch(ctx, edgeGroups.unionGroup, "#eab308", [], vpLeft, vpTop, vpRight, vpBottom);
   drawEdgeBatch(ctx, edgeGroups.fieldNullable, "#6366f1", [4, 3], vpLeft, vpTop, vpRight, vpBottom);
   drawEdgeBatch(ctx, edgeGroups.fieldSolid, "#6366f1", [], vpLeft, vpTop, vpRight, vpBottom);
+  drawEdgeBatch(ctx, edgeGroups.argGroup, "#f97316", [3, 3], vpLeft, vpTop, vpRight, vpBottom);
   ctx.setLineDash([]);
 
   // PASS B — nodes. One drawImage per visible node using the sprite
