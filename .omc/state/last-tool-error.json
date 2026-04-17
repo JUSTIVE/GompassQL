@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"gh api \\\"repos/IvanGoncharov/dotviz\\\" --jq '.default_branch' 2>/dev/null\",\"description\":\"Get default branch of dotviz repo\"}",
-  "error": "Exit code 1\n{\"message\":\"Not Found\",\"documentation_url\":\"https://docs.github.com/rest/repos/repos#get-a-repository\",\"status\":\"404\"}",
-  "timestamp": "2026-04-16T13:17:55.024Z",
-  "retry_count": 2
-}

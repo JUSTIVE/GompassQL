@@ -23,7 +23,10 @@ export function ColoredType({ type, className }: { type: string; className?: str
   );
 }
 
-export function ColoredTypeSvg({ type, ...props }: { type: string } & React.SVGTextElementAttributes<SVGTextElement>) {
+export function ColoredTypeSvg({
+  type,
+  ...props
+}: { type: string } & React.SVGTextElementAttributes<SVGTextElement>) {
   return (
     <text {...props}>
       {colorizeType(type).map((seg, i) => (

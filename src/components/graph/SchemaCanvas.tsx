@@ -1,10 +1,10 @@
+import { Application, Container, Graphics, Sprite, Texture, TilingSprite } from "pixi.js";
 import { Loader2 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { BezierSegment, LayoutResult } from "@/lib/layout";
 import type { LayoutWorkerRequest, LayoutWorkerResponse } from "@/lib/layout-worker";
 import type { GraphEdgeData, GraphNodeData } from "@/lib/sdl-to-graph";
 import { useTheme } from "@/lib/theme";
-import { colorizeType } from "@/lib/type-colors";
 import {
   HEADER_H,
   KIND_COLORS,
@@ -16,28 +16,17 @@ import {
 } from "./node-style";
 
 /**
- * Canvas-based schema graph renderer.
+ * Pixi.js v8 schema graph renderer.
  *
- * Rendering is structured for throughput on hundreds of nodes:
- *
- *   • Layout runs off the main thread in a worker; only positions/
- *     beziers come back. No React reconciliation per node.
- *   • Each node card (background + header + kind label + name + field
- *     rows) is pre-rendered once to its own offscreen canvas — per-node
- *     sprite caching. The main draw loop blits the sprite with a single
- *     `drawImage` per visible node instead of 30+ `fillText` calls.
- *     Cache is invalidated on theme change or new layout.
- *   • Edges are batched by (color, dash) into four groups. Each group
- *     draws with one `beginPath`, one `setLineDash`, one `stroke` and
- *     one `fill` — draw calls and context-state changes scale with the
- *     number of distinct styles, not with the number of edges.
- *   • Viewport culling skips invisible nodes and edges (bbox test) so
- *     only what's on-screen pays the draw cost.
- *   • View changes (pan / zoom / focus) go through a `requestAnimation-
- *     Frame`-coalesced path so rapid events don't stack up redraws.
- *   • Canvas resolution is re-set only when the element actually
- *     resizes; each draw reuses the existing backing store and skips
- *     allocation churn.
+ * Scene graph:
+ *   Application.stage
+ *    ├── gridTiling (TilingSprite) — dot grid, screen-space
+ *    └── world (Container) — pan/zoom transform
+ *         ├── edgeGraphics (Graphics) — all edges batched
+ *         ├── arrowGraphics (Graphics) — all arrowheads
+ *         ├── nodeContainer (Container) — one Sprite per node
+ *         ├── hoverGraphics (Graphics) — field row highlight
+ *         └── focusGraphics (Graphics) — focus ring + hover ring
  */
 
 interface LaidNode {
@@ -74,43 +63,46 @@ interface Props {
   onClearFocus?: () => void;
 }
 
-const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
-const CLICK_DRAG_THRESHOLD = 4;
-
-function getComputedCssVar(name: string, fallback: string): string {
-  if (typeof window === "undefined") return fallback;
-  const val = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  return val || fallback;
+interface EdgeGroupSpec {
+  color: string;
+  colorHex: number;
+  dash: number[];
+  dim: LaidEdge[];
+  active: LaidEdge[];
 }
 
+interface EdgeGroups {
+  groups: EdgeGroupSpec[];
+  dimNodeIds: Set<string>;
+}
+
+interface SpriteCtx {
+  cardColor: string;
+  fgColor: string;
+  mutedFg: string;
+}
+
+const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
+const CLICK_DRAG_THRESHOLD = 4;
 const EMPTY_LAYOUT: LayoutResult = { nodes: [], edgePaths: [] };
 const CULL_PAD = 100;
 const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
 
-// Sprite LOD: controls how much detail is baked into each sprite tier.
-// "full"   – all text + icons (zoom ≥ LOD_FULL)
-// "bar"    – colored placeholder bars where text would be (LOD_BAR ≤ zoom < LOD_FULL)
-// "chrome" – card shape + header band only (zoom < LOD_BAR)
-// Tiers are cached separately so switching zoom never discards valid entries.
+// LOD tiers
 type SpriteLOD = "full" | "bar" | "chrome";
-const LOD_FULL = 0.22; // body text (10 px) ≈ 2 CSS px below this
-const LOD_BAR  = 0.07; // bars become sub-pixel below this
+const LOD_FULL = 0.22;
+const LOD_BAR = 0.07;
 
 function computeLOD(viewK: number): SpriteLOD {
   if (viewK >= LOD_FULL) return "full";
-  if (viewK >= LOD_BAR)  return "bar";
+  if (viewK >= LOD_BAR) return "bar";
   return "chrome";
 }
 
-// Field-bar width fractions cycle through these to fake varied text lengths.
-const BAR_NAME_FRACS  = [0.62, 0.50, 0.71, 0.55, 0.44, 0.68];
+const BAR_NAME_FRACS = [0.62, 0.50, 0.71, 0.55, 0.44, 0.68];
 const BAR_FIELD_FRACS = [0.44, 0.36, 0.52, 0.38, 0.46, 0.32];
-const BAR_TYPE_FRACS  = [0.24, 0.30, 0.20, 0.27, 0.22, 0.28];
+const BAR_TYPE_FRACS = [0.24, 0.30, 0.20, 0.27, 0.22, 0.28];
 
-// Per-node sprite DPR is decided dynamically and rebuilds when the
-// user zooms in far enough that the baked bitmap would otherwise
-// blur. Discrete levels (1, 2, 3, 4) keep the cache from thrashing
-// while panning or making small zoom adjustments.
 const MAX_SPRITE_DPR = 4;
 
 function idealSpriteDpr(viewK: number): number {
@@ -120,26 +112,438 @@ function idealSpriteDpr(viewK: number): number {
   return Math.min(MAX_SPRITE_DPR, Math.max(1, needed));
 }
 
-/** Caps sprite DPR so total sprite memory stays roughly bounded. */
 function memoryCappedDpr(ideal: number, nodeCount: number): number {
   if (nodeCount <= 0) return ideal;
-  // Back-of-envelope: assume ~220×180 px average node area, 4 bytes
-  // per pixel. Target ≤ ~200 MB → dpr² ≤ 1250 / nodeCount.
   const cap = Math.max(1, Math.floor(Math.sqrt(1250 / nodeCount)));
   return Math.max(1, Math.min(ideal, cap));
 }
 
+function getComputedCssVar(name: string, fallback: string): string {
+  if (typeof window === "undefined") return fallback;
+  const val = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return val || fallback;
+}
+
+function cssColorToHex(color: string): number {
+  // Handle #rrggbb
+  if (color.startsWith("#") && color.length === 7) {
+    return parseInt(color.slice(1), 16);
+  }
+  // Handle #rgb
+  if (color.startsWith("#") && color.length === 4) {
+    const r = color[1]!;
+    const g = color[2]!;
+    const b = color[3]!;
+    return parseInt(r + r + g + g + b + b, 16);
+  }
+  // Handle hsl(...) and rgb(...) via a canvas trick
+  if (typeof document !== "undefined") {
+    const canvas = document.createElement("canvas");
+    canvas.width = 1;
+    canvas.height = 1;
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.fillStyle = color;
+      ctx.fillRect(0, 0, 1, 1);
+      const d = ctx.getImageData(0, 0, 1, 1).data;
+      return ((d[0]! << 16) | (d[1]! << 8) | d[2]!);
+    }
+  }
+  return 0xffffff;
+}
+
+// measureText cache
+const typeWidthCache = new Map<string, number>();
+const fitTextCache = new Map<string, string>();
+
+function cachedTextWidth(ctx: CanvasRenderingContext2D, text: string): number {
+  let w = typeWidthCache.get(text);
+  if (w !== undefined) return w;
+  w = ctx.measureText(text).width;
+  typeWidthCache.set(text, w);
+  return w;
+}
+
+function fitText(ctx: CanvasRenderingContext2D, s: string, maxWidth: number): string {
+  const cacheKey = `${s}|${maxWidth}`;
+  const cached = fitTextCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  if (ctx.measureText(s).width <= maxWidth) {
+    fitTextCache.set(cacheKey, s);
+    return s;
+  }
+  const ellipsis = "…";
+  let lo = 0;
+  let hi = s.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    const cand = s.slice(0, mid) + ellipsis;
+    if (ctx.measureText(cand).width <= maxWidth) lo = mid;
+    else hi = mid - 1;
+  }
+  const result = lo > 0 ? s.slice(0, lo) + ellipsis : ellipsis;
+  fitTextCache.set(cacheKey, result);
+  return result;
+}
+
+function roundRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+
+function roundRectTopOnly(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h);
+  ctx.lineTo(x, y + h);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+
+function drawColoredType(
+  ctx: CanvasRenderingContext2D,
+  typeStr: string,
+  rightX: number,
+  y: number,
+) {
+  const w = cachedTextWidth(ctx, typeStr);
+  ctx.fillStyle = "#f59e0b";
+  ctx.fillText(typeStr, rightX - w, y);
+}
+
+const RELAY_COLOR = "#F26A03";
+const RELAY_SVG_PATH = new Path2D(
+  "M2.264 4.937A2.264 2.264 0 1 0 4.456 7.77h10.339a1.792 1.792 0 0 1 0 3.583h-5.73a3.037 3.037 0 0 0-3.034 3.033a3.036 3.036 0 0 0 3.033 3.033h10.494a2.264 2.264 0 1 0 0-1.242H9.064a1.793 1.793 0 0 1-1.791-1.791c0-.988.803-1.792 1.791-1.792h5.73a3.036 3.036 0 0 0 3.034-3.033a3.036 3.036 0 0 0-3.033-3.033H4.427a2.265 2.265 0 0 0-2.163-1.592",
+);
+
+function drawRelayIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number) {
+  const scale = 8 / 24;
+  ctx.save();
+  ctx.fillStyle = RELAY_COLOR;
+  ctx.globalAlpha = 0.85;
+  ctx.translate(cx - 12 * scale, cy - 12 * scale);
+  ctx.scale(scale, scale);
+  ctx.fill(RELAY_SVG_PATH);
+  ctx.restore();
+}
+
+function bodyRowCount(n: LaidNode): number {
+  const d = n.data;
+  if (d.kind === "Enum") return (d.values ?? []).length;
+  if (d.kind === "Union") return (d.members ?? []).length;
+  if (d.kind === "Scalar") return 1;
+  return (d.fields ?? []).length;
+}
+
+function drawNodeSprite(
+  ctx: CanvasRenderingContext2D,
+  n: LaidNode,
+  { cardColor, fgColor, mutedFg }: SpriteCtx,
+  lod: SpriteLOD,
+) {
+  const w = n.w;
+  const h = n.h;
+  const color = KIND_COLORS[n.data.kind];
+
+  if (lod === "chrome") {
+    roundRect(ctx, 0, 0, w, h, 6);
+    ctx.fillStyle = color;
+    ctx.fill();
+    return;
+  }
+
+  roundRect(ctx, 0, 0, w, h, 6);
+  ctx.fillStyle = cardColor;
+  ctx.fill();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.25;
+  ctx.globalAlpha = 0.75;
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  roundRectTopOnly(ctx, 0, 0, w, HEADER_H, 6);
+  ctx.fillStyle = color;
+  ctx.fill();
+
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = 0.4;
+  ctx.lineWidth = 0.75;
+  ctx.beginPath();
+  ctx.moveTo(0, HEADER_H);
+  ctx.lineTo(w, HEADER_H);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  if (lod === "bar") {
+    const avail = w - 16;
+    const nFrac = BAR_NAME_FRACS[0]!;
+    ctx.fillStyle = "#ffffff";
+    ctx.globalAlpha = 0.55;
+    roundRect(ctx, 8, 23, avail * nFrac, 5, 2.5);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    const bodyY = HEADER_H + TOP_BODY_PAD - 2;
+    const rowCount = bodyRowCount(n);
+    for (let i = 0; i < rowCount; i++) {
+      const fy = bodyY + i * ROW_H + 3;
+      const ff = BAR_FIELD_FRACS[i % BAR_FIELD_FRACS.length]!;
+      const tf = BAR_TYPE_FRACS[i % BAR_TYPE_FRACS.length]!;
+      const typeBarW = avail * tf;
+      ctx.fillStyle = fgColor;
+      ctx.globalAlpha = 0.35;
+      roundRect(ctx, 10, fy, avail * ff, 4, 2);
+      ctx.fill();
+      ctx.fillStyle = "#f59e0b";
+      ctx.globalAlpha = 0.45;
+      roundRect(ctx, w - 10 - typeBarW, fy, typeBarW, 4, 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    return;
+  }
+
+  // full tier
+  ctx.font = `600 9px ${MONO}`;
+  ctx.fillStyle = "#ffffff";
+  ctx.globalAlpha = 0.6;
+  ctx.fillText(n.data.kind.toUpperCase(), 8, 14);
+  ctx.globalAlpha = 1;
+
+  ctx.font = NODE_NAME_FONT;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(fitText(ctx, n.data.name, w - 16), 8, 30);
+
+  const bodyY = HEADER_H + TOP_BODY_PAD - 2;
+  if (n.data.kind === "Enum") {
+    ctx.font = `10px ${MONO}`;
+    ctx.fillStyle = mutedFg;
+    const values = n.data.values ?? [];
+    for (let i = 0; i < values.length; i++) {
+      ctx.fillText(values[i]!.name, 10, bodyY + i * ROW_H + 10);
+    }
+  } else if (n.data.kind === "Union") {
+    ctx.font = `10px ${MONO}`;
+    ctx.fillStyle = mutedFg;
+    const members = n.data.members ?? [];
+    for (let i = 0; i < members.length; i++) {
+      ctx.fillText("| " + members[i]!, 10, bodyY + i * ROW_H + 10);
+    }
+  } else if (n.data.kind === "Scalar") {
+    ctx.font = `italic 10px ${MONO}`;
+    ctx.fillStyle = mutedFg;
+    ctx.fillText("custom scalar", 10, bodyY + 10);
+  } else {
+    const fields = n.data.fields ?? [];
+    ctx.font = `10px ${MONO}`;
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i]!;
+      const fy = bodyY + i * ROW_H + 10;
+      ctx.fillStyle = fgColor;
+      ctx.globalAlpha = f.isDeprecated ? 0.4 : 1;
+      ctx.fillText(f.name, 10, fy);
+      if (f.isDeprecated) {
+        const nameW = ctx.measureText(f.name).width;
+        ctx.strokeStyle = fgColor;
+        ctx.lineWidth = 0.75;
+        ctx.beginPath();
+        ctx.moveTo(10, fy - 3.5);
+        ctx.lineTo(10 + nameW, fy - 3.5);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      if (f.isRelayConnection) {
+        const typeW = ctx.measureText(f.type).width;
+        const iconCx = w - 10 - typeW - 8;
+        drawRelayIcon(ctx, iconCx, fy - 2);
+        ctx.font = `10px ${MONO}`;
+      }
+      drawColoredType(ctx, f.type, w - 10, fy);
+    }
+  }
+}
+
+// ─── Dashed bezier walker ─────────────────────────────────────────────
+
+/** Sample a cubic bezier at parameter t */
+function cubicBezier(
+  p0: Point, p1: Point, p2: Point, p3: Point, t: number,
+): Point {
+  const mt = 1 - t;
+  const mt2 = mt * mt;
+  const t2 = t * t;
+  return {
+    x: mt2 * mt * p0.x + 3 * mt2 * t * p1.x + 3 * mt * t2 * p2.x + t2 * t * p3.x,
+    y: mt2 * mt * p0.y + 3 * mt2 * t * p1.y + 3 * mt * t2 * p2.y + t2 * t * p3.y,
+  };
+}
+
+/**
+ * Draw a dashed bezier path on a Pixi Graphics object.
+ * Pixi v8 has no setLineDash, so we walk the curve parametrically
+ * and alternate moveTo (gap) / lineTo (dash).
+ */
+function drawDashedBezierEdge(
+  g: Graphics,
+  edge: LaidEdge,
+  dash: number[],
+  color: number,
+  alpha: number,
+  strokeWidth: number,
+) {
+  const STEPS = 20;
+  let arcLen = 0;
+  let dashIndex = 0;
+  let dashPos = 0;
+  let drawing = true; // start with dash
+
+  const points: Point[] = [];
+
+  // Collect all points along the bezier chain
+  let prevPt: Point = edge.start;
+  points.push(prevPt);
+  for (const seg of edge.segments) {
+    for (let i = 1; i <= STEPS; i++) {
+      const t = i / STEPS;
+      const pt = cubicBezier(prevPt, seg.c1, seg.c2, seg.end, t);
+      // approximate: use start and end of segment as p0
+      points.push(pt);
+    }
+    prevPt = seg.end;
+  }
+  if (edge.arrowTip) {
+    points.push(edge.arrowTip);
+  }
+
+  // Walk and dash
+  let penDown = false;
+  for (let i = 1; i < points.length; i++) {
+    const prev = points[i - 1]!;
+    const curr = points[i]!;
+    const segLen = Math.hypot(curr.x - prev.x, curr.y - prev.y);
+    if (segLen < 0.001) continue;
+
+    let consumed = 0;
+    while (consumed < segLen) {
+      const dashLen = dash[dashIndex % dash.length]!;
+      const remaining = dashLen - dashPos;
+      const available = segLen - consumed;
+      const advance = Math.min(remaining, available);
+      const t = consumed / segLen;
+      const nextT = (consumed + advance) / segLen;
+      const startPt = {
+        x: prev.x + (curr.x - prev.x) * t,
+        y: prev.y + (curr.y - prev.y) * t,
+      };
+      const endPt = {
+        x: prev.x + (curr.x - prev.x) * nextT,
+        y: prev.y + (curr.y - prev.y) * nextT,
+      };
+
+      if (drawing) {
+        if (!penDown) {
+          g.moveTo(startPt.x, startPt.y);
+          penDown = true;
+        }
+        g.lineTo(endPt.x, endPt.y);
+      } else {
+        penDown = false;
+        arcLen += advance;
+        void arcLen;
+      }
+
+      dashPos += advance;
+      consumed += advance;
+
+      if (dashPos >= dashLen) {
+        dashPos = 0;
+        dashIndex++;
+        drawing = !drawing;
+      }
+    }
+  }
+}
+
+/** Draw a solid bezier edge path on a Pixi Graphics object */
+function drawSolidBezierEdge(g: Graphics, edge: LaidEdge) {
+  g.moveTo(edge.start.x, edge.start.y);
+  for (const seg of edge.segments) {
+    g.bezierCurveTo(seg.c1.x, seg.c1.y, seg.c2.x, seg.c2.y, seg.end.x, seg.end.y);
+  }
+  if (edge.arrowTip) {
+    g.lineTo(edge.arrowTip.x, edge.arrowTip.y);
+  }
+}
+
+/** Draw arrowhead for an edge onto a Pixi Graphics already set up for fill */
+function drawArrowHead(g: Graphics, edge: LaidEdge) {
+  const lastSeg = edge.segments[edge.segments.length - 1]!;
+  const tangentFrom = edge.arrowTip ? lastSeg.end : lastSeg.c2;
+  const tangentTo = edge.arrowTip ?? lastSeg.end;
+  const adx = tangentTo.x - tangentFrom.x;
+  const ady = tangentTo.y - tangentFrom.y;
+  const alen = Math.hypot(adx, ady);
+  if (alen <= 0) return;
+  const ax = adx / alen;
+  const ay = ady / alen;
+  const sz = 7;
+  g.moveTo(tangentTo.x, tangentTo.y);
+  g.lineTo(tangentTo.x - ax * sz + ay * sz * 0.4, tangentTo.y - ay * sz - ax * sz * 0.4);
+  g.lineTo(tangentTo.x - ax * sz - ay * sz * 0.4, tangentTo.y - ay * sz + ax * sz * 0.4);
+  g.closePath();
+}
+
+// ─── Dot grid tile builder ────────────────────────────────────────────
+
+function buildDotGridTexture(dotColor: number, alpha: number): Texture {
+  const size = 24;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  const r = (dotColor >> 16) & 0xff;
+  const gv = (dotColor >> 8) & 0xff;
+  const b = dotColor & 0xff;
+  ctx.fillStyle = `rgba(${r},${gv},${b},${alpha})`;
+  ctx.fillRect(0, 0, 1, 1);
+  return Texture.from(canvas);
+}
+
+// ─── Main component ───────────────────────────────────────────────────
 
 export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClearFocus }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const pixiContainerRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 1, h: 1 });
   const viewRef = useRef({ x: 0, y: 0, k: 1 });
-  const fpsRef = useRef<{ times: number[]; history: number[]; lastSampleAt: number }>({
-    times: [],
-    history: Array<number>(40).fill(0),
-    lastSampleAt: 0,
-  });
+
   const dragRef = useRef({
     active: false,
     lastX: 0,
@@ -148,22 +552,50 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     startY: 0,
     moved: false,
   });
-  const rafRef = useRef<number | null>(null);
+
   const hoveredFieldRef = useRef<{ nodeId: string; fieldIndex: number; isRelayHover: boolean } | null>(null);
   const hoveredNodeRef = useRef<string | null>(null);
   const [cursor, setCursor] = useState<"grab" | "pointer">("grab");
   const { resolved: themeResolved } = useTheme();
+  const currentLodRef = useRef<SpriteLOD>("full");
+  const [lodTick, setLodTick] = useState(0);
+  const [appReady, setAppReady] = useState(false);
 
-  // Layout runs off the main thread in a dedicated Web Worker bundled
-  // separately at `/layout-worker.js`. `isPending` is true from the
-  // moment a request is posted until the matching response arrives;
-  // stale responses (older `id`) are discarded.
+  // Layout state
   const [layoutResult, setLayoutResult] = useState<LayoutResult>(EMPTY_LAYOUT);
   const [isPending, setIsPending] = useState(nodes.length > 0);
   const [lastTiming, setLastTiming] = useState<LayoutWorkerResponse["timings"] | null>(null);
   const lastTimingRef = useRef<LayoutWorkerResponse["timings"] | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const requestIdRef = useRef(0);
+
+  // Pixi app + scene graph refs
+  const appRef = useRef<Application | null>(null);
+  const sceneRef = useRef<{
+    gridTiling: TilingSprite | null;
+    world: Container | null;
+    edgeGraphics: Graphics | null;
+    arrowGraphics: Graphics | null;
+    nodeContainer: Container | null;
+    hoverGraphics: Graphics | null;
+    focusGraphics: Graphics | null;
+  }>({
+    gridTiling: null,
+    world: null,
+    edgeGraphics: null,
+    arrowGraphics: null,
+    nodeContainer: null,
+    hoverGraphics: null,
+    focusGraphics: null,
+  });
+
+  // Node sprite/texture cache
+  const textureCacheRef = useRef(new Map<string, Texture>());
+  const spriteDprRef = useRef(0);
+  const nodeSpritesRef = useRef(new Map<string, Sprite>());
+
+  // FPS state for overlay
+  const [fpsDisplay, setFpsDisplay] = useState(0);
 
   useLayoutEffect(() => {
     const el = containerRef.current;
@@ -272,10 +704,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       let segments: BezierSegment[] = path.segments;
       const arrowTip = path.arrowTip;
 
-      // Snap forward field-edges to the field row's right edge on the
-      // source node by rewriting the first bezier's start + c1 (so the
-      // curve *departs* horizontally at the row, then blends back into
-      // the original c2/end — no seam, no kink, single smooth bezier).
       if (e.kind === "field" && e.sourceFieldIndex != null && b.cx > a.cx && segments.length > 0) {
         const exitX = a.cx + a.w / 2;
         const exitY = a.cy - a.h / 2 + HEADER_H + TOP_BODY_PAD - 2 + e.sourceFieldIndex * ROW_H + 6;
@@ -293,32 +721,18 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         ];
       }
 
-      // A cubic bezier's convex hull is contained in its four control
-      // points, so start + every (c1, c2, end) + arrowTip is a safe
-      // bounding box for culling.
-      let minX = start.x,
-        maxX = start.x,
-        minY = start.y,
-        maxY = start.y;
+      let minX = start.x, maxX = start.x, minY = start.y, maxY = start.y;
       for (const s of segments) {
-        if (s.c1.x < minX) minX = s.c1.x;
-        else if (s.c1.x > maxX) maxX = s.c1.x;
-        if (s.c1.y < minY) minY = s.c1.y;
-        else if (s.c1.y > maxY) maxY = s.c1.y;
-        if (s.c2.x < minX) minX = s.c2.x;
-        else if (s.c2.x > maxX) maxX = s.c2.x;
-        if (s.c2.y < minY) minY = s.c2.y;
-        else if (s.c2.y > maxY) maxY = s.c2.y;
-        if (s.end.x < minX) minX = s.end.x;
-        else if (s.end.x > maxX) maxX = s.end.x;
-        if (s.end.y < minY) minY = s.end.y;
-        else if (s.end.y > maxY) maxY = s.end.y;
+        if (s.c1.x < minX) minX = s.c1.x; else if (s.c1.x > maxX) maxX = s.c1.x;
+        if (s.c1.y < minY) minY = s.c1.y; else if (s.c1.y > maxY) maxY = s.c1.y;
+        if (s.c2.x < minX) minX = s.c2.x; else if (s.c2.x > maxX) maxX = s.c2.x;
+        if (s.c2.y < minY) minY = s.c2.y; else if (s.c2.y > maxY) maxY = s.c2.y;
+        if (s.end.x < minX) minX = s.end.x; else if (s.end.x > maxX) maxX = s.end.x;
+        if (s.end.y < minY) minY = s.end.y; else if (s.end.y > maxY) maxY = s.end.y;
       }
       if (arrowTip) {
-        if (arrowTip.x < minX) minX = arrowTip.x;
-        else if (arrowTip.x > maxX) maxX = arrowTip.x;
-        if (arrowTip.y < minY) minY = arrowTip.y;
-        else if (arrowTip.y > maxY) maxY = arrowTip.y;
+        if (arrowTip.x < minX) minX = arrowTip.x; else if (arrowTip.x > maxX) maxX = arrowTip.x;
+        if (arrowTip.y < minY) minY = arrowTip.y; else if (arrowTip.y > maxY) maxY = arrowTip.y;
       }
 
       out.push({
@@ -335,16 +749,13 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     return out;
   }, [edges, layoutResult, nodeById]);
 
-  // Edge groups — pre-partitioned by (color, dash) so the draw loop
-  // doesn't re-partition every frame. Each group renders with one
-  // beginPath / one stroke / one fill call regardless of edge count.
   const edgeGroups = useMemo((): EdgeGroups => {
-    const buckets: [LaidEdge[], string, number[]][] = [
-      [[], "#6366f1", []],   // fieldSolid
-      [[], "#6366f1", [4, 3]], // fieldNullable
-      [[], "#eab308", []],  // union
-      [[], "#64748b", [6, 4]], // implements (muted-foreground fallback)
-      [[], "#f97316", [3, 3]], // arg
+    const buckets: [LaidEdge[], string, number, number[]][] = [
+      [[], "#6366f1", 0x6366f1, []],
+      [[], "#6366f1", 0x6366f1, [4, 3]],
+      [[], "#eab308", 0xeab308, []],
+      [[], "#64748b", 0x64748b, [6, 4]],
+      [[], "#f97316", 0xf97316, [3, 3]],
     ];
     for (const e of laidEdges) {
       if (e.kind === "implements") buckets[3]![0].push(e);
@@ -354,17 +765,18 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       else buckets[0]![0].push(e);
     }
     const shouldDim = focusId && focusId !== rootId;
-    const groups: EdgeGroupSpec[] = buckets.map(([edges, color, dash]) => {
-      if (!shouldDim) return { color, dash, dim: [], active: edges };
+    const groups: EdgeGroupSpec[] = buckets.map(([edgeList, color, colorHex, dash]) => {
+      if (!shouldDim) return { color, colorHex, dash, dim: [], active: edgeList };
       return {
         color,
+        colorHex,
         dash,
-        dim: edges.filter((e) => e.sourceId !== focusId && e.targetId !== focusId),
-        active: edges.filter((e) => e.sourceId === focusId || e.targetId === focusId),
+        dim: edgeList.filter((e) => e.sourceId !== focusId && e.targetId !== focusId),
+        active: edgeList.filter((e) => e.sourceId === focusId || e.targetId === focusId),
       };
     });
 
-    let dimNodeIds = new Set<string>();
+    const dimNodeIds = new Set<string>();
     if (shouldDim && focusId) {
       const connectedIds = new Set<string>([focusId]);
       for (const e of laidEdges) {
@@ -372,9 +784,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         else if (e.targetId === focusId) connectedIds.add(e.sourceId);
       }
       for (const e of laidEdges) {
-        const src = e.sourceId, tgt = e.targetId;
-        if (!connectedIds.has(src)) dimNodeIds.add(src);
-        if (!connectedIds.has(tgt)) dimNodeIds.add(tgt);
+        if (!connectedIds.has(e.sourceId)) dimNodeIds.add(e.sourceId);
+        if (!connectedIds.has(e.targetId)) dimNodeIds.add(e.targetId);
       }
     }
 
@@ -383,15 +794,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
   const bounds = useMemo(() => {
     if (laidNodes.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
-    let minX = Infinity,
-      minY = Infinity,
-      maxX = -Infinity,
-      maxY = -Infinity;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const n of laidNodes) {
-      const x1 = n.cx - n.w / 2,
-        y1 = n.cy - n.h / 2;
-      const x2 = n.cx + n.w / 2,
-        y2 = n.cy + n.h / 2;
+      const x1 = n.cx - n.w / 2, y1 = n.cy - n.h / 2;
+      const x2 = n.cx + n.w / 2, y2 = n.cy + n.h / 2;
       if (x1 < minX) minX = x1;
       if (y1 < minY) minY = y1;
       if (x2 > maxX) maxX = x2;
@@ -400,18 +806,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     return { minX, minY, maxX, maxY };
   }, [laidNodes]);
 
-  // Sprite cache and DPR are managed as refs so upgrades take effect
-  // in the same frame (no React state update cycle lag). The draw loop
-  // computes the needed DPR on every frame and clears the cache in-place
-  // when the DPR needs to rise, then rebuilds lazily from there.
-  const spriteCacheRef = useRef(new Map<string, HTMLCanvasElement | OffscreenCanvas>());
-  const spriteDprRef = useRef(0);
-  useEffect(() => {
-    spriteCacheRef.current.clear();
-    spriteDprRef.current = 0;
-  }, [laidNodes, themeResolved]);
-
-  // Auto-fit.
+  // Auto-fit
   const fittedKey = useRef("");
   useEffect(() => {
     if (laidNodes.length === 0 || size.w <= 1) return;
@@ -427,8 +822,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     viewRef.current = { x: size.w / 2 - cx * k, y: size.h / 2 - cy * k, k };
   }, [laidNodes, size, bounds]);
 
-  // Focus pan + zoom. Raises zoom to a readable floor so selecting a
-  // type in the tree actually looks like the canvas moved TO it.
+  // Focus pan + zoom
   const FOCUS_MIN_ZOOM = 0.9;
   useEffect(() => {
     if (!focusId || focusId === rootId || size.w <= 1) return;
@@ -443,7 +837,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     };
   }, [focusId, nodeById, size.w, size.h]);
 
-  // Wheel zoom.
+  // Wheel zoom
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -462,6 +856,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
+  // Hit-testing helpers
   const screenToWorld = (clientX: number, clientY: number): Point | null => {
     const el = containerRef.current;
     if (!el) return null;
@@ -494,7 +889,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         if (!f) return null;
         const nav =
           !BUILTIN_SCALARS.has(f.typeName) && nodeById.has(f.typeName) ? f.typeName : null;
-        // Relay icon sits in the right ~40 px of the row.
         const isRelayHover = !!f.isRelayConnection && localX > n.w - 44;
         return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav, isRelayHover };
       }
@@ -551,6 +945,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       moved: false,
     };
   };
+
   const onMouseMove = (e: React.MouseEvent) => {
     const drag = dragRef.current;
     if (drag.active) {
@@ -590,11 +985,13 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
     hoveredNodeRef.current = hoveredNode;
   };
+
   const endDrag = () => {
     dragRef.current.active = false;
     hoveredFieldRef.current = null;
     hoveredNodeRef.current = null;
   };
+
   const onClick = (e: React.MouseEvent) => {
     if (dragRef.current.moved) return;
     const world = screenToWorld(e.clientX, e.clientY);
@@ -606,9 +1003,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     onClearFocus?.();
   };
 
-  // Touch gestures: 1-finger pan, 2-finger pinch zoom, tap-to-navigate.
-  // Refs hold the latest closures so the listener block can stay bound
-  // once instead of re-attaching on every render.
+  // Touch gestures
   const hitTestRef = useRef(hitTestFieldTarget);
   hitTestRef.current = hitTestFieldTarget;
   const onNavigateRef = useRef(onNavigate);
@@ -625,11 +1020,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     let pinchStartDist = 0;
     let pinchStartK = 1;
 
-    const enterPan = () => {
-      mode = "pan";
-      panMoved = false;
-    };
-
+    const enterPan = () => { mode = "pan"; panMoved = false; };
     const enterPinch = () => {
       const arr = [...points.values()];
       if (arr.length < 2) return;
@@ -642,12 +1033,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       if (e.cancelable) e.preventDefault();
       for (let i = 0; i < e.changedTouches.length; i++) {
         const t = e.changedTouches[i]!;
-        points.set(t.identifier, {
-          x: t.clientX,
-          y: t.clientY,
-          startX: t.clientX,
-          startY: t.clientY,
-        });
+        points.set(t.identifier, { x: t.clientX, y: t.clientY, startX: t.clientX, startY: t.clientY });
       }
       if (points.size === 1) enterPan();
       else if (points.size >= 2) enterPinch();
@@ -655,12 +1041,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
     const onTouchMove = (e: TouchEvent) => {
       if (e.cancelable) e.preventDefault();
-
-      // Snapshot pre-move positions so we can compute a per-finger
-      // delta even when several touches move in the same frame.
       const before = new Map<number, { x: number; y: number }>();
       for (const [id, p] of points) before.set(id, { x: p.x, y: p.y });
-
       for (let i = 0; i < e.changedTouches.length; i++) {
         const t = e.changedTouches[i]!;
         const existing = points.get(t.identifier);
@@ -668,7 +1050,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         existing.x = t.clientX;
         existing.y = t.clientY;
       }
-
       if (mode === "pan" && points.size === 1) {
         const arr = [...points.entries()];
         const [id, pt] = arr[0]!;
@@ -679,18 +1060,14 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         if (
           Math.abs(pt.x - pt.startX) > CLICK_DRAG_THRESHOLD ||
           Math.abs(pt.y - pt.startY) > CLICK_DRAG_THRESHOLD
-        ) {
-          panMoved = true;
-        }
+        ) panMoved = true;
         const v = viewRef.current;
         viewRef.current = { ...v, x: v.x + dx, y: v.y + dy };
         return;
       }
-
       if (mode === "pinch" && points.size >= 2) {
         const arr = [...points.values()];
-        const a = arr[0]!;
-        const b = arr[1]!;
+        const a = arr[0]!, b = arr[1]!;
         const dist = Math.hypot(a.x - b.x, a.y - b.y);
         if (pinchStartDist <= 0) return;
         const newK = Math.max(0.05, Math.min(4, pinchStartK * (dist / pinchStartDist)));
@@ -699,11 +1076,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         const cy = (a.y + b.y) / 2 - rect.top;
         const v = viewRef.current;
         const ratio = newK / v.k;
-        viewRef.current = {
-          k: newK,
-          x: cx - (cx - v.x) * ratio,
-          y: cy - (cy - v.y) * ratio,
-        };
+        viewRef.current = { k: newK, x: cx - (cx - v.x) * ratio, y: cy - (cy - v.y) * ratio };
       }
     };
 
@@ -711,14 +1084,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const ended: Touch[] = [];
       for (let i = 0; i < e.changedTouches.length; i++) {
         const t = e.changedTouches[i]!;
-        if (points.has(t.identifier)) {
-          ended.push(t);
-          points.delete(t.identifier);
-        }
+        if (points.has(t.identifier)) { ended.push(t); points.delete(t.identifier); }
       }
-
-      // Lifting one finger of a pinch leaves us in single-finger pan
-      // mode; reset the pan baseline so the next move doesn't jump.
       if (mode === "pinch" && points.size === 1) {
         const remaining = [...points.values()][0]!;
         remaining.startX = remaining.x;
@@ -726,7 +1093,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         enterPan();
         return;
       }
-
       if (points.size === 0) {
         const wasTap = mode === "pan" && !panMoved && ended.length > 0;
         mode = "none";
@@ -755,48 +1121,380 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     };
   }, []);
 
-  // Draw loop. When a node is focused, run a continuous RAF loop so the
-  // focus ring pulse animates smoothly. Otherwise run one-shot to avoid
-  // unnecessary per-frame work during idle.
+  // ─── Pixi Application init ────────────────────────────────────────
+
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d", { alpha: false });
-    if (!ctx) return;
+    const mountEl = pixiContainerRef.current;
+    if (!mountEl) return;
 
-    if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    const dpr = window.devicePixelRatio || 1;
+    // Use themeResolved (from React context) for the first-frame
+    // background. We can't read CSS vars here because React fires
+    // child effects before parent — ThemeProvider hasn't toggled the
+    // .dark class on <html> yet, so getComputedStyle still returns
+    // the light-mode value. The background sync effect (below) picks
+    // up the real CSS var once both the app and the theme are ready.
+    const initBgHex = themeResolved === "dark" ? 0x0a0a0a : 0xffffff;
+    const app = new Application();
 
-    const loop = () => {
-      rafRef.current = requestAnimationFrame(loop);
-      drawFrame(
-        canvas,
-        ctx,
-        size,
-        viewRef.current,
-        laidNodes,
-        laidEdges,
-        edgeGroups,
-        nodeById,
-        focusId ?? null,
-        edgeGroups.dimNodeIds,
-        hoveredNodeRef.current,
-        hoveredFieldRef.current,
-        spriteCacheRef.current,
-        spriteDprRef,
-        fpsRef,
-        lastTimingRef,
-      );
-    };
+    let destroyed = false;
+    app.init({
+      width: size.w,
+      height: size.h,
+      resolution: dpr,
+      autoDensity: true,
+      antialias: true,
+      backgroundAlpha: 1,
+      backgroundColor: initBgHex,
+      preference: "webgl",
+    }).then(() => {
+      if (destroyed) {
+        app.destroy(true);
+        return;
+      }
 
-    rafRef.current = requestAnimationFrame(loop);
+      mountEl.appendChild(app.canvas as HTMLCanvasElement);
+
+      // Scene graph
+      const gridTiling = new TilingSprite({
+        texture: Texture.WHITE,
+        width: size.w,
+        height: size.h,
+      });
+      gridTiling.tileScale.set(1);
+
+      const world = new Container();
+      world.cullable = true;
+
+      const edgeGraphics = new Graphics();
+      const arrowGraphics = new Graphics();
+      const nodeContainer = new Container();
+      nodeContainer.cullable = true;
+      const hoverGraphics = new Graphics();
+      const focusGraphics = new Graphics();
+
+      world.addChild(edgeGraphics);
+      world.addChild(arrowGraphics);
+      world.addChild(nodeContainer);
+      world.addChild(hoverGraphics);
+      world.addChild(focusGraphics);
+
+      app.stage.addChild(gridTiling);
+      app.stage.addChild(world);
+
+      appRef.current = app;
+      setAppReady(true);
+      sceneRef.current = {
+        gridTiling,
+        world,
+        edgeGraphics,
+        arrowGraphics,
+        nodeContainer,
+        hoverGraphics,
+        focusGraphics,
+      };
+
+      // FPS tick counter
+      let fpsTimes: number[] = [];
+      let lastFpsSampleAt = 0;
+
+      app.ticker.add(() => {
+        const scene = sceneRef.current;
+        if (!scene.world) return;
+
+        const v = viewRef.current;
+        const sw = app.screen.width;
+        const sh = app.screen.height;
+
+        // Sync world transform
+        scene.world.position.set(v.x, v.y);
+        scene.world.scale.set(v.k, v.k);
+
+        // Detect LOD change → trigger node/edge rebuild
+        const newLod = computeLOD(v.k);
+        if (newLod !== currentLodRef.current) {
+          currentLodRef.current = newLod;
+          setLodTick((t) => t + 1);
+        }
+
+        // Sync grid tiling
+        if (scene.gridTiling) {
+          scene.gridTiling.width = sw;
+          scene.gridTiling.height = sh;
+          scene.gridTiling.tilePosition.set(v.x % 24, v.y % 24);
+          scene.gridTiling.tileScale.set(v.k, v.k);
+        }
+
+        // Hover highlight
+        if (scene.hoverGraphics) {
+          scene.hoverGraphics.clear();
+          const hoveredField = hoveredFieldRef.current;
+          if (hoveredField) {
+            const n = nodeByIdRef.current.get(hoveredField.nodeId);
+            if (n) {
+              const fgHex = cssColorToHex(getComputedCssVar("--foreground", "#0f172a"));
+              const nodeLeft = n.cx - n.w / 2;
+              const nodeTop = n.cy - n.h / 2;
+              const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
+              const hy = nodeTop + bodyTop + hoveredField.fieldIndex * ROW_H;
+              const hpad = 4;
+              scene.hoverGraphics.roundRect(nodeLeft + hpad, hy, n.w - hpad * 2, ROW_H, 3);
+              scene.hoverGraphics.fill({ color: fgHex, alpha: 0.07 });
+            }
+          }
+        }
+
+        // Focus + hover rings
+        if (scene.focusGraphics) {
+          scene.focusGraphics.clear();
+
+          const hoveredNodeId = hoveredNodeRef.current;
+          const focusIdVal = focusIdRef.current;
+
+          if (hoveredNodeId && hoveredNodeId !== focusIdVal) {
+            const n = nodeByIdRef.current.get(hoveredNodeId);
+            if (n) {
+              const colorStr = KIND_COLORS[n.data.kind];
+              const colorHex = cssColorToHex(colorStr);
+              const pad = 3;
+              scene.focusGraphics.roundRect(
+                n.cx - n.w / 2 - pad, n.cy - n.h / 2 - pad,
+                n.w + pad * 2, n.h + pad * 2, 9,
+              );
+              scene.focusGraphics.stroke({ width: 1.5, color: colorHex, alpha: 0.4 });
+            }
+          }
+
+          if (focusIdVal) {
+            const n = nodeByIdRef.current.get(focusIdVal);
+            if (n) {
+              const colorStr = KIND_COLORS[n.data.kind];
+              const colorHex = cssColorToHex(colorStr);
+
+              const t = (performance.now() % 1600) / 1600;
+              const ripplePad = t * 18;
+              const rippleAlpha = (1 - t) * 0.6;
+
+              scene.focusGraphics.roundRect(
+                n.cx - n.w / 2 - ripplePad, n.cy - n.h / 2 - ripplePad,
+                n.w + ripplePad * 2, n.h + ripplePad * 2, 6 + ripplePad,
+              );
+              scene.focusGraphics.stroke({ width: 2, color: colorHex, alpha: rippleAlpha });
+
+              const pad = 3;
+              scene.focusGraphics.roundRect(
+                n.cx - n.w / 2 - pad, n.cy - n.h / 2 - pad,
+                n.w + pad * 2, n.h + pad * 2, 9,
+              );
+              scene.focusGraphics.stroke({ width: 2.5, color: colorHex, alpha: 0.75 });
+            }
+          }
+        }
+
+        // FPS sampling
+        const now = performance.now();
+        fpsTimes.push(now);
+        let lo = 0;
+        while (lo < fpsTimes.length && now - fpsTimes[lo]! > 1000) lo++;
+        if (lo > 0) fpsTimes.splice(0, lo);
+        if (now - lastFpsSampleAt >= 500) {
+          lastFpsSampleAt = now;
+          setFpsDisplay(fpsTimes.length);
+        }
+      });
+    });
 
     return () => {
-      if (rafRef.current != null) {
-        cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
+      destroyed = true;
+      const app = appRef.current;
+      if (app) {
+        app.destroy(true, { children: true, texture: true });
+        appRef.current = null;
       }
+      sceneRef.current = {
+        gridTiling: null,
+        world: null,
+        edgeGraphics: null,
+        arrowGraphics: null,
+        nodeContainer: null,
+        hoverGraphics: null,
+        focusGraphics: null,
+      };
     };
-  }, [laidNodes, laidEdges, edgeGroups, focusId, size, nodeById]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Keep focusId accessible in the ticker without re-init
+  const focusIdRef = useRef(focusId ?? null);
+  focusIdRef.current = focusId ?? null;
+
+  // Keep nodeById accessible in the ticker
+  const nodeByIdRef = useRef(nodeById);
+  nodeByIdRef.current = nodeById;
+
+  // Resize Pixi renderer
+  useEffect(() => {
+    const app = appRef.current;
+    if (!app || size.w <= 1 || size.h <= 1) return;
+    app.renderer.resize(size.w, size.h);
+    const scene = sceneRef.current;
+    if (scene.gridTiling) {
+      scene.gridTiling.width = size.w;
+      scene.gridTiling.height = size.h;
+    }
+  }, [size]);
+
+  // Rebuild dot grid texture when theme changes
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene.gridTiling) return;
+    const mutedFg = getComputedCssVar("--muted-foreground", "#64748b");
+    const mutedHex = cssColorToHex(mutedFg);
+    const tex = buildDotGridTexture(mutedHex, 0.18);
+    scene.gridTiling.texture = tex;
+    scene.gridTiling.tileScale.set(1);
+  }, [themeResolved]);
+
+  // Rebuild edges when laidEdges/edgeGroups change
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene.edgeGraphics || !scene.arrowGraphics) return;
+
+    const eg = scene.edgeGraphics;
+    const ag = scene.arrowGraphics;
+    eg.clear();
+    ag.clear();
+
+    const lod = computeLOD(viewRef.current.k);
+    if (lod === "chrome") return;
+
+    const DIM = 0.1;
+    const STROKE_W = 1.4;
+
+    for (const g of edgeGroups.groups) {
+      const colorHex = g.colorHex;
+
+      // Dim edges
+      if (g.dim.length > 0) {
+        if (g.dash.length > 0) {
+          for (const edge of g.dim) {
+            drawDashedBezierEdge(eg, edge, g.dash, colorHex, DIM, STROKE_W);
+          }
+          eg.stroke({ width: STROKE_W, color: colorHex, alpha: DIM });
+        } else {
+          eg.beginPath();
+          for (const edge of g.dim) {
+            drawSolidBezierEdge(eg, edge);
+          }
+          eg.stroke({ width: STROKE_W, color: colorHex, alpha: DIM });
+        }
+        // Arrowheads for dim
+        ag.beginPath();
+        for (const edge of g.dim) {
+          drawArrowHead(ag, edge);
+        }
+        ag.fill({ color: colorHex, alpha: DIM });
+      }
+
+      // Active edges
+      if (g.active.length > 0) {
+        if (g.dash.length > 0) {
+          for (const edge of g.active) {
+            drawDashedBezierEdge(eg, edge, g.dash, colorHex, 1, STROKE_W);
+          }
+          eg.stroke({ width: STROKE_W, color: colorHex, alpha: 1 });
+        } else {
+          eg.beginPath();
+          for (const edge of g.active) {
+            drawSolidBezierEdge(eg, edge);
+          }
+          eg.stroke({ width: STROKE_W, color: colorHex, alpha: 1 });
+        }
+        // Arrowheads for active
+        ag.beginPath();
+        for (const edge of g.active) {
+          drawArrowHead(ag, edge);
+        }
+        ag.fill({ color: colorHex, alpha: 1 });
+      }
+    }
+  }, [laidEdges, edgeGroups, lodTick]);
+
+  // Rebuild node textures and sprites when laidNodes or theme changes
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene.nodeContainer) return;
+
+    // Destroy old textures
+    for (const tex of textureCacheRef.current.values()) {
+      tex.destroy(true);
+    }
+    textureCacheRef.current.clear();
+    spriteDprRef.current = 0;
+
+    // Clear old sprites
+    for (const spr of nodeSpritesRef.current.values()) {
+      spr.destroy();
+    }
+    nodeSpritesRef.current.clear();
+    scene.nodeContainer.removeChildren();
+
+    const cardColor = getComputedCssVar("--card", "#ffffff");
+    const fgColor = getComputedCssVar("--foreground", "#0f172a");
+    const mutedFg = getComputedCssVar("--muted-foreground", "#64748b");
+    const spriteCtx: SpriteCtx = { cardColor, fgColor, mutedFg };
+
+    const viewK = viewRef.current.k;
+    const lod = computeLOD(viewK);
+    const dpr = memoryCappedDpr(idealSpriteDpr(viewK), laidNodes.length);
+    spriteDprRef.current = dpr;
+
+    const { dimNodeIds } = edgeGroups;
+    const DIM = 0.1;
+
+    for (const n of laidNodes) {
+      const key = `${n.id}:${lod}`;
+      let tex = textureCacheRef.current.get(key);
+      if (!tex) {
+        const pw = Math.ceil(n.w * dpr);
+        const ph = Math.ceil(n.h * dpr);
+        const can = document.createElement("canvas");
+        can.width = pw;
+        can.height = ph;
+        const ctx = can.getContext("2d");
+        if (ctx) {
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          drawNodeSprite(ctx, n, spriteCtx, lod);
+          tex = Texture.from(can);
+          textureCacheRef.current.set(key, tex);
+        }
+      }
+      if (!tex) continue;
+
+      const sprite = new Sprite(tex);
+      sprite.position.set(n.cx - n.w / 2, n.cy - n.h / 2);
+      sprite.width = n.w;
+      sprite.height = n.h;
+      sprite.alpha = dimNodeIds.has(n.id) ? DIM : 1;
+      sprite.cullable = true;
+
+      scene.nodeContainer.addChild(sprite);
+      nodeSpritesRef.current.set(n.id, sprite);
+    }
+  }, [laidNodes, themeResolved, edgeGroups, lodTick]);
+
+  // FPS + timing overlay state
+  const fpsOverlayRef = useRef<HTMLDivElement>(null);
+
+  // Background color sync — runs on theme change AND when app first
+  // becomes ready (async init may finish after the initial effect).
+  useEffect(() => {
+    const app = appRef.current;
+    if (!app) return;
+    const bgColor = getComputedCssVar("--background", "#ffffff");
+    const bgHex = cssColorToHex(bgColor);
+    app.renderer.background.color = bgHex;
+  }, [themeResolved, appReady]);
 
   return (
     <div
@@ -809,7 +1507,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       onClick={onClick}
       style={{ cursor, touchAction: "none" }}
     >
-      <canvas ref={canvasRef} style={{ width: size.w, height: size.h, display: "block" }} />
+      <div ref={pixiContainerRef} style={{ width: size.w, height: size.h }} />
+
       {isPending && (
         <div
           className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-background/60 backdrop-blur-sm"
@@ -827,812 +1526,24 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           </div>
         </div>
       )}
+
+      {/* FPS overlay */}
+      <div
+        ref={fpsOverlayRef}
+        className="pointer-events-none absolute bottom-4 right-4 rounded-lg border border-border/20 bg-background/10 px-3 py-2 font-mono text-xs text-muted-foreground/60 backdrop-blur-sm"
+        style={{ minWidth: 120 }}
+      >
+        <div className="flex items-baseline justify-between gap-4">
+          <span>{fpsDisplay} fps</span>
+          <span>{laidNodes.length} nodes · {laidEdges.length} edges</span>
+        </div>
+        {lastTiming && (
+          <div className="mt-1 space-y-0.5 opacity-70">
+            <div>similarity {lastTiming.similarityMs.toFixed(0)}ms</div>
+            <div>layout {lastTiming.layoutMs.toFixed(0)}ms · total {lastTiming.totalMs.toFixed(0)}ms</div>
+          </div>
+        )}
+      </div>
     </div>
   );
-}
-
-// ─── Draw frame ──────────────────────────────────────────────────────
-
-interface EdgeGroupSpec {
-  color: string;
-  dash: number[];
-  dim: LaidEdge[];
-  active: LaidEdge[];
-}
-
-interface EdgeGroups {
-  groups: EdgeGroupSpec[];
-  dimNodeIds: Set<string>;
-}
-
-function drawFrame(
-  canvas: HTMLCanvasElement,
-  ctx: CanvasRenderingContext2D,
-  size: { w: number; h: number },
-  view: { x: number; y: number; k: number },
-  laidNodes: LaidNode[],
-  laidEdges: LaidEdge[],
-  edgeGroups: EdgeGroups,
-  nodeById: Map<string, LaidNode>,
-  focusId: string | null,
-  dimNodeIds: Set<string>,
-  hoveredNodeId: string | null,
-  hoveredField: { nodeId: string; fieldIndex: number; isRelayHover: boolean } | null,
-  spriteCache: Map<string, HTMLCanvasElement | OffscreenCanvas>,
-  spriteDprRef: { current: number },
-  fpsRef: { current: { times: number[]; history: number[]; lastSampleAt: number } },
-  lastTimingRef: { current: LayoutWorkerResponse["timings"] | null },
-): void {
-  const dpr = window.devicePixelRatio || 1;
-  const targetW = Math.ceil(size.w * dpr);
-  const targetH = Math.ceil(size.h * dpr);
-  if (canvas.width !== targetW) canvas.width = targetW;
-  if (canvas.height !== targetH) canvas.height = targetH;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-  // Compute the needed sprite DPR for this frame and upgrade in-place
-  // if the zoom level demands sharper sprites. Clearing and rebuilding
-  // happens lazily within the same frame — no React re-render required.
-  const neededDpr = memoryCappedDpr(idealSpriteDpr(view.k), laidNodes.length);
-  if (neededDpr > spriteDprRef.current) {
-    spriteCache.clear();
-    spriteDprRef.current = neededDpr;
-  }
-  const spriteDpr = spriteDprRef.current || neededDpr;
-  const lod = computeLOD(view.k);
-
-  const bgColor = getComputedCssVar("--background", "#ffffff");
-  const cardColor = getComputedCssVar("--card", "#ffffff");
-  const fgColor = getComputedCssVar("--foreground", "#0f172a");
-  const mutedFg = getComputedCssVar("--muted-foreground", "#64748b");
-
-  ctx.fillStyle = bgColor;
-  ctx.fillRect(0, 0, size.w, size.h);
-
-  drawDotGrid(ctx, size, view, mutedFg);
-
-  ctx.save();
-  ctx.translate(view.x, view.y);
-  ctx.scale(view.k, view.k);
-
-  const vpLeft = -view.x / view.k;
-  const vpTop = -view.y / view.k;
-  const vpRight = (size.w - view.x) / view.k;
-  const vpBottom = (size.h - view.y) / view.k;
-
-  ctx.lineWidth = 1.4;
-  ctx.lineJoin = "round";
-  ctx.lineCap = "round";
-
-  // PASS A — edges. Skipped entirely at "chrome" LOD (nodes are solid
-  // color pills; edges would only add visual noise at that scale).
-  const DIM = 0.1;
-  const vp: [number, number, number, number] = [vpLeft, vpTop, vpRight, vpBottom];
-  if (lod !== "chrome") {
-    for (const g of edgeGroups.groups) {
-      if (g.dim.length > 0) drawEdgeBatch(ctx, g.dim, g.color, g.dash, ...vp, DIM);
-      if (g.active.length > 0) drawEdgeBatch(ctx, g.active, g.color, g.dash, ...vp, 1);
-    }
-    ctx.setLineDash([]);
-  }
-  void focusId; // used indirectly via edgeGroups + focus ring below
-
-  // PASS B — nodes. Per-frame sprite build budget: if building sprites
-  // would bust the frame time, draw a solid-color fallback this frame
-  // and signal the wrapper to schedule an immediate follow-up RAF so
-  // the remaining sprites get built without ever dropping a frame.
-  const SPRITE_BUDGET_MS = 4;
-  const budgetDeadline = performance.now() + SPRITE_BUDGET_MS;
-  const spriteContext = { cardColor, fgColor, mutedFg };
-  for (const n of laidNodes) {
-    const nLeft = n.cx - n.w / 2;
-    const nRight = n.cx + n.w / 2;
-    const nTop = n.cy - n.h / 2;
-    const nBottom = n.cy + n.h / 2;
-    if (
-      nRight < vpLeft - CULL_PAD ||
-      nLeft > vpRight + CULL_PAD ||
-      nBottom < vpTop - CULL_PAD ||
-      nTop > vpBottom + CULL_PAD
-    ) {
-      continue;
-    }
-    const buildAllowed = performance.now() < budgetDeadline;
-    const sprite = getOrBuildSprite(spriteCache, n, spriteContext, spriteDpr, lod, buildAllowed);
-    const isDim = dimNodeIds.has(n.id);
-    if (sprite) {
-      if (isDim) ctx.globalAlpha = DIM;
-      ctx.drawImage(sprite, nLeft, nTop, n.w, n.h);
-      if (isDim) ctx.globalAlpha = 1;
-    } else {
-      ctx.globalAlpha = isDim ? DIM : 1;
-      ctx.fillStyle = KIND_COLORS[n.data.kind];
-      roundRect(ctx, nLeft, nTop, n.w, n.h, 6);
-      ctx.fill();
-      ctx.globalAlpha = 1;
-    }
-  }
-
-  // PASS B.5 — hovered field row highlight.
-  if (hoveredField) {
-    const n = nodeById.get(hoveredField.nodeId);
-    if (n) {
-      const nodeLeft = n.cx - n.w / 2;
-      const nodeTop = n.cy - n.h / 2;
-      const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
-      const hy = nodeTop + bodyTop + hoveredField.fieldIndex * ROW_H;
-      ctx.fillStyle = fgColor;
-      ctx.globalAlpha = 0.07;
-      const hpad = 4;
-      roundRect(ctx, nodeLeft + hpad, hy, n.w - hpad * 2, ROW_H, 3);
-      ctx.fill();
-      ctx.globalAlpha = 1;
-    }
-  }
-
-  // PASS C — hover ring + focus ring + expanding ripple pulse.
-  if (hoveredNodeId && hoveredNodeId !== focusId) {
-    const n = nodeById.get(hoveredNodeId);
-    if (n) {
-      const color = KIND_COLORS[n.data.kind];
-      ctx.save();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.5;
-      ctx.globalAlpha = 0.4;
-      const pad = 3;
-      roundRect(ctx, n.cx - n.w / 2 - pad, n.cy - n.h / 2 - pad, n.w + pad * 2, n.h + pad * 2, 9);
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  if (focusId) {
-    const n = nodeById.get(focusId);
-    if (n) {
-      const color = KIND_COLORS[n.data.kind];
-
-      // Ripple: t goes 0→1 over 1.6 s, then restarts.
-      const t = (performance.now() % 1600) / 1600;
-      const ripplePad = t * 18;
-      const rippleAlpha = (1 - t) * 0.6;
-
-      ctx.save();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-      ctx.globalAlpha = rippleAlpha;
-      roundRect(
-        ctx,
-        n.cx - n.w / 2 - ripplePad,
-        n.cy - n.h / 2 - ripplePad,
-        n.w + ripplePad * 2,
-        n.h + ripplePad * 2,
-        6 + ripplePad,
-      );
-      ctx.stroke();
-      ctx.restore();
-
-      // Static base ring, always visible.
-      ctx.save();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2.5;
-      ctx.globalAlpha = 0.75;
-      ctx.shadowColor = color;
-      ctx.shadowBlur = 10;
-      const pad = 3;
-      roundRect(
-        ctx,
-        n.cx - n.w / 2 - pad,
-        n.cy - n.h / 2 - pad,
-        n.w + pad * 2,
-        n.h + pad * 2,
-        9,
-      );
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  ctx.restore();
-
-  // Silence unused — keep laidEdges in scope for future hit-testing.
-  void laidEdges;
-
-  // PASS D — deprecated field tooltip (screen space).
-  if (hoveredField) {
-    const n = nodeById.get(hoveredField.nodeId);
-    if (n) {
-      const isDepField = n.data.fields?.[hoveredField.fieldIndex]?.isDeprecated;
-      const isDepValue = n.data.values?.[hoveredField.fieldIndex]?.isDeprecated;
-      if (isDepField || isDepValue) {
-        const raw = n.data.fields?.[hoveredField.fieldIndex]?.deprecationReason
-          ?? n.data.values?.[hoveredField.fieldIndex]?.deprecationReason;
-        const reason = raw?.trim() || "Deprecated";
-
-        // Field row centre in world space → screen space (CSS px).
-        const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
-        const rowCentreY = (n.cy - n.h / 2) + bodyTop + hoveredField.fieldIndex * ROW_H + ROW_H / 2;
-        const sx = (n.cx + n.w / 2) * view.k + view.x + 10;
-        const sy = rowCentreY * view.k + view.y;
-
-        ctx.save();
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.font = `500 11px ${MONO}`;
-
-        const PAD_X = 8;
-        const textW = ctx.measureText(reason).width;
-        const TIP_H = 22;
-        const TIP_W = textW + PAD_X * 2 + 14; // 14 = icon space
-
-        // Flip left if it would overflow right edge.
-        const canvasW = canvas.width / dpr;
-        const canvasH = canvas.height / dpr;
-        const tipX = sx + TIP_W > canvasW ? (n.cx - n.w / 2) * view.k + view.x - TIP_W - 10 : sx;
-        const tipY = Math.max(4, Math.min(canvasH - TIP_H - 4, sy - TIP_H / 2));
-
-        // Shadow.
-        ctx.shadowColor = "rgba(0,0,0,0.18)";
-        ctx.shadowBlur = 6;
-        ctx.shadowOffsetY = 2;
-
-        // Background + amber border.
-        ctx.fillStyle = cardColor;
-        ctx.globalAlpha = 0.97;
-        roundRect(ctx, tipX, tipY, TIP_W, TIP_H, 4);
-        ctx.fill();
-        ctx.shadowColor = "transparent";
-        ctx.shadowBlur = 0;
-        ctx.shadowOffsetY = 0;
-        ctx.strokeStyle = "#f59e0b";
-        ctx.lineWidth = 1;
-        ctx.globalAlpha = 0.65;
-        roundRect(ctx, tipX, tipY, TIP_W, TIP_H, 4);
-        ctx.stroke();
-
-        // ⚠ icon.
-        ctx.font = `12px sans-serif`;
-        ctx.fillStyle = "#f59e0b";
-        ctx.globalAlpha = 0.9;
-        ctx.fillText("⚠", tipX + PAD_X, tipY + TIP_H / 2 + 4);
-
-        // Reason text.
-        ctx.font = `500 11px ${MONO}`;
-        ctx.fillStyle = fgColor;
-        ctx.globalAlpha = 0.85;
-        ctx.fillText(reason, tipX + PAD_X + 14, tipY + TIP_H / 2 + 4);
-
-        ctx.restore();
-      }
-    }
-  }
-
-  // PASS D.2 — Relay Connection tooltip (screen space).
-  if (hoveredField?.isRelayHover) {
-    const n = nodeById.get(hoveredField.nodeId);
-    if (n) {
-      const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
-      const rowCentreY = (n.cy - n.h / 2) + bodyTop + hoveredField.fieldIndex * ROW_H + ROW_H / 2;
-      const sx = (n.cx + n.w / 2) * view.k + view.x + 10;
-      const sy = rowCentreY * view.k + view.y;
-
-      ctx.save();
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.font = `500 11px ${MONO}`;
-
-      const LABEL = "Relay Connection";
-      const PAD_X = 8;
-      const TIP_H = 22;
-      const TIP_W = ctx.measureText(LABEL).width + PAD_X * 2;
-
-      const canvasW = canvas.width / dpr;
-      const canvasH = canvas.height / dpr;
-      const tipX = sx + TIP_W > canvasW ? (n.cx - n.w / 2) * view.k + view.x - TIP_W - 10 : sx;
-      const tipY = Math.max(4, Math.min(canvasH - TIP_H - 4, sy - TIP_H / 2));
-
-      ctx.shadowColor = "rgba(0,0,0,0.18)";
-      ctx.shadowBlur = 6;
-      ctx.shadowOffsetY = 2;
-      ctx.fillStyle = cardColor;
-      ctx.globalAlpha = 0.97;
-      roundRect(ctx, tipX, tipY, TIP_W, TIP_H, 4);
-      ctx.fill();
-      ctx.shadowColor = "transparent";
-      ctx.shadowBlur = 0;
-      ctx.shadowOffsetY = 0;
-      ctx.strokeStyle = RELAY_COLOR;
-      ctx.lineWidth = 1;
-      ctx.globalAlpha = 0.65;
-      roundRect(ctx, tipX, tipY, TIP_W, TIP_H, 4);
-      ctx.stroke();
-
-      ctx.fillStyle = fgColor;
-      ctx.globalAlpha = 0.85;
-      ctx.fillText(LABEL, tipX + PAD_X, tipY + TIP_H / 2 + 4);
-
-      ctx.restore();
-    }
-  }
-
-  // FPS overlay — bottom-right corner, screen-space (identity transform).
-  const now = performance.now();
-  const fp = fpsRef.current;
-
-  // Rolling 1-second window for current FPS.
-  fp.times.push(now);
-  let lo = 0;
-  while (lo < fp.times.length && now - fp.times[lo]! > 1000) lo++;
-  if (lo > 0) fp.times.splice(0, lo);
-  const fps = fp.times.length;
-
-  // Sample into history every 200 ms.
-  if (now - fp.lastSampleAt >= 200) {
-    fp.history.push(fps);
-    if (fp.history.length > 40) fp.history.shift();
-    fp.lastSampleAt = now;
-  }
-
-  ctx.save();
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-
-  const CHART_W = 280;
-  const CHART_H = 80;
-  const PAD = 14;
-  const TEXT_ROW = 20;
-  const timing = lastTimingRef.current;
-  const textRows = timing ? 3 : 1;
-  const panelW = CHART_W + PAD * 2;
-  const panelH = CHART_H + textRows * TEXT_ROW + PAD * 2 + 6;
-  const px = canvas.width  - panelW - 16;
-  const py = canvas.height - panelH - 16;
-
-  // Panel background.
-  ctx.fillStyle = mutedFg;
-  ctx.globalAlpha = 0.08;
-  roundRect(ctx, px, py, panelW, panelH, 8);
-  ctx.fill();
-
-  // Bars.
-  const maxFps = 65;
-  const barW = fp.history.length > 0 ? CHART_W / fp.history.length : 6;
-  const chartX = px + PAD;
-  const chartY = py + PAD;
-  for (let i = 0; i < fp.history.length; i++) {
-    const v = fp.history[i]!;
-    const bh = Math.max(1, (v / maxFps) * CHART_H);
-    const isLow = v < 30;
-    ctx.globalAlpha = isLow ? 0.6 : 0.3;
-    ctx.fillStyle = isLow ? "#f87171" : mutedFg;
-    ctx.fillRect(
-      chartX + i * barW,
-      chartY + CHART_H - bh,
-      Math.max(1, barW - 1),
-      bh,
-    );
-  }
-
-  // Text rows.
-  ctx.font = `600 13px ${MONO}`;
-  ctx.fillStyle = mutedFg;
-  ctx.globalAlpha = 0.65;
-  ctx.textBaseline = "top";
-  const textY = chartY + CHART_H + 8;
-
-  ctx.textAlign = "left";
-  ctx.fillText(`${fps} fps`, px + PAD, textY);
-  ctx.textAlign = "right";
-  ctx.fillText(`${laidNodes.length} nodes · ${laidEdges.length} edges`, px + panelW - PAD, textY);
-
-  if (timing) {
-    ctx.font = `500 12px ${MONO}`;
-    ctx.textAlign = "left";
-    ctx.globalAlpha = 0.5;
-    ctx.fillText(`similarity ${timing.similarityMs.toFixed(0)}ms`, px + PAD, textY + TEXT_ROW);
-    ctx.fillText(`layout ${timing.layoutMs.toFixed(0)}ms`, px + PAD, textY + TEXT_ROW * 2);
-    ctx.textAlign = "right";
-    ctx.fillText(`total ${timing.totalMs.toFixed(0)}ms`, px + panelW - PAD, textY + TEXT_ROW * 2);
-  }
-
-  ctx.restore();
-}
-
-function drawDotGrid(
-  ctx: CanvasRenderingContext2D,
-  size: { w: number; h: number },
-  view: { x: number; y: number; k: number },
-  dotColor: string,
-) {
-  const dotGap = 24;
-  const step = dotGap * view.k;
-  if (step < 6) return;
-  const { w, h } = size;
-  ctx.save();
-  ctx.fillStyle = dotColor;
-  ctx.globalAlpha = 0.18;
-  const startX = ((view.x % step) + step) % step;
-  const startY = ((view.y % step) + step) % step;
-  // Batch all dots into one path, one fill() call. Previously each dot
-  // was an individual fillRect(1,1) — 14k+ GPU submissions at mid-zoom.
-  ctx.beginPath();
-  for (let px = startX; px < w; px += step) {
-    for (let py = startY; py < h; py += step) {
-      ctx.rect(px, py, 1, 1);
-    }
-  }
-  ctx.fill();
-  ctx.restore();
-}
-
-function drawEdgeBatch(
-  ctx: CanvasRenderingContext2D,
-  edges: LaidEdge[],
-  color: string,
-  dash: number[],
-  vpLeft: number,
-  vpTop: number,
-  vpRight: number,
-  vpBottom: number,
-  alpha = 1,
-) {
-  if (edges.length === 0) return;
-
-  ctx.save();
-  ctx.globalAlpha = alpha;
-  // Single pass: build the stroke path and collect visible edges for
-  // arrowheads. The previous two-pass design iterated + bbox-tested
-  // every edge twice — one for stroke, once for arrowhead fill. With
-  // 1,294 edges that doubled the per-frame comparison count for no
-  // reason. Now we iterate once, push visible refs into a small array,
-  // stroke, then iterate the already-filtered set for arrowheads.
-  ctx.strokeStyle = color;
-  ctx.setLineDash(dash);
-  const visible: LaidEdge[] = [];
-  ctx.beginPath();
-  for (const e of edges) {
-    const bb = e.bbox;
-    if (
-      bb.maxX < vpLeft - CULL_PAD ||
-      bb.minX > vpRight + CULL_PAD ||
-      bb.maxY < vpTop - CULL_PAD ||
-      bb.minY > vpBottom + CULL_PAD
-    ) {
-      continue;
-    }
-    visible.push(e);
-    ctx.moveTo(e.start.x, e.start.y);
-    for (const seg of e.segments) {
-      ctx.bezierCurveTo(seg.c1.x, seg.c1.y, seg.c2.x, seg.c2.y, seg.end.x, seg.end.y);
-    }
-    if (e.arrowTip) ctx.lineTo(e.arrowTip.x, e.arrowTip.y);
-  }
-  if (visible.length === 0) { ctx.restore(); return; }
-  ctx.stroke();
-
-  // Arrowheads from the already-filtered visible set — no bbox re-test.
-  ctx.setLineDash([]);
-  ctx.fillStyle = color;
-  ctx.beginPath();
-  for (const e of visible) {
-    const lastSeg = e.segments[e.segments.length - 1]!;
-    const tangentFrom = e.arrowTip ? lastSeg.end : lastSeg.c2;
-    const tangentTo = e.arrowTip ?? lastSeg.end;
-    const adx = tangentTo.x - tangentFrom.x;
-    const ady = tangentTo.y - tangentFrom.y;
-    const alen = Math.hypot(adx, ady);
-    if (alen <= 0) continue;
-    const ax = adx / alen;
-    const ay = ady / alen;
-    const sz = 7;
-    ctx.moveTo(tangentTo.x, tangentTo.y);
-    ctx.lineTo(tangentTo.x - ax * sz + ay * sz * 0.4, tangentTo.y - ay * sz - ax * sz * 0.4);
-    ctx.lineTo(tangentTo.x - ax * sz - ay * sz * 0.4, tangentTo.y - ay * sz + ax * sz * 0.4);
-    ctx.closePath();
-  }
-  ctx.fill();
-  ctx.restore();
-}
-
-// ─── Sprite cache ────────────────────────────────────────────────────
-
-interface SpriteCtx {
-  cardColor: string;
-  fgColor: string;
-  mutedFg: string;
-}
-
-function getOrBuildSprite(
-  cache: Map<string, HTMLCanvasElement | OffscreenCanvas>,
-  n: LaidNode,
-  ctxColors: SpriteCtx,
-  dpr: number,
-  lod: SpriteLOD,
-  buildAllowed: boolean,
-): HTMLCanvasElement | null {
-  const key = `${n.id}:${lod}`;
-  const existing = cache.get(key);
-  if (existing) return existing;
-  if (!buildAllowed) return null;
-  const pw = Math.ceil(n.w * dpr);
-  const ph = Math.ceil(n.h * dpr);
-  const can: HTMLCanvasElement | OffscreenCanvas =
-    typeof OffscreenCanvas !== "undefined"
-      ? new OffscreenCanvas(pw, ph)
-      : document.createElement("canvas");
-  if ("width" in can && !(can instanceof OffscreenCanvas)) {
-    can.width = pw;
-    can.height = ph;
-  }
-  const c = can.getContext("2d") as CanvasRenderingContext2D | null;
-  if (!c) return null;
-  c.setTransform(dpr, 0, 0, dpr, 0, 0);
-  drawNodeSprite(c, n, ctxColors, lod);
-  cache.set(key, can);
-  return can;
-}
-
-function drawNodeSprite(
-  ctx: CanvasRenderingContext2D,
-  n: LaidNode,
-  { cardColor, fgColor, mutedFg }: SpriteCtx,
-  lod: SpriteLOD,
-) {
-  const w = n.w;
-  const h = n.h;
-  const color = KIND_COLORS[n.data.kind];
-
-  // "chrome" tier: render as a solid color pill — no card chrome, no text.
-  if (lod === "chrome") {
-    roundRect(ctx, 0, 0, w, h, 6);
-    ctx.fillStyle = color;
-    ctx.fill();
-    return;
-  }
-
-  // Card background + unfocused border.
-  roundRect(ctx, 0, 0, w, h, 6);
-  ctx.fillStyle = cardColor;
-  ctx.fill();
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.25;
-  ctx.globalAlpha = 0.75;
-  ctx.stroke();
-  ctx.globalAlpha = 1;
-
-  // Header band.
-  roundRectTopOnly(ctx, 0, 0, w, HEADER_H, 6);
-  ctx.fillStyle = color;
-  ctx.fill();
-
-  // Header separator.
-  ctx.strokeStyle = color;
-  ctx.globalAlpha = 0.4;
-  ctx.lineWidth = 0.75;
-  ctx.beginPath();
-  ctx.moveTo(0, HEADER_H);
-  ctx.lineTo(w, HEADER_H);
-  ctx.stroke();
-  ctx.globalAlpha = 1;
-
-  // "bar" tier: draw placeholder bars where text would be.
-  if (lod === "bar") {
-    const avail = w - 16;
-    // Name bar in header.
-    const nFrac = BAR_NAME_FRACS[0]!;
-    ctx.fillStyle = "#ffffff";
-    ctx.globalAlpha = 0.55;
-    roundRect(ctx, 8, 23, avail * nFrac, 5, 2.5);
-    ctx.fill();
-    ctx.globalAlpha = 1;
-
-    // Body placeholder bars: one row pair (field + type) per content row.
-    const bodyY = HEADER_H + TOP_BODY_PAD - 2;
-    const rowCount = bodyRowCount(n);
-    for (let i = 0; i < rowCount; i++) {
-      const fy = bodyY + i * ROW_H + 3;
-      const ff = BAR_FIELD_FRACS[i % BAR_FIELD_FRACS.length]!;
-      const tf = BAR_TYPE_FRACS[i % BAR_TYPE_FRACS.length]!;
-      const typeBarW = avail * tf;
-      ctx.fillStyle = fgColor;
-      ctx.globalAlpha = 0.35;
-      roundRect(ctx, 10, fy, avail * ff, 4, 2);
-      ctx.fill();
-      ctx.fillStyle = "#f59e0b"; // amber-400
-      ctx.globalAlpha = 0.45;
-      roundRect(ctx, w - 10 - typeBarW, fy, typeBarW, 4, 2);
-      ctx.fill();
-      ctx.globalAlpha = 1;
-    }
-    return;
-  }
-
-  // "full" tier: kind label.
-  ctx.font = `600 9px ${MONO}`;
-  ctx.fillStyle = "#ffffff";
-  ctx.globalAlpha = 0.6;
-  ctx.fillText(n.data.kind.toUpperCase(), 8, 14);
-  ctx.globalAlpha = 1;
-
-  // "full" tier: node name.
-  ctx.font = NODE_NAME_FONT;
-  ctx.fillStyle = "#ffffff";
-  ctx.fillText(fitText(ctx, n.data.name, w - 16), 8, 30);
-
-  // "full" tier: body.
-  const bodyY = HEADER_H + TOP_BODY_PAD - 2;
-  if (n.data.kind === "Enum") {
-    ctx.font = `10px ${MONO}`;
-    ctx.fillStyle = mutedFg;
-    const values = n.data.values ?? [];
-    for (let i = 0; i < values.length; i++) {
-      ctx.fillText(values[i]!.name, 10, bodyY + i * ROW_H + 10);
-    }
-  } else if (n.data.kind === "Union") {
-    ctx.font = `10px ${MONO}`;
-    ctx.fillStyle = mutedFg;
-    const members = n.data.members ?? [];
-    for (let i = 0; i < members.length; i++) {
-      ctx.fillText("| " + members[i]!, 10, bodyY + i * ROW_H + 10);
-    }
-  } else if (n.data.kind === "Scalar") {
-    ctx.font = `italic 10px ${MONO}`;
-    ctx.fillStyle = mutedFg;
-    ctx.fillText("custom scalar", 10, bodyY + 10);
-  } else {
-    const fields = n.data.fields ?? [];
-    ctx.font = `10px ${MONO}`;
-    for (let i = 0; i < fields.length; i++) {
-      const f = fields[i]!;
-      const fy = bodyY + i * ROW_H + 10;
-      ctx.fillStyle = fgColor;
-      ctx.globalAlpha = f.isDeprecated ? 0.4 : 1;
-      ctx.fillText(f.name, 10, fy);
-      if (f.isDeprecated) {
-        const nameW = ctx.measureText(f.name).width;
-        ctx.strokeStyle = fgColor;
-        ctx.lineWidth = 0.75;
-        ctx.beginPath();
-        ctx.moveTo(10, fy - 3.5);
-        ctx.lineTo(10 + nameW, fy - 3.5);
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
-      if (f.isRelayConnection) {
-        const typeW = ctx.measureText(f.type).width;
-        const iconCx = w - 10 - typeW - 8;
-        drawRelayIcon(ctx, iconCx, fy - 2);
-        ctx.font = `10px ${MONO}`;
-      }
-      drawColoredType(ctx, f.type, w - 10, fy);
-    }
-  }
-}
-
-function bodyRowCount(n: LaidNode): number {
-  const d = n.data;
-  if (d.kind === "Enum")   return (d.values ?? []).length;
-  if (d.kind === "Union")  return (d.members ?? []).length;
-  if (d.kind === "Scalar") return 1;
-  return (d.fields ?? []).length;
-}
-
-// ─── Relay icon ─────────────────────────────────────────────────────
-
-const RELAY_COLOR = "#F26A03";
-// SVG path from relay.svg (viewBox 0 0 24 24).
-const RELAY_SVG_PATH = new Path2D(
-  "M2.264 4.937A2.264 2.264 0 1 0 4.456 7.77h10.339a1.792 1.792 0 0 1 0 3.583h-5.73a3.037 3.037 0 0 0-3.034 3.033a3.036 3.036 0 0 0 3.033 3.033h10.494a2.264 2.264 0 1 0 0-1.242H9.064a1.793 1.793 0 0 1-1.791-1.791c0-.988.803-1.792 1.791-1.792h5.73a3.036 3.036 0 0 0 3.034-3.033a3.036 3.036 0 0 0-3.033-3.033H4.427a2.265 2.265 0 0 0-2.163-1.592",
-);
-
-/** Draws the Relay logo icon scaled to ~8 px, centred at (cx, cy). */
-function drawRelayIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number) {
-  const scale = 8 / 24;
-  ctx.save();
-  ctx.fillStyle = RELAY_COLOR;
-  ctx.globalAlpha = 0.85;
-  ctx.translate(cx - 12 * scale, cy - 12 * scale);
-  ctx.scale(scale, scale);
-  ctx.fill(RELAY_SVG_PATH);
-  ctx.restore();
-}
-
-// ─── Drawing helpers ─────────────────────────────────────────────────
-
-function roundRect(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  r: number,
-) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.arcTo(x + w, y, x + w, y + r, r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
-  ctx.lineTo(x + r, y + h);
-  ctx.arcTo(x, y + h, x, y + h - r, r);
-  ctx.lineTo(x, y + r);
-  ctx.arcTo(x, y, x + r, y, r);
-  ctx.closePath();
-}
-
-/** Rectangle with rounded top corners and flat bottom. Used for the
- *  header band so its bottom sits flush against the body separator. */
-function roundRectTopOnly(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  r: number,
-) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.arcTo(x + w, y, x + w, y + r, r);
-  ctx.lineTo(x + w, y + h);
-  ctx.lineTo(x, y + h);
-  ctx.lineTo(x, y + r);
-  ctx.arcTo(x, y, x + r, y, r);
-  ctx.closePath();
-}
-
-// measureText cache — keyed by the raw string. Safe because
-// drawColoredType is always called with the same 10px mono font
-// already set on ctx, and font metrics don't change with theme.
-// Bounded by the number of unique type strings in the schema.
-const typeWidthCache = new Map<string, number>();
-
-function cachedTextWidth(ctx: CanvasRenderingContext2D, text: string): number {
-  let w = typeWidthCache.get(text);
-  if (w !== undefined) return w;
-  w = ctx.measureText(text).width;
-  typeWidthCache.set(text, w);
-  return w;
-}
-
-function drawColoredType(
-  ctx: CanvasRenderingContext2D,
-  typeStr: string,
-  rightX: number,
-  y: number,
-) {
-  const w = cachedTextWidth(ctx, typeStr);
-  ctx.fillStyle = "#f59e0b";
-  ctx.fillText(typeStr, rightX - w, y);
-}
-
-// function truncate(s: string, n: number) {
-//   return s.length > n ? s.slice(0, n - 1) + "…" : s;
-// }
-
-/**
- * Shorten `s` to the longest prefix (+ "…") that still fits within
- * `maxWidth` pixels using the currently-set canvas font. Results are
- * cached by (string, maxWidth) so LOD/DPR transitions don't re-run
- * the binary-search measureText loop for names that already fit.
- */
-const fitTextCache = new Map<string, string>();
-
-function fitText(ctx: CanvasRenderingContext2D, s: string, maxWidth: number): string {
-  const cacheKey = `${s}|${maxWidth}`;
-  const cached = fitTextCache.get(cacheKey);
-  if (cached !== undefined) return cached;
-
-  if (ctx.measureText(s).width <= maxWidth) {
-    fitTextCache.set(cacheKey, s);
-    return s;
-  }
-  const ellipsis = "…";
-  let lo = 0;
-  let hi = s.length;
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >> 1;
-    const cand = s.slice(0, mid) + ellipsis;
-    if (ctx.measureText(cand).width <= maxWidth) lo = mid;
-    else hi = mid - 1;
-  }
-  const result = lo > 0 ? s.slice(0, lo) + ellipsis : ellipsis;
-  fitTextCache.set(cacheKey, result);
-  return result;
 }
