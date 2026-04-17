@@ -1054,9 +1054,11 @@ function drawDotGrid(
 ) {
   const dotGap = 24;
   const dotR = 1;
+  const step = dotGap * view.k;
+  // Below ~6 px the grid is too dense to be useful and costs ~100k fillRect calls.
+  if (step < 6) return;
   ctx.fillStyle = dotColor;
   ctx.globalAlpha = 0.18;
-  const step = dotGap * view.k;
   const startX = ((view.x % step) + step) % step;
   const startY = ((view.y % step) + step) % step;
   for (let px = startX; px < size.w; px += step) {
