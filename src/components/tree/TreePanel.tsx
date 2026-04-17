@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Clock, Filter, Search, Share2, TriangleAlert, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Clock, Filter, Search, TriangleAlert, X } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
@@ -8,6 +8,14 @@ import { ColoredType } from "@/lib/type-colors";
 import { cn } from "@/lib/utils";
 
 const BUILTIN = new Set(["String", "Int", "Float", "Boolean", "ID"]);
+
+function RelayIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="#F26A03" className={className} aria-hidden>
+      <path d="M2.264 4.937A2.264 2.264 0 1 0 4.456 7.77h10.339a1.792 1.792 0 0 1 0 3.583h-5.73a3.037 3.037 0 0 0-3.034 3.033a3.036 3.036 0 0 0 3.033 3.033h10.494a2.264 2.264 0 1 0 0-1.242H9.064a1.793 1.793 0 0 1-1.791-1.791c0-.988.803-1.792 1.791-1.792h5.73a3.036 3.036 0 0 0 3.034-3.033a3.036 3.036 0 0 0-3.033-3.033H4.427a2.265 2.265 0 0 0-2.163-1.592" />
+    </svg>
+  );
+}
 const ROOT_CANDIDATES = ["Query", "Mutation", "Subscription"];
 
 // ─── Search history ────────────────────────────────────────────────────
@@ -821,7 +829,7 @@ function FieldRow({
         className="flex items-center gap-0.5 rounded px-1 hover:bg-secondary/80"
       >
         {item.isRelayConnection && item.label && (
-          <Share2 className="h-2.5 w-2.5 shrink-0 text-violet-500 opacity-70" />
+          <RelayIcon className="h-2.5 w-2.5 shrink-0 opacity-80" />
         )}
         {item.label ? <ColoredType type={item.label} /> : null}
         <ChevronRight className="h-3 w-3 text-muted-foreground" />
@@ -829,7 +837,7 @@ function FieldRow({
     ) : (
       <span className="flex items-center gap-0.5">
         {item.isRelayConnection && item.label && (
-          <Share2 className="h-2.5 w-2.5 shrink-0 text-violet-500 opacity-70" />
+          <RelayIcon className="h-2.5 w-2.5 shrink-0 opacity-80" />
         )}
         {item.label ? <ColoredType type={item.label} /> : null}
       </span>
@@ -856,7 +864,7 @@ function FieldRow({
           </span>
           <span className={cn("flex shrink-0 items-center gap-1", single.navigable && "group-hover:opacity-80")}>
             {single.isRelayConnection && single.label && (
-              <Share2 className="h-2.5 w-2.5 shrink-0 text-violet-500 opacity-70" />
+              <RelayIcon className="h-2.5 w-2.5 shrink-0 opacity-80" />
             )}
             {single.label ? <ColoredType type={single.label} /> : null}
             {single.navigable && <ChevronRight className="h-3 w-3 text-muted-foreground" />}

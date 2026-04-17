@@ -1447,34 +1447,21 @@ function bodyRowCount(n: LaidNode): number {
 
 // ─── Relay icon ─────────────────────────────────────────────────────
 
-/** Draws a tiny 3-node relay network icon (8×7 px) centred at (cx, cy). */
+const RELAY_COLOR = "#F26A03";
+// SVG path from relay.svg (viewBox 0 0 24 24).
+const RELAY_SVG_PATH = new Path2D(
+  "M2.264 4.937A2.264 2.264 0 1 0 4.456 7.77h10.339a1.792 1.792 0 0 1 0 3.583h-5.73a3.037 3.037 0 0 0-3.034 3.033a3.036 3.036 0 0 0 3.033 3.033h10.494a2.264 2.264 0 1 0 0-1.242H9.064a1.793 1.793 0 0 1-1.791-1.791c0-.988.803-1.792 1.791-1.792h5.73a3.036 3.036 0 0 0 3.034-3.033a3.036 3.036 0 0 0-3.033-3.033H4.427a2.265 2.265 0 0 0-2.163-1.592",
+);
+
+/** Draws the Relay logo icon scaled to ~8 px, centred at (cx, cy). */
 function drawRelayIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number) {
+  const scale = 8 / 24;
   ctx.save();
-  const color = "#8b5cf6"; // violet-500 — relay brand color
-  const r = 1.5;
-  const pts = [
-    { x: cx, y: cy - 3.5 },
-    { x: cx - 3.5, y: cy + 2 },
-    { x: cx + 3.5, y: cy + 2 },
-  ];
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 0.8;
-  ctx.globalAlpha = 0.55;
-  ctx.beginPath();
-  ctx.moveTo(pts[0]!.x, pts[0]!.y);
-  ctx.lineTo(pts[1]!.x, pts[1]!.y);
-  ctx.moveTo(pts[0]!.x, pts[0]!.y);
-  ctx.lineTo(pts[2]!.x, pts[2]!.y);
-  ctx.moveTo(pts[1]!.x, pts[1]!.y);
-  ctx.lineTo(pts[2]!.x, pts[2]!.y);
-  ctx.stroke();
-  ctx.globalAlpha = 1;
-  ctx.fillStyle = color;
-  for (const p of pts) {
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-    ctx.fill();
-  }
+  ctx.fillStyle = RELAY_COLOR;
+  ctx.globalAlpha = 0.85;
+  ctx.translate(cx - 12 * scale, cy - 12 * scale);
+  ctx.scale(scale, scale);
+  ctx.fill(RELAY_SVG_PATH);
   ctx.restore();
 }
 
