@@ -7,7 +7,7 @@ interface SchemaContextValue {
   name: string;
   graph: ParsedGraph;
   hasSchema: boolean;
-  /** Nodes reachable from the current root type. */
+  /** Nodes reachable from the current root type (with active filters applied). */
   visibleNodes: GraphNodeData[];
   /** Edges reachable from the current root type. */
   visibleEdges: GraphEdgeData[];
@@ -19,10 +19,14 @@ interface SchemaContextValue {
   focusStack: string[];
   pushFocus: (id: string) => void;
   popTo: (index: number) => void;
+
+  hidePrimitiveFields: boolean;
+  setHidePrimitiveFields: (v: boolean) => void;
 }
 
 const EMPTY: ParsedGraph = { nodes: [], edges: [], error: null };
 const STORAGE_KEY = "gompassql:current";
+const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
 
 const SchemaContext = createContext<SchemaContextValue | null>(null);
 
@@ -51,6 +55,7 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
   const [name, setName] = useState(initial.name);
   const [rootType, setRootTypeState] = useState<string | null>(null);
   const [focusStack, setFocusStack] = useState<string[]>([]);
+  const [hidePrimitiveFields, setHidePrimitiveFields] = useState(false);
 
   const graph = useMemo(() => (sdl ? sdlToGraph(sdl) : EMPTY), [sdl]);
 
@@ -66,6 +71,15 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     if (!effectiveRoot) return { nodes: graph.nodes, edges: graph.edges };
     return reachableFrom(graph.nodes, graph.edges, effectiveRoot);
   }, [graph, effectiveRoot]);
+
+  const visibleNodes = useMemo(() => {
+    if (!hidePrimitiveFields) return visible.nodes;
+    return visible.nodes.map((n) => {
+      if (!n.fields) return n;
+      const fields = n.fields.filter((f) => !BUILTIN_SCALARS.has(f.typeName));
+      return fields.length === n.fields.length ? n : { ...n, fields };
+    });
+  }, [visible.nodes, hidePrimitiveFields]);
 
   const setSchema = useCallback(
     ({ sdl: nextSdl, name: nextName }: { sdl: string; name?: string }) => {
@@ -116,7 +130,7 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     name,
     graph,
     hasSchema: graph.nodes.length > 0,
-    visibleNodes: visible.nodes,
+    visibleNodes,
     visibleEdges: visible.edges,
     setSchema,
     clearSchema,
@@ -125,6 +139,8 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     focusStack,
     pushFocus,
     popTo,
+    hidePrimitiveFields,
+    setHidePrimitiveFields,
   };
 
   return <SchemaContext.Provider value={value}>{children}</SchemaContext.Provider>;

@@ -1179,7 +1179,15 @@ function drawNodeSprite(
   const h = n.h;
   const color = KIND_COLORS[n.data.kind];
 
-  // Card background + unfocused border (always drawn).
+  // "chrome" tier: render as a solid color pill — no card chrome, no text.
+  if (lod === "chrome") {
+    roundRect(ctx, 0, 0, w, h, 6);
+    ctx.fillStyle = color;
+    ctx.fill();
+    return;
+  }
+
+  // Card background + unfocused border.
   roundRect(ctx, 0, 0, w, h, 6);
   ctx.fillStyle = cardColor;
   ctx.fill();
@@ -1189,12 +1197,12 @@ function drawNodeSprite(
   ctx.stroke();
   ctx.globalAlpha = 1;
 
-  // Header band (always drawn).
+  // Header band.
   roundRectTopOnly(ctx, 0, 0, w, HEADER_H, 6);
   ctx.fillStyle = color;
   ctx.fill();
 
-  // Header separator (always drawn).
+  // Header separator.
   ctx.strokeStyle = color;
   ctx.globalAlpha = 0.4;
   ctx.lineWidth = 0.75;
@@ -1203,9 +1211,6 @@ function drawNodeSprite(
   ctx.lineTo(w, HEADER_H);
   ctx.stroke();
   ctx.globalAlpha = 1;
-
-  // "chrome" tier stops here — no text or bars.
-  if (lod === "chrome") return;
 
   // "bar" tier: draw placeholder bars where text would be.
   if (lod === "bar") {
