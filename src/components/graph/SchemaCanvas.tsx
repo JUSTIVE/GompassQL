@@ -71,6 +71,7 @@ interface Props {
   focusId?: string | null;
   rootId?: string | null;
   onNavigate?: (typeId: string) => void;
+  onClearFocus?: () => void;
 }
 
 const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
@@ -113,7 +114,7 @@ function initialSpriteDpr(): number {
   return Math.min(2, Math.max(1, window.devicePixelRatio || 1));
 }
 
-export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Props) {
+export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClearFocus }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [size, setSize] = useState({ w: 1, h: 1 });
@@ -330,10 +331,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
       else if (e.kind === "field" && e.nullable) buckets[1]![0].push(e);
       else buckets[0]![0].push(e);
     }
+    const shouldDim = focusId && focusId !== rootId;
     const groups: EdgeGroupSpec[] = buckets.map(([edges, color, dash]) => {
-      if (!focusId) {
-        return { color, dash, dim: [], active: edges };
-      }
+      if (!shouldDim) return { color, dash, dim: [], active: edges };
       return {
         color,
         dash,
@@ -342,7 +342,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
       };
     });
     return { groups };
-  }, [laidEdges, focusId]);
+  }, [laidEdges, focusId, rootId]);
 
   const bounds = useMemo(() => {
     if (laidNodes.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
@@ -412,7 +412,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
   // type in the tree actually looks like the canvas moved TO it.
   const FOCUS_MIN_ZOOM = 0.9;
   useEffect(() => {
-    if (!focusId || size.w <= 1) return;
+    if (!focusId || focusId === rootId || size.w <= 1) return;
     const n = nodeById.get(focusId);
     if (!n) return;
     const v = viewRef.current;
@@ -573,6 +573,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
     if (fieldHit) { onNavigate?.(fieldHit); return; }
     const nodeId = hitTestNodeHeader(world.x, world.y);
     if (nodeId) { onNavigate?.(nodeId); return; }
+    onClearFocus?.();
   };
 
   // Touch gestures: 1-finger pan, 2-finger pinch zoom, tap-to-navigate.
@@ -1032,7 +1033,7 @@ function drawEdgeBatch(
     }
     if (e.arrowTip) ctx.lineTo(e.arrowTip.x, e.arrowTip.y);
   }
-  if (!anyVisible) return;
+  if (!anyVisible) { ctx.restore(); return; }
   ctx.stroke();
 
   // One path for every arrowhead fill in this group. Dashes don't

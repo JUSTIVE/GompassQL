@@ -12,6 +12,7 @@ export function ViewRoute() {
     visibleNodes,
     visibleEdges,
     pushFocus,
+    popTo,
   } = useSchema();
   const navigate = useNavigate();
 
@@ -36,6 +37,7 @@ export function ViewRoute() {
           focusId={focusId}
           rootId={rootType}
           onNavigate={pushFocus}
+          onClearFocus={() => popTo(-1)}
         />
       </section>
     </div>
