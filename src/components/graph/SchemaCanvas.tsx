@@ -135,6 +135,11 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [size, setSize] = useState({ w: 1, h: 1 });
   const viewRef = useRef({ x: 0, y: 0, k: 1 });
+  const fpsRef = useRef<{ times: number[]; history: number[]; lastSampleAt: number }>({
+    times: [],
+    history: Array<number>(40).fill(0),
+    lastSampleAt: 0,
+  });
   const [viewTick, setViewTick] = useState(0);
   const dragRef = useRef({
     active: false,
@@ -787,6 +792,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         hoveredFieldRef.current,
         spriteCacheRef.current,
         spriteDprRef,
+        fpsRef,
       );
     };
 
@@ -878,6 +884,7 @@ function drawFrame(
   hoveredField: { nodeId: string; fieldIndex: number } | null,
   spriteCache: Map<string, HTMLCanvasElement>,
   spriteDprRef: { current: number },
+  fpsRef: { current: { times: number[]; history: number[]; lastSampleAt: number } },
 ): void {
   const dpr = window.devicePixelRatio || 1;
   const targetW = Math.ceil(size.w * dpr);
@@ -1044,6 +1051,72 @@ function drawFrame(
 
   // Silence unused — keep laidEdges in scope for future hit-testing.
   void laidEdges;
+
+  // FPS overlay — bottom-right corner, screen-space (identity transform).
+  const now = performance.now();
+  const fp = fpsRef.current;
+
+  // Rolling 1-second window for current FPS.
+  fp.times.push(now);
+  let lo = 0;
+  while (lo < fp.times.length && now - fp.times[lo]! > 1000) lo++;
+  if (lo > 0) fp.times.splice(0, lo);
+  const fps = fp.times.length;
+
+  // Sample into history every 200 ms.
+  if (now - fp.lastSampleAt >= 200) {
+    fp.history.push(fps);
+    if (fp.history.length > 40) fp.history.shift();
+    fp.lastSampleAt = now;
+  }
+
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+  const CHART_W = 82;
+  const CHART_H = 28;
+  const PAD = 8;
+  const TEXT_H = 16;
+  const panelW = CHART_W + PAD * 2;
+  const panelH = CHART_H + TEXT_H + PAD * 2;
+  const px = canvas.width  - panelW - 10;
+  const py = canvas.height - panelH - 10;
+
+  // Panel background.
+  ctx.fillStyle = mutedFg;
+  ctx.globalAlpha = 0.06;
+  roundRect(ctx, px, py, panelW, panelH, 5);
+  ctx.fill();
+
+  // Bars.
+  const maxFps = 65;
+  const barW = CHART_W / fp.history.length;
+  const chartX = px + PAD;
+  const chartY = py + PAD;
+  ctx.fillStyle = mutedFg;
+  for (let i = 0; i < fp.history.length; i++) {
+    const v = fp.history[i]!;
+    const bh = Math.max(1, (v / maxFps) * CHART_H);
+    const isLow = v < 30;
+    ctx.globalAlpha = isLow ? 0.55 : 0.28;
+    ctx.fillStyle = isLow ? "#f87171" : mutedFg;
+    ctx.fillRect(
+      chartX + i * barW,
+      chartY + CHART_H - bh,
+      Math.max(1, barW - 1),
+      bh,
+    );
+  }
+
+  // FPS text.
+  ctx.font = `600 11px ${MONO}`;
+  ctx.fillStyle = mutedFg;
+  ctx.globalAlpha = 0.55;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "bottom";
+  ctx.fillText(`${fps} fps`, px + panelW - PAD, py + panelH - PAD + 2);
+
+  ctx.restore();
 }
 
 function drawDotGrid(
@@ -1057,16 +1130,21 @@ function drawDotGrid(
   const step = dotGap * view.k;
   // Below ~6 px the grid is too dense to be useful and costs ~100k fillRect calls.
   if (step < 6) return;
+  const { w, h } = size;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, w, h);
+  ctx.clip();
   ctx.fillStyle = dotColor;
   ctx.globalAlpha = 0.18;
   const startX = ((view.x % step) + step) % step;
   const startY = ((view.y % step) + step) % step;
-  for (let px = startX; px < size.w; px += step) {
-    for (let py = startY; py < size.h; py += step) {
+  for (let px = startX; px < w; px += step) {
+    for (let py = startY; py < h; py += step) {
       ctx.fillRect(px, py, dotR, dotR);
     }
   }
-  ctx.globalAlpha = 1;
+  ctx.restore();
 }
 
 function drawEdgeBatch(
