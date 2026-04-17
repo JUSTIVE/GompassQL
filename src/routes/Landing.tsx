@@ -10,7 +10,7 @@ import {
   Wand2,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { SdlEditor } from "@/components/SdlEditor";
 import { Button } from "@/components/ui/button";
 import { SAMPLE_SDL } from "@/lib/sample-sdl";
@@ -52,6 +52,25 @@ export function LandingRoute() {
   useEffect(() => {
     setHistory(loadHistory());
   }, []);
+
+  const historyMeta = useMemo(
+    () =>
+      history.map((entry) => {
+        const g = sdlToGraph(entry.sdl);
+        const byKind: Record<string, number> = {};
+        for (const n of g.nodes) byKind[n.kind] = (byKind[n.kind] ?? 0) + 1;
+        const parts: string[] = [];
+        const types = (byKind["Object"] ?? 0) + (byKind["Interface"] ?? 0) + (byKind["Input"] ?? 0);
+        if (types) parts.push(`${types} types`);
+        if (byKind["Enum"]) parts.push(`${byKind["Enum"]} enums`);
+        if (byKind["Union"]) parts.push(`${byKind["Union"]} unions`);
+        const lines = entry.sdl.split("\n").length;
+        parts.push(`${lines} lines`);
+        const hash6 = entry.hash.slice(0, 6).padStart(6, "0");
+        return { summary: parts.join(" · "), hash6 };
+      }),
+    [history],
+  );
 
   const readFile = async (file: File) => {
     try {
@@ -223,7 +242,9 @@ export function LandingRoute() {
           </div>
           {historyOpen && (
             <ul className="max-h-48 overflow-auto border-t border-border">
-              {history.map((entry) => (
+              {history.map((entry, i) => {
+                const meta = historyMeta[i];
+                return (
                 <li
                   key={entry.hash}
                   className="group flex items-center gap-2 border-b border-border/50 px-3 py-2 last:border-b-0 hover:bg-secondary/40"
@@ -240,6 +261,12 @@ export function LandingRoute() {
                       {entry.updatedAt !== entry.createdAt ? "updated " : "added "}
                       {formatTimestamp(entry.updatedAt)}
                     </span>
+                    {meta && (
+                      <span className="mt-0.5 font-mono text-[10px] text-muted-foreground/70">
+                        {meta.summary}
+                        <span className="ml-1.5 rounded bg-muted px-1 py-px">{meta.hash6}</span>
+                      </span>
+                    )}
                   </button>
                   <button
                     type="button"
@@ -250,7 +277,8 @@ export function LandingRoute() {
                     <X className="h-3.5 w-3.5" />
                   </button>
                 </li>
-              ))}
+                );
+              })}
             </ul>
           )}
         </div>

@@ -1,5 +1,5 @@
-import { ChevronDown, ChevronRight, Share2 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { ChevronDown, ChevronRight, Search, Share2, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
 import { useSchema } from "@/lib/schema-context";
@@ -9,6 +9,71 @@ import { cn } from "@/lib/utils";
 
 const BUILTIN = new Set(["String", "Int", "Float", "Boolean", "ID"]);
 const ROOT_CANDIDATES = ["Query", "Mutation", "Subscription"];
+
+function fuzzyScore(
+  query: string,
+  target: string,
+): { score: number; indices: number[] } | null {
+  if (!query) return { score: 0, indices: [] };
+  const q = query.toLowerCase();
+  const t = target.toLowerCase();
+  let qi = 0;
+  const indices: number[] = [];
+  for (let i = 0; i < t.length && qi < q.length; i++) {
+    if (t[i] === q[qi]) { indices.push(i); qi++; }
+  }
+  if (qi < q.length) return null;
+
+  let score = 0;
+  let streak = 0;
+  for (let i = 0; i < indices.length; i++) {
+    const idx = indices[i]!;
+    const prevIdx = i > 0 ? indices[i - 1]! : -2;
+    if (idx === prevIdx + 1) {
+      streak++;
+      score += 4 + streak * 2;
+    } else {
+      streak = 0;
+      score += 1;
+    }
+    if (idx === 0) {
+      score += 8;
+    } else {
+      const prev = target[idx - 1]!;
+      const curr = target[idx]!;
+      if (prev === "_" || prev === "-" || prev === ".") score += 7;
+      else if (curr >= "A" && curr <= "Z") score += 5;
+    }
+  }
+  score += Math.round((query.length / target.length) * 8);
+  return { score, indices };
+}
+
+function HighlightedText({ text, indices }: { text: string; indices: number[] }) {
+  const set = new Set(indices);
+  const segs: { text: string; hi: boolean }[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const hi = set.has(i);
+    let j = i;
+    while (j < text.length && set.has(j) === hi) j++;
+    segs.push({ text: text.slice(i, j), hi });
+    i = j;
+  }
+  return (
+    <span>
+      {segs.map((s, k) =>
+        s.hi ? (
+          <span key={k} className="font-semibold text-primary">
+            {s.text}
+          </span>
+        ) : (
+          <span key={k}>{s.text}</span>
+        ),
+      )}
+    </span>
+  );
+}
 
 export function TreePanel() {
   const {
@@ -22,6 +87,10 @@ export function TreePanel() {
     name,
   } = useSchema();
   const [allTypesOpen, setAllTypesOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [selectedIdx, setSelectedIdx] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const selectedItemRef = useRef<HTMLButtonElement>(null);
 
   const byId = useMemo(
     () => new Map(visibleNodes.map((n) => [n.id, n])),
@@ -56,6 +125,88 @@ export function TreePanel() {
     [graph.nodes],
   );
 
+  interface SearchResult {
+    typeId: string;
+    typeName: string;
+    typeKind: GraphNodeData["kind"];
+    fieldName?: string;
+    fieldType?: string;
+    score: number;
+    matchIndices: number[];
+  }
+
+  const searchResults = useMemo<SearchResult[]>(() => {
+    const q = query.trim();
+    if (!q) return [];
+    const out: SearchResult[] = [];
+    for (const node of graph.nodes) {
+      const tm = fuzzyScore(q, node.name);
+      if (tm) {
+        out.push({
+          typeId: node.id,
+          typeName: node.name,
+          typeKind: node.kind,
+          score: tm.score + 3,
+          matchIndices: tm.indices,
+        });
+      }
+      for (const f of node.fields ?? []) {
+        const fm = fuzzyScore(q, f.name);
+        if (fm) {
+          out.push({
+            typeId: node.id,
+            typeName: node.name,
+            typeKind: node.kind,
+            fieldName: f.name,
+            fieldType: f.type,
+            score: fm.score,
+            matchIndices: fm.indices,
+          });
+        }
+      }
+      for (const v of node.values ?? []) {
+        const vm = fuzzyScore(q, v.name);
+        if (vm) {
+          out.push({
+            typeId: node.id,
+            typeName: node.name,
+            typeKind: node.kind,
+            fieldName: v.name,
+            score: vm.score,
+            matchIndices: vm.indices,
+          });
+        }
+      }
+    }
+    out.sort((a, b) => b.score - a.score);
+    return out.slice(0, 80);
+  }, [query, graph.nodes]);
+
+  useEffect(() => { setSelectedIdx(0); }, [searchResults]);
+
+  useEffect(() => {
+    selectedItemRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selectedIdx]);
+
+  const jumpToAndClose = (id: string) => {
+    jumpTo(id);
+    setQuery("");
+  };
+
+  const onSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Escape") { setQuery(""); return; }
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setSelectedIdx((i) => Math.min(i + 1, searchResults.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setSelectedIdx((i) => Math.max(i - 1, 0));
+    } else if (e.key === "Enter") {
+      const r = searchResults[selectedIdx];
+      if (r) { jumpToAndClose(r.typeId); inputRef.current?.blur(); }
+    }
+  };
+
   const jumpTo = (id: string) => {
     if (id === rootType) {
       popTo(-1);
@@ -77,6 +228,82 @@ export function TreePanel() {
 
   return (
     <div className="flex h-full min-h-0 flex-col [&_::-webkit-scrollbar]:w-0 [&_::-webkit-scrollbar]:h-0 [scrollbar-width:none]">
+      {/* Search input */}
+      <div className="border-b border-border px-3 py-2">
+        <div className="relative flex items-center">
+          <Search className="pointer-events-none absolute left-2 h-3 w-3 text-muted-foreground" />
+          <input
+            ref={inputRef}
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={onSearchKeyDown}
+            placeholder="Search types & fields…"
+            className="w-full rounded border border-border bg-background py-1.5 pl-7 pr-6 text-xs placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+          {query && (
+            <button
+              type="button"
+              onClick={() => { setQuery(""); inputRef.current?.focus(); }}
+              className="absolute right-2 text-muted-foreground hover:text-foreground"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Search results */}
+      {query.trim() && (
+        <div className="min-h-0 flex-1 overflow-auto">
+          {searchResults.length === 0 ? (
+            <div className="p-6 text-center text-xs text-muted-foreground">No results</div>
+          ) : (
+            <ul>
+              {searchResults.map((r, i) => {
+                const style = KIND_STYLES[r.typeKind];
+                const isSelected = i === selectedIdx;
+                return (
+                  <li key={`${r.typeId}:${r.fieldName ?? ""}:${i}`}>
+                    <button
+                      ref={isSelected ? selectedItemRef : undefined}
+                      type="button"
+                      onClick={() => jumpToAndClose(r.typeId)}
+                      onMouseEnter={() => setSelectedIdx(i)}
+                      className={cn(
+                        "flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-xs transition-colors",
+                        isSelected ? "bg-secondary" : "hover:bg-secondary/60",
+                      )}
+                    >
+                      <Badge className={cn("shrink-0 px-1.5 py-0 text-[9px] leading-4", style.badge)}>
+                        {style.label}
+                      </Badge>
+                      {r.fieldName ? (
+                        <span className="min-w-0 flex-1 truncate">
+                          <span className="text-muted-foreground">{r.typeName}.</span>
+                          <HighlightedText text={r.fieldName} indices={r.matchIndices} />
+                        </span>
+                      ) : (
+                        <span className="min-w-0 flex-1 truncate">
+                          <HighlightedText text={r.typeName} indices={r.matchIndices} />
+                        </span>
+                      )}
+                      {r.fieldType && (
+                        <span className="shrink-0 text-[10px] text-muted-foreground">
+                          {r.fieldType}
+                        </span>
+                      )}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {/* Normal tree (hidden while searching) */}
+      {!query.trim() && <>
       <div className="border-b border-border p-3">
         <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
           {name || "Schema"}
@@ -187,6 +414,7 @@ export function TreePanel() {
           />
         )}
       </div>
+      </>}
     </div>
   );
 }
@@ -376,3 +604,4 @@ function FieldRow({
     </button>
   );
 }
+
