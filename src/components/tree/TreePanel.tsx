@@ -77,7 +77,7 @@ function fuzzyScore(
   return { score, indices };
 }
 
-function HighlightedText({ text, indices }: { text: string; indices: number[] }) {
+function HighlightedText({ text, indices, className }: { text: string; indices: number[]; className?: string }) {
   const set = new Set(indices);
   const segs: { text: string; hi: boolean }[] = [];
   let i = 0;
@@ -89,7 +89,7 @@ function HighlightedText({ text, indices }: { text: string; indices: number[] })
     i = j;
   }
   return (
-    <span>
+    <span className={className}>
       {segs.map((s, k) =>
         s.hi ? (
           <span key={k} className="font-semibold text-primary">
@@ -182,51 +182,86 @@ export function TreePanel() {
     fieldType?: string;
     score: number;
     matchIndices: number[];
+    typeMatchIndices?: number[]; // set when query is "Type.field" form
   }
 
   const searchResults = useMemo<SearchResult[]>(() => {
     const q = query.trim();
     if (!q) return [];
     const out: SearchResult[] = [];
-    for (const node of graph.nodes) {
-      const tm = fuzzyScore(q, node.name);
-      if (tm) {
-        out.push({
-          typeId: node.id,
-          typeName: node.name,
-          typeKind: node.kind,
-          score: tm.score + 3,
-          matchIndices: tm.indices,
-        });
-      }
-      for (const f of node.fields ?? []) {
-        const fm = fuzzyScore(q, f.name);
-        if (fm) {
+
+    const dotIdx = q.indexOf(".");
+    if (dotIdx > 0) {
+      // "Type.field" mode: left side matches type name, right side matches field/value name.
+      const typePart = q.slice(0, dotIdx);
+      const fieldPart = q.slice(dotIdx + 1);
+      for (const node of graph.nodes) {
+        const tm = fuzzyScore(typePart, node.name);
+        if (!tm) continue;
+        const rowsF = node.fields ?? [];
+        const rowsV = node.values ?? [];
+        const rows: { name: string; type?: string }[] = [
+          ...rowsF.map((f) => ({ name: f.name, type: f.type })),
+          ...rowsV.map((v) => ({ name: v.name })),
+        ];
+        for (const row of rows) {
+          const fm = fieldPart ? fuzzyScore(fieldPart, row.name) : { score: 0, indices: [] as number[] };
+          if (!fm) continue;
           out.push({
             typeId: node.id,
             typeName: node.name,
             typeKind: node.kind,
-            fieldName: f.name,
-            fieldType: f.type,
-            score: fm.score,
+            fieldName: row.name,
+            fieldType: row.type,
+            score: tm.score + fm.score,
             matchIndices: fm.indices,
+            typeMatchIndices: tm.indices,
           });
         }
       }
-      for (const v of node.values ?? []) {
-        const vm = fuzzyScore(q, v.name);
-        if (vm) {
+    } else {
+      // Plain mode: fuzzy-match query against type names, field names, and enum values.
+      for (const node of graph.nodes) {
+        const tm = fuzzyScore(q, node.name);
+        if (tm) {
           out.push({
             typeId: node.id,
             typeName: node.name,
             typeKind: node.kind,
-            fieldName: v.name,
-            score: vm.score,
-            matchIndices: vm.indices,
+            score: tm.score + 3,
+            matchIndices: tm.indices,
           });
+        }
+        for (const f of node.fields ?? []) {
+          const fm = fuzzyScore(q, f.name);
+          if (fm) {
+            out.push({
+              typeId: node.id,
+              typeName: node.name,
+              typeKind: node.kind,
+              fieldName: f.name,
+              fieldType: f.type,
+              score: fm.score,
+              matchIndices: fm.indices,
+            });
+          }
+        }
+        for (const v of node.values ?? []) {
+          const vm = fuzzyScore(q, v.name);
+          if (vm) {
+            out.push({
+              typeId: node.id,
+              typeName: node.name,
+              typeKind: node.kind,
+              fieldName: v.name,
+              score: vm.score,
+              matchIndices: vm.indices,
+            });
+          }
         }
       }
     }
+
     out.sort((a, b) => b.score - a.score);
     return out.slice(0, 80);
   }, [query, graph.nodes]);
@@ -410,7 +445,12 @@ export function TreePanel() {
                       </Badge>
                       {r.fieldName ? (
                         <span className="min-w-0 flex-1 truncate">
-                          <span className="text-muted-foreground">{r.typeName}.</span>
+                          {r.typeMatchIndices ? (
+                            <HighlightedText text={r.typeName} indices={r.typeMatchIndices} className="text-muted-foreground" />
+                          ) : (
+                            <span className="text-muted-foreground">{r.typeName}</span>
+                          )}
+                          <span className="text-muted-foreground">.</span>
                           <HighlightedText text={r.fieldName} indices={r.matchIndices} />
                         </span>
                       ) : (

@@ -93,8 +93,8 @@ const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
 // "chrome" – card shape + header band only (zoom < LOD_BAR)
 // Tiers are cached separately so switching zoom never discards valid entries.
 type SpriteLOD = "full" | "bar" | "chrome";
-const LOD_FULL = 0.4;  // body text (10 px) ≈ 4 CSS px below this
-const LOD_BAR  = 0.12; // bars become sub-pixel below this
+const LOD_FULL = 0.22; // body text (10 px) ≈ 2 CSS px below this
+const LOD_BAR  = 0.07; // bars become sub-pixel below this
 
 function computeLOD(viewK: number): SpriteLOD {
   if (viewK >= LOD_FULL) return "full";
@@ -920,15 +920,17 @@ function drawFrame(
   ctx.lineJoin = "round";
   ctx.lineCap = "round";
 
-  // PASS A — edges. dim/active split is pre-computed in the edgeGroups
-  // memo (which depends on focusId), so this pass is just draw calls.
+  // PASS A — edges. Skipped entirely at "chrome" LOD (nodes are solid
+  // color pills; edges would only add visual noise at that scale).
   const DIM = 0.1;
   const vp: [number, number, number, number] = [vpLeft, vpTop, vpRight, vpBottom];
-  for (const g of edgeGroups.groups) {
-    drawEdgeBatch(ctx, g.dim, g.color, g.dash, ...vp, DIM);
-    drawEdgeBatch(ctx, g.active, g.color, g.dash, ...vp, 1);
+  if (lod !== "chrome") {
+    for (const g of edgeGroups.groups) {
+      drawEdgeBatch(ctx, g.dim, g.color, g.dash, ...vp, DIM);
+      drawEdgeBatch(ctx, g.active, g.color, g.dash, ...vp, 1);
+    }
+    ctx.setLineDash([]);
   }
-  ctx.setLineDash([]);
   void focusId; // used indirectly via edgeGroups + focus ring below
 
   // PASS B — nodes. One drawImage per visible node using the sprite
