@@ -315,21 +315,34 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
   // Edge groups — pre-partitioned by (color, dash) so the draw loop
   // doesn't re-partition every frame. Each group renders with one
   // beginPath / one stroke / one fill call regardless of edge count.
-  const edgeGroups = useMemo(() => {
-    const implementsGroup: LaidEdge[] = [];
-    const unionGroup: LaidEdge[] = [];
-    const fieldNullable: LaidEdge[] = [];
-    const fieldSolid: LaidEdge[] = [];
-    const argGroup: LaidEdge[] = [];
+  const edgeGroups = useMemo((): EdgeGroups => {
+    const buckets: [LaidEdge[], string, number[]][] = [
+      [[], "#6366f1", []],   // fieldSolid
+      [[], "#6366f1", [4, 3]], // fieldNullable
+      [[], "#eab308", []],  // union
+      [[], "#64748b", [6, 4]], // implements (muted-foreground fallback)
+      [[], "#f97316", [3, 3]], // arg
+    ];
     for (const e of laidEdges) {
-      if (e.kind === "implements") implementsGroup.push(e);
-      else if (e.kind === "union") unionGroup.push(e);
-      else if (e.kind === "arg") argGroup.push(e);
-      else if (e.kind === "field" && e.nullable) fieldNullable.push(e);
-      else fieldSolid.push(e);
+      if (e.kind === "implements") buckets[3]![0].push(e);
+      else if (e.kind === "union") buckets[2]![0].push(e);
+      else if (e.kind === "arg") buckets[4]![0].push(e);
+      else if (e.kind === "field" && e.nullable) buckets[1]![0].push(e);
+      else buckets[0]![0].push(e);
     }
-    return { implementsGroup, unionGroup, fieldNullable, fieldSolid, argGroup };
-  }, [laidEdges]);
+    const groups: EdgeGroupSpec[] = buckets.map(([edges, color, dash]) => {
+      if (!focusId) {
+        return { color, dash, dim: [], active: edges };
+      }
+      return {
+        color,
+        dash,
+        dim: edges.filter((e) => e.sourceId !== focusId && e.targetId !== focusId),
+        active: edges.filter((e) => e.sourceId === focusId || e.targetId === focusId),
+      };
+    });
+    return { groups };
+  }, [laidEdges, focusId]);
 
   const bounds = useMemo(() => {
     if (laidNodes.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
@@ -484,6 +497,18 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
   const hitTestFieldTarget = (worldX: number, worldY: number): string | null =>
     hitTestField(worldX, worldY)?.navigableTarget ?? null;
 
+  const hitTestNodeHeader = (worldX: number, worldY: number): string | null => {
+    for (const n of laidNodes) {
+      const left = n.cx - n.w / 2;
+      const right = n.cx + n.w / 2;
+      const top = n.cy - n.h / 2;
+      if (worldX >= left && worldX <= right && worldY >= top && worldY <= top + HEADER_H) {
+        return n.id;
+      }
+    }
+    return null;
+  };
+
   const onMouseDown = (e: React.MouseEvent) => {
     dragRef.current = {
       active: true,
@@ -541,12 +566,13 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
     }
   };
   const onClick = (e: React.MouseEvent) => {
-    if (!onNavigate) return;
     if (dragRef.current.moved) return;
     const world = screenToWorld(e.clientX, e.clientY);
     if (!world) return;
-    const hit = hitTestFieldTarget(world.x, world.y);
-    if (hit) onNavigate(hit);
+    const fieldHit = hitTestFieldTarget(world.x, world.y);
+    if (fieldHit) { onNavigate?.(fieldHit); return; }
+    const nodeId = hitTestNodeHeader(world.x, world.y);
+    if (nodeId) { onNavigate?.(nodeId); return; }
   };
 
   // Touch gestures: 1-finger pan, 2-finger pinch zoom, tap-to-navigate.
@@ -789,12 +815,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
 
 // ─── Draw frame ──────────────────────────────────────────────────────
 
+interface EdgeGroupSpec {
+  color: string;
+  dash: number[];
+  dim: LaidEdge[];
+  active: LaidEdge[];
+}
+
 interface EdgeGroups {
-  implementsGroup: LaidEdge[];
-  unionGroup: LaidEdge[];
-  fieldNullable: LaidEdge[];
-  fieldSolid: LaidEdge[];
-  argGroup: LaidEdge[];
+  groups: EdgeGroupSpec[];
 }
 
 function drawFrame(
@@ -810,7 +839,7 @@ function drawFrame(
   hoveredField: { nodeId: string; fieldIndex: number } | null,
   spriteCache: Map<string, HTMLCanvasElement>,
   spriteDprLevel: number,
-) {
+): void {
   const dpr = window.devicePixelRatio || 1;
   const targetW = Math.ceil(size.w * dpr);
   const targetH = Math.ceil(size.h * dpr);
@@ -841,14 +870,16 @@ function drawFrame(
   ctx.lineJoin = "round";
   ctx.lineCap = "round";
 
-  // PASS A — edges, batched by style. Each group is one beginPath/
-  // stroke and one beginPath/fill regardless of member count.
-  drawEdgeBatch(ctx, edgeGroups.implementsGroup, mutedFg, [6, 4], vpLeft, vpTop, vpRight, vpBottom);
-  drawEdgeBatch(ctx, edgeGroups.unionGroup, "#eab308", [], vpLeft, vpTop, vpRight, vpBottom);
-  drawEdgeBatch(ctx, edgeGroups.fieldNullable, "#6366f1", [4, 3], vpLeft, vpTop, vpRight, vpBottom);
-  drawEdgeBatch(ctx, edgeGroups.fieldSolid, "#6366f1", [], vpLeft, vpTop, vpRight, vpBottom);
-  drawEdgeBatch(ctx, edgeGroups.argGroup, "#f97316", [3, 3], vpLeft, vpTop, vpRight, vpBottom);
+  // PASS A — edges. dim/active split is pre-computed in the edgeGroups
+  // memo (which depends on focusId), so this pass is just draw calls.
+  const DIM = 0.1;
+  const vp: [number, number, number, number] = [vpLeft, vpTop, vpRight, vpBottom];
+  for (const g of edgeGroups.groups) {
+    drawEdgeBatch(ctx, g.dim, g.color, g.dash, ...vp, DIM);
+    drawEdgeBatch(ctx, g.active, g.color, g.dash, ...vp, 1);
+  }
   ctx.setLineDash([]);
+  void focusId; // used indirectly via edgeGroups + focus ring below
 
   // PASS B — nodes. One drawImage per visible node using the sprite
   // cache. Sprites carry the full card (chrome + text) at the current
@@ -973,9 +1004,12 @@ function drawEdgeBatch(
   vpTop: number,
   vpRight: number,
   vpBottom: number,
+  alpha = 1,
 ) {
   if (edges.length === 0) return;
 
+  ctx.save();
+  ctx.globalAlpha = alpha;
   // One path for every stroke in this style group.
   ctx.strokeStyle = color;
   ctx.setLineDash(dash);
@@ -1032,6 +1066,7 @@ function drawEdgeBatch(
     ctx.closePath();
   }
   ctx.fill();
+  ctx.restore();
 }
 
 // ─── Sprite cache ────────────────────────────────────────────────────

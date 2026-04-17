@@ -648,16 +648,9 @@ function TypeDetail({
       ) : (
         <ul className="space-y-0.5 font-mono text-xs">
           {node.fields?.map((f) => {
-            const inputArgs = (f.args ?? []).filter((a) => {
-              if (BUILTIN.has(a.typeName)) return false;
-              return nodesById.get(a.typeName)?.kind === "Input";
-            });
+            // Only show the return type in the chain — Input args are
+            // visible on hover via the argsDetail list, not inline.
             const chain: ChainItem[] = [
-              ...inputArgs.map((a) => ({
-                label: a.type,
-                typeName: a.typeName,
-                navigable: chainNavigable(a.typeName),
-              })),
               {
                 label: f.type,
                 typeName: f.typeName,
@@ -671,7 +664,7 @@ function TypeDetail({
                   label={f.name}
                   chain={chain}
                   description={f.description}
-                  args={f.args}
+                  args={f.args?.map((a) => ({ ...a, navigable: isNavigable(a.typeName) }))}
                   onNavigate={onNavigate}
                 />
               </li>
@@ -703,14 +696,15 @@ function FieldRow({
   label: string;
   chain: ChainItem[];
   description?: string;
-  args?: { name: string; type: string; typeName: string }[];
+  args?: { name: string; type: string; typeName: string; navigable: boolean }[];
   onNavigate: (id: string) => void;
 }) {
   const [hovered, setHovered] = useState(false);
-  const single = chain.length === 1 ? chain[0]! : null;
-
   const requiredArgCount = args?.filter((a) => a.type.endsWith("!")).length ?? 0;
   const hasArgs = (args?.length ?? 0) > 0;
+  // Args are rendered as inner buttons, so we must use div mode (not
+  // button mode) whenever args are present to avoid button-in-button.
+  const single = chain.length === 1 && !hasArgs ? chain[0]! : null;
 
   const arityBadge = hasArgs ? (
     <span className="font-mono text-[10px] text-muted-foreground/60">
@@ -723,7 +717,18 @@ function FieldRow({
       {args!.map((a) => (
         <li key={a.name} className="flex items-center gap-1.5 font-mono text-[10px]">
           <span className="text-muted-foreground">{a.name}:</span>
-          <ColoredType type={a.type} />
+          {a.navigable ? (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onNavigate(a.typeName); }}
+              className="flex items-center gap-0.5 rounded px-0.5 hover:bg-secondary/80"
+            >
+              <ColoredType type={a.type} />
+              <ChevronRight className="h-2.5 w-2.5 text-muted-foreground" />
+            </button>
+          ) : (
+            <ColoredType type={a.type} />
+          )}
         </li>
       ))}
     </ul>
