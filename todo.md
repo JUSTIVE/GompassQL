@@ -1,5 +1,6 @@
 # TODO
 
-1. 목록에서 현재 선택한 노드 하이라이팅
-2. 노드에서 필드의 타입 누르면 해당 타입의 노드로 이동
-3. New 페이지에 히스토리 쌓기(최대10개, 값 해싱해서 중복 안되게, 중복되면 최신으로 갱신, 추가/갱신한 일자, 기록 초기화)
+1. ~~텍스트 해상도 높이기~~ ✅ memoryCappedDpr budget 1250→5000
+2. ~~초기 로드 시 배경색 테마에 맞게 변경하기~~ ✅ default dark + initBgHex
+3. ~~lod 전환시 렉~~ ✅ progressive sprite build (4ms/frame budget)
+4. ~~useEffect 줄이기~~ ✅ auto-fit + focus-pan merged

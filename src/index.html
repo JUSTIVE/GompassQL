@@ -4,6 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Graviz — GraphQL SDL visualizer</title>
+    <script>
+      // Apply dark class before first paint to prevent white flash.
+      // Runs synchronously in <head>, before any CSS or React loads.
+      (function(){
+        try {
+          var t = localStorage.getItem("gompassql:theme");
+          var dark = t === "dark" || (!t && (!window.matchMedia || window.matchMedia("(prefers-color-scheme:dark)").matches));
+          if (t !== "light" && dark) document.documentElement.classList.add("dark");
+        } catch(e){}
+      })();
+    </script>
     <script type="module" src="./frontend.tsx" async></script>
   </head>
   <body>

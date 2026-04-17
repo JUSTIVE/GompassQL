@@ -114,7 +114,9 @@ function idealSpriteDpr(viewK: number): number {
 
 function memoryCappedDpr(ideal: number, nodeCount: number): number {
   if (nodeCount <= 0) return ideal;
-  const cap = Math.max(1, Math.floor(Math.sqrt(1250 / nodeCount)));
+  // Budget raised so 400-node schemas still get DPR≥2 on retina.
+  // Old 1250 forced DPR=1 at 400 nodes → blurry text.
+  const cap = Math.max(1, Math.floor(Math.sqrt(5000 / nodeCount)));
   return Math.max(1, Math.min(ideal, cap));
 }
 
@@ -594,8 +596,21 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const spriteDprRef = useRef(0);
   const nodeSpritesRef = useRef(new Map<string, Sprite>());
 
+  // Progressive sprite build queue — filled by the node useEffect,
+  // drained by the ticker a few nodes per frame (budget-limited).
+  interface SpriteBuildQueue {
+    nodes: LaidNode[];
+    lod: SpriteLOD;
+    dpr: number;
+    spriteCtx: SpriteCtx;
+    dimNodeIds: Set<string>;
+  }
+  const spriteBuildQueueRef = useRef<SpriteBuildQueue | null>(null);
+
   // FPS state for overlay
   const [fpsDisplay, setFpsDisplay] = useState(0);
+  const fpsHistoryRef = useRef<number[]>(new Array(60).fill(0));
+  const chartCanvasRef = useRef<HTMLCanvasElement>(null);
 
   useLayoutEffect(() => {
     const el = containerRef.current;
@@ -806,36 +821,39 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     return { minX, minY, maxX, maxY };
   }, [laidNodes]);
 
-  // Auto-fit
+  // Auto-fit + focus pan (merged into one effect to reduce effect count).
+  // Auto-fit runs once per unique (nodeCount, viewport size) to center the
+  // whole graph. Focus pan runs on explicit type selection in the tree.
   const fittedKey = useRef("");
-  useEffect(() => {
-    if (laidNodes.length === 0 || size.w <= 1) return;
-    const key = `${laidNodes.length}:${Math.round(size.w)}:${Math.round(size.h)}`;
-    if (fittedKey.current === key) return;
-    fittedKey.current = key;
-    const pad = 80;
-    const gW = bounds.maxX - bounds.minX + pad * 2;
-    const gH = bounds.maxY - bounds.minY + pad * 2;
-    const k = Math.min(size.w / gW, size.h / gH, 1.4);
-    const cx = (bounds.minX + bounds.maxX) / 2;
-    const cy = (bounds.minY + bounds.maxY) / 2;
-    viewRef.current = { x: size.w / 2 - cx * k, y: size.h / 2 - cy * k, k };
-  }, [laidNodes, size, bounds]);
-
-  // Focus pan + zoom
   const FOCUS_MIN_ZOOM = 0.9;
   useEffect(() => {
-    if (!focusId || focusId === rootId || size.w <= 1) return;
-    const n = nodeById.get(focusId);
-    if (!n) return;
-    const v = viewRef.current;
-    const k = Math.max(v.k, FOCUS_MIN_ZOOM);
-    viewRef.current = {
-      k,
-      x: size.w / 2 - n.cx * k,
-      y: size.h / 2 - n.cy * k,
-    };
-  }, [focusId, nodeById, size.w, size.h]);
+    if (laidNodes.length === 0 || size.w <= 1) return;
+    // Auto-fit: only fires when the key changes (new layout or resize)
+    const key = `${laidNodes.length}:${Math.round(size.w)}:${Math.round(size.h)}`;
+    if (fittedKey.current !== key) {
+      fittedKey.current = key;
+      const pad = 80;
+      const gW = bounds.maxX - bounds.minX + pad * 2;
+      const gH = bounds.maxY - bounds.minY + pad * 2;
+      const k = Math.min(size.w / gW, size.h / gH, 1.4);
+      const cx = (bounds.minX + bounds.maxX) / 2;
+      const cy = (bounds.minY + bounds.maxY) / 2;
+      viewRef.current = { x: size.w / 2 - cx * k, y: size.h / 2 - cy * k, k };
+    }
+    // Focus pan: centers + zooms to the focused type
+    if (focusId && focusId !== rootId) {
+      const n = nodeById.get(focusId);
+      if (n) {
+        const v = viewRef.current;
+        const k = Math.max(v.k, FOCUS_MIN_ZOOM);
+        viewRef.current = {
+          k,
+          x: size.w / 2 - n.cx * k,
+          y: size.h / 2 - n.cy * k,
+        };
+      }
+    }
+  }, [laidNodes, size, bounds, focusId, nodeById]);
 
   // Wheel zoom
   useEffect(() => {
@@ -1156,8 +1174,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       mountEl.appendChild(app.canvas as HTMLCanvasElement);
 
       // Scene graph
+      // Build the dot grid texture immediately so the grid doesn't
+      // start as a solid white Texture.WHITE covering the dark bg.
+      const initMutedFg = getComputedCssVar("--muted-foreground", "#64748b");
+      const initGridTex = buildDotGridTexture(cssColorToHex(initMutedFg), 0.18);
       const gridTiling = new TilingSprite({
-        texture: Texture.WHITE,
+        texture: initGridTex,
         width: size.w,
         height: size.h,
       });
@@ -1291,15 +1313,70 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           }
         }
 
+        // Progressive sprite building — drain the queue a few nodes
+        // per frame (4ms budget) so LOD transitions never block.
+        const buildQ = spriteBuildQueueRef.current;
+        if (buildQ && buildQ.nodes.length > 0) {
+          const deadline = performance.now() + 4;
+          while (buildQ.nodes.length > 0 && performance.now() < deadline) {
+            const n = buildQ.nodes.pop()!;
+            const key = `${n.id}:${buildQ.lod}`;
+            if (textureCacheRef.current.has(key)) continue;
+            const pw = Math.ceil(n.w * buildQ.dpr);
+            const ph = Math.ceil(n.h * buildQ.dpr);
+            const can = document.createElement("canvas");
+            can.width = pw;
+            can.height = ph;
+            const c2d = can.getContext("2d");
+            if (c2d) {
+              c2d.setTransform(buildQ.dpr, 0, 0, buildQ.dpr, 0, 0);
+              drawNodeSprite(c2d, n, buildQ.spriteCtx, buildQ.lod);
+              const tex = Texture.from(can);
+              textureCacheRef.current.set(key, tex);
+              const spr = nodeSpritesRef.current.get(n.id);
+              if (spr) {
+                spr.texture = tex;
+                spr.tint = 0xffffff;
+              }
+            }
+          }
+          if (buildQ.nodes.length === 0) {
+            spriteBuildQueueRef.current = null;
+          }
+        }
+
         // FPS sampling
         const now = performance.now();
         fpsTimes.push(now);
         let lo = 0;
         while (lo < fpsTimes.length && now - fpsTimes[lo]! > 1000) lo++;
         if (lo > 0) fpsTimes.splice(0, lo);
-        if (now - lastFpsSampleAt >= 500) {
+        if (now - lastFpsSampleAt >= 200) {
           lastFpsSampleAt = now;
-          setFpsDisplay(fpsTimes.length);
+          const fps = fpsTimes.length;
+          setFpsDisplay(fps);
+          const hist = fpsHistoryRef.current;
+          hist.push(fps);
+          if (hist.length > 60) hist.shift();
+          // Draw chart directly — no React re-render needed.
+          const cc = chartCanvasRef.current;
+          if (cc) {
+            const cw = cc.width;
+            const ch = cc.height;
+            const cctx = cc.getContext("2d");
+            if (cctx) {
+              cctx.clearRect(0, 0, cw, ch);
+              const maxFps = 65;
+              const barW = cw / hist.length;
+              for (let i = 0; i < hist.length; i++) {
+                const v = hist[i]!;
+                const bh = Math.max(1, (v / maxFps) * ch);
+                const isLow = v < 30;
+                cctx.fillStyle = isLow ? "rgba(248,113,113,0.7)" : "rgba(148,163,184,0.35)";
+                cctx.fillRect(i * barW, ch - bh, Math.max(1, barW - 1), bh);
+              }
+            }
+          }
         }
       });
     });
@@ -1452,34 +1529,42 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const { dimNodeIds } = edgeGroups;
     const DIM = 0.1;
 
+    // Create placeholder sprites immediately (colored box via tint on
+    // a white 1×1 texture — near-zero cost). The ticker progressively
+    // builds real textures and swaps them in, so no single frame
+    // blocks for 400+ drawNodeSprite calls.
     for (const n of laidNodes) {
+      // Reuse cached texture if available (e.g. scrolling back to same LOD).
       const key = `${n.id}:${lod}`;
-      let tex = textureCacheRef.current.get(key);
-      if (!tex) {
-        const pw = Math.ceil(n.w * dpr);
-        const ph = Math.ceil(n.h * dpr);
-        const can = document.createElement("canvas");
-        can.width = pw;
-        can.height = ph;
-        const ctx = can.getContext("2d");
-        if (ctx) {
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          drawNodeSprite(ctx, n, spriteCtx, lod);
-          tex = Texture.from(can);
-          textureCacheRef.current.set(key, tex);
-        }
-      }
-      if (!tex) continue;
+      const cachedTex = textureCacheRef.current.get(key);
 
-      const sprite = new Sprite(tex);
+      const sprite = new Sprite(cachedTex ?? Texture.WHITE);
       sprite.position.set(n.cx - n.w / 2, n.cy - n.h / 2);
       sprite.width = n.w;
       sprite.height = n.h;
       sprite.alpha = dimNodeIds.has(n.id) ? DIM : 1;
       sprite.cullable = true;
+      if (!cachedTex) {
+        sprite.tint = cssColorToHex(KIND_COLORS[n.data.kind]);
+      }
 
       scene.nodeContainer.addChild(sprite);
       nodeSpritesRef.current.set(n.id, sprite);
+    }
+
+    // Queue progressive texture builds — the ticker drains this
+    // with a per-frame budget so LOD transitions don't jank.
+    const needBuild = laidNodes.filter(
+      (n) => !textureCacheRef.current.has(`${n.id}:${lod}`),
+    );
+    if (needBuild.length > 0) {
+      spriteBuildQueueRef.current = {
+        nodes: needBuild,
+        lod,
+        dpr,
+        spriteCtx,
+        dimNodeIds,
+      };
     }
   }, [laidNodes, themeResolved, edgeGroups, lodTick]);
 
@@ -1527,12 +1612,19 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         </div>
       )}
 
-      {/* FPS overlay */}
+      {/* FPS overlay with real-time chart */}
       <div
         ref={fpsOverlayRef}
         className="pointer-events-none absolute bottom-4 right-4 rounded-lg border border-border/20 bg-background/10 px-3 py-2 font-mono text-xs text-muted-foreground/60 backdrop-blur-sm"
-        style={{ minWidth: 120 }}
+        style={{ minWidth: 280 }}
       >
+        <canvas
+          ref={chartCanvasRef}
+          width={260}
+          height={48}
+          className="mb-1.5 rounded"
+          style={{ width: 260, height: 48, display: "block" }}
+        />
         <div className="flex items-baseline justify-between gap-4">
           <span>{fpsDisplay} fps</span>
           <span>{laidNodes.length} nodes · {laidEdges.length} edges</span>

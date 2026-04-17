@@ -24,9 +24,16 @@ function systemPrefers(): ResolvedTheme {
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [theme, setThemeState] = useState<Theme>(() => {
-    if (typeof window === "undefined") return "system";
+    if (typeof window === "undefined") return "dark";
     const saved = window.localStorage.getItem(STORAGE_KEY) as Theme | null;
-    return saved ?? "dark";
+    const t = saved ?? "dark";
+    // Toggle .dark synchronously during state init — before the first
+    // paint — so CSS variables (--background etc.) resolve correctly
+    // from the very first frame. The useEffect below handles subsequent
+    // changes and system-preference listeners.
+    const applied: ResolvedTheme = t === "system" ? systemPrefers() : t;
+    document.documentElement.classList.toggle("dark", applied === "dark");
+    return t;
   });
   const [resolved, setResolved] = useState<ResolvedTheme>(() =>
     theme === "system" ? systemPrefers() : theme,
