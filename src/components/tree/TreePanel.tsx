@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Search, Share2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Clock, Search, Share2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
@@ -9,6 +9,34 @@ import { cn } from "@/lib/utils";
 
 const BUILTIN = new Set(["String", "Int", "Float", "Boolean", "ID"]);
 const ROOT_CANDIDATES = ["Query", "Mutation", "Subscription"];
+
+// ─── Search history ────────────────────────────────────────────────────
+
+const SEARCH_HISTORY_KEY = "graviz:search-history";
+const MAX_SEARCH_HISTORY = 10;
+
+function loadSearchHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(SEARCH_HISTORY_KEY);
+    if (!raw) return [];
+    const p = JSON.parse(raw);
+    return Array.isArray(p) ? p.filter((s): s is string => typeof s === "string") : [];
+  } catch { return []; }
+}
+
+function saveSearchHistory(qs: string[]): void {
+  try { localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(qs)); } catch {}
+}
+
+function pushSearchHistory(q: string, current: string[]): string[] {
+  const trimmed = q.trim();
+  if (!trimmed) return current;
+  const next = [trimmed, ...current.filter((s) => s !== trimmed)].slice(0, MAX_SEARCH_HISTORY);
+  saveSearchHistory(next);
+  return next;
+}
+
+// ─── Fuzzy search ──────────────────────────────────────────────────────
 
 function fuzzyScore(
   query: string,
@@ -89,8 +117,23 @@ export function TreePanel() {
   const [allTypesOpen, setAllTypesOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [selectedIdx, setSelectedIdx] = useState(0);
+  const [inputFocused, setInputFocused] = useState(false);
+  const [searchHistory, setSearchHistory] = useState<string[]>(() => loadSearchHistory());
   const inputRef = useRef<HTMLInputElement>(null);
   const selectedItemRef = useRef<HTMLButtonElement>(null);
+
+  // Cmd+K / Ctrl+K → focus search input
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        inputRef.current?.focus();
+        inputRef.current?.select();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
 
   const byId = useMemo(
     () => new Map(visibleNodes.map((n) => [n.id, n])),
@@ -188,13 +231,19 @@ export function TreePanel() {
     selectedItemRef.current?.scrollIntoView({ block: "nearest" });
   }, [selectedIdx]);
 
+  const saveQueryToHistory = (q: string) => {
+    setSearchHistory((h) => pushSearchHistory(q, h));
+  };
+
   const jumpToAndClose = (id: string) => {
+    if (query.trim()) saveQueryToHistory(query);
     jumpTo(id);
     setQuery("");
+    inputRef.current?.blur();
   };
 
   const onSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Escape") { setQuery(""); return; }
+    if (e.key === "Escape") { setQuery(""); inputRef.current?.blur(); return; }
     if (e.key === "ArrowDown") {
       e.preventDefault();
       setSelectedIdx((i) => Math.min(i + 1, searchResults.length - 1));
@@ -203,8 +252,21 @@ export function TreePanel() {
       setSelectedIdx((i) => Math.max(i - 1, 0));
     } else if (e.key === "Enter") {
       const r = searchResults[selectedIdx];
-      if (r) { jumpToAndClose(r.typeId); inputRef.current?.blur(); }
+      if (r) jumpToAndClose(r.typeId);
     }
+  };
+
+  const removeHistoryItem = (q: string) => {
+    setSearchHistory((h) => {
+      const next = h.filter((s) => s !== q);
+      saveSearchHistory(next);
+      return next;
+    });
+  };
+
+  const clearAllHistory = () => {
+    setSearchHistory([]);
+    saveSearchHistory([]);
   };
 
   const jumpTo = (id: string) => {
@@ -238,10 +300,12 @@ export function TreePanel() {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={onSearchKeyDown}
+            onFocus={() => setInputFocused(true)}
+            onBlur={() => setTimeout(() => setInputFocused(false), 150)}
             placeholder="Search types & fields…"
             className="w-full rounded border border-border bg-background py-1.5 pl-7 pr-6 text-xs placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
-          {query && (
+          {query ? (
             <button
               type="button"
               onClick={() => { setQuery(""); inputRef.current?.focus(); }}
@@ -249,9 +313,53 @@ export function TreePanel() {
             >
               <X className="h-3 w-3" />
             </button>
+          ) : (
+            <span className="pointer-events-none absolute right-2 font-mono text-[10px] text-muted-foreground/50">
+              ⌘K
+            </span>
           )}
         </div>
       </div>
+
+      {/* Recent search history (shown when focused + query empty) */}
+      {inputFocused && !query.trim() && searchHistory.length > 0 && (
+        <div className="min-h-0 flex-1 overflow-auto">
+          <div className="flex items-center justify-between px-3 py-1.5">
+            <span className="text-[10px] uppercase tracking-wider text-muted-foreground">Recent</span>
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={clearAllHistory}
+              className="text-[10px] text-muted-foreground hover:text-foreground"
+            >
+              Clear all
+            </button>
+          </div>
+          <ul>
+            {searchHistory.map((q) => (
+              <li key={q} className="flex items-center">
+                <button
+                  type="button"
+                  className="flex flex-1 items-center gap-2 px-3 py-1.5 text-left font-mono text-xs hover:bg-secondary/60"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => setQuery(q)}
+                >
+                  <Clock className="h-3 w-3 shrink-0 text-muted-foreground" />
+                  <span className="truncate">{q}</span>
+                </button>
+                <button
+                  type="button"
+                  className="mr-3 shrink-0 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => removeHistoryItem(q)}
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* Search results */}
       {query.trim() && (
@@ -302,8 +410,8 @@ export function TreePanel() {
         </div>
       )}
 
-      {/* Normal tree (hidden while searching) */}
-      {!query.trim() && <>
+      {/* Normal tree (hidden while searching or showing history) */}
+      {!query.trim() && !(inputFocused && searchHistory.length > 0) && <>
       <div className="border-b border-border p-3">
         <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
           {name || "Schema"}

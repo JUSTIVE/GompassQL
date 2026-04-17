@@ -696,9 +696,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
     };
   }, []);
 
-  // RAF-coalesced draw. Every effect-triggering change enqueues one
-  // frame; any enqueues before the frame fires collapse into that
-  // frame. Prevents back-pressure during rapid pan/zoom events.
+  // Draw loop. When a node is focused, run a continuous RAF loop so the
+  // focus ring pulse animates smoothly. Otherwise run one-shot to avoid
+  // unnecessary per-frame work during idle.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -706,8 +706,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
     if (!ctx) return;
 
     if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
-    rafRef.current = requestAnimationFrame(() => {
-      rafRef.current = null;
+
+    const draw = () => {
       drawFrame(
         canvas,
         ctx,
@@ -722,7 +722,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
         spriteCache,
         spriteDprLevel,
       );
-    });
+    };
+
+    if (focusId) {
+      const loop = () => {
+        rafRef.current = requestAnimationFrame(loop);
+        draw();
+      };
+      rafRef.current = requestAnimationFrame(loop);
+    } else {
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        draw();
+      });
+    }
 
     return () => {
       if (rafRef.current != null) {
@@ -871,25 +884,48 @@ function drawFrame(
     }
   }
 
-  // PASS C — focus ring on top.
+  // PASS C — focus ring + expanding ripple pulse.
   if (focusId) {
     const n = nodeById.get(focusId);
     if (n) {
       const color = KIND_COLORS[n.data.kind];
+
+      // Ripple: t goes 0→1 over 1.6 s, then restarts.
+      const t = (performance.now() % 1600) / 1600;
+      const ripplePad = t * 18;
+      const rippleAlpha = (1 - t) * 0.6;
+
       ctx.save();
-      // Subtle fill over the whole card.
-      ctx.fillStyle = color;
-      ctx.globalAlpha = 0.05;
-      roundRect(ctx, n.cx - n.w / 2, n.cy - n.h / 2, n.w, n.h, 6);
-      ctx.fill();
-      // Wide, soft ring.
-      ctx.globalAlpha = 0.5;
-      ctx.shadowColor = color;
-      ctx.shadowBlur = 18;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = rippleAlpha;
+      roundRect(
+        ctx,
+        n.cx - n.w / 2 - ripplePad,
+        n.cy - n.h / 2 - ripplePad,
+        n.w + ripplePad * 2,
+        n.h + ripplePad * 2,
+        6 + ripplePad,
+      );
+      ctx.stroke();
+      ctx.restore();
+
+      // Static base ring, always visible.
+      ctx.save();
       ctx.strokeStyle = color;
       ctx.lineWidth = 2.5;
-      const pad = 5;
-      roundRect(ctx, n.cx - n.w / 2 - pad, n.cy - n.h / 2 - pad, n.w + pad * 2, n.h + pad * 2, 10);
+      ctx.globalAlpha = 0.75;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 10;
+      const pad = 3;
+      roundRect(
+        ctx,
+        n.cx - n.w / 2 - pad,
+        n.cy - n.h / 2 - pad,
+        n.w + pad * 2,
+        n.h + pad * 2,
+        9,
+      );
       ctx.stroke();
       ctx.restore();
     }
