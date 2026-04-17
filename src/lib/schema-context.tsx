@@ -72,14 +72,41 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     return reachableFrom(graph.nodes, graph.edges, effectiveRoot);
   }, [graph, effectiveRoot]);
 
-  const visibleNodes = useMemo(() => {
-    if (!hidePrimitiveFields) return visible.nodes;
-    return visible.nodes.map((n) => {
+  const { visibleNodes, visibleEdges } = useMemo(() => {
+    if (!hidePrimitiveFields) {
+      return { visibleNodes: visible.nodes, visibleEdges: visible.edges };
+    }
+
+    // Build per-node old-index → new-index maps for fields that survive the filter.
+    const indexRemap = new Map<string, Map<number, number>>();
+    const nodes = visible.nodes.map((n) => {
       if (!n.fields) return n;
-      const fields = n.fields.filter((f) => !BUILTIN_SCALARS.has(f.typeName));
-      return fields.length === n.fields.length ? n : { ...n, fields };
+      let newIdx = 0;
+      const remap = new Map<number, number>();
+      const fields = n.fields.filter((f, oldIdx) => {
+        if (BUILTIN_SCALARS.has(f.typeName)) return false;
+        remap.set(oldIdx, newIdx++);
+        return true;
+      });
+      if (fields.length === n.fields.length) return n;
+      indexRemap.set(n.id, remap);
+      return { ...n, fields };
     });
-  }, [visible.nodes, hidePrimitiveFields]);
+
+    // Remap sourceFieldIndex on edges whose source node had fields removed.
+    const edges = visible.edges.map((e) => {
+      if (e.sourceFieldIndex == null) return e;
+      const remap = indexRemap.get(e.source);
+      if (!remap) return e;
+      const newIdx = remap.get(e.sourceFieldIndex);
+      if (newIdx === e.sourceFieldIndex) return e;
+      // newIdx undefined means the field itself was removed — keep edge as-is
+      // (primitive-typed fields never produce edges, so this shouldn't happen)
+      return newIdx != null ? { ...e, sourceFieldIndex: newIdx } : e;
+    });
+
+    return { visibleNodes: nodes, visibleEdges: edges };
+  }, [visible.nodes, visible.edges, hidePrimitiveFields]);
 
   const setSchema = useCallback(
     ({ sdl: nextSdl, name: nextName }: { sdl: string; name?: string }) => {
@@ -131,7 +158,7 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     graph,
     hasSchema: graph.nodes.length > 0,
     visibleNodes,
-    visibleEdges: visible.edges,
+    visibleEdges,
     setSchema,
     clearSchema,
     rootType: effectiveRoot,

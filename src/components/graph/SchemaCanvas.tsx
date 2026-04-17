@@ -1237,7 +1237,8 @@ function drawNodeSprite(
       ctx.globalAlpha = 0.35;
       roundRect(ctx, 10, fy, avail * ff, 4, 2);
       ctx.fill();
-      ctx.fillStyle = mutedFg;
+      ctx.fillStyle = "#f59e0b"; // amber-400
+      ctx.globalAlpha = 0.45;
       roundRect(ctx, w - 10 - typeBarW, fy, typeBarW, 4, 2);
       ctx.fill();
       ctx.globalAlpha = 1;
