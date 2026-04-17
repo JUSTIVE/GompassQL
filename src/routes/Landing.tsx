@@ -6,6 +6,7 @@ import {
   History,
   Sparkles,
   Trash2,
+  TriangleAlert,
   Upload,
   Wand2,
   X,
@@ -44,6 +45,7 @@ export function LandingRoute() {
   const [sdl, setSdl] = useState("");
   const [derivedName, setDerivedName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
@@ -78,6 +80,7 @@ export function LandingRoute() {
       setSdl(text);
       setDerivedName(nameFromFile(file));
       setError(null);
+      setWarnings([]);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to read file.");
     }
@@ -117,18 +120,27 @@ export function LandingRoute() {
     const trimmed = sdl.trim();
     if (!trimmed) {
       setError("Paste an SDL or drop a .graphql file.");
+      setWarnings([]);
       return null;
     }
     const graph = sdlToGraph(trimmed);
     if (graph.error) {
       setError(graph.error);
+      setWarnings([]);
       return null;
     }
     if (graph.nodes.length === 0) {
       setError("No types found in this SDL.");
+      setWarnings([]);
+      return null;
+    }
+    if (graph.warnings.length > 0) {
+      setError(null);
+      setWarnings(graph.warnings);
       return null;
     }
     setError(null);
+    setWarnings([]);
     return { sdl: trimmed, name: derivedName ?? defaultName() };
   };
 
@@ -144,6 +156,7 @@ export function LandingRoute() {
     setSdl(entry.sdl);
     setDerivedName(entry.name);
     setError(null);
+    setWarnings([]);
   };
 
   const deleteHistoryEntry = (hash: string) => {
@@ -290,17 +303,29 @@ export function LandingRoute() {
           onChange={(v) => {
             setSdl(v);
             if (derivedName) setDerivedName(null);
+            if (warnings.length) setWarnings([]);
           }}
           placeholder="# Paste your GraphQL SDL here…"
         />
       </div>
 
-      {error ? (
+      {error && (
         <div className="flex max-h-32 shrink-0 items-start gap-2 overflow-auto rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
           <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
           <pre className="whitespace-pre-wrap font-mono">{error}</pre>
         </div>
-      ) : null}
+      )}
+      {warnings.length > 0 && (
+        <div className="shrink-0 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-400">
+          <div className="mb-1.5 flex items-center gap-1.5 font-medium">
+            <TriangleAlert className="h-3.5 w-3.5 shrink-0" />
+            Schema has duplicate type declarations — fix before visualizing
+          </div>
+          <ul className="space-y-0.5 font-mono">
+            {warnings.map((w) => <li key={w}>{w}</li>)}
+          </ul>
+        </div>
+      )}
 
       <div className="flex shrink-0 flex-wrap justify-end gap-2">
         <Button onClick={visualize} size="lg" className="gap-2">

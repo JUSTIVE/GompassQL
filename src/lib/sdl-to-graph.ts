@@ -1,4 +1,4 @@
-import { Kind, parse, type ConstDirectiveNode, type TypeNode } from "graphql";
+import { getLocation, Kind, parse, type ConstDirectiveNode, type TypeNode } from "graphql";
 
 export type NodeKind = "Object" | "Interface" | "Union" | "Enum" | "Scalar" | "Input";
 
@@ -47,6 +47,7 @@ export interface ParsedGraph {
   nodes: GraphNodeData[];
   edges: GraphEdgeData[];
   error: string | null;
+  warnings: string[];
 }
 
 const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
@@ -103,15 +104,32 @@ function renderType(t: TypeNode): { rendered: string; base: string } {
 export function sdlToGraph(sdl: string): ParsedGraph {
   const nodes: GraphNodeData[] = [];
 
-  if (!sdl.trim()) return { nodes: [], edges: [], error: null };
+  if (!sdl.trim()) return { nodes: [], edges: [], error: null, warnings: [] };
 
   let doc;
   try {
     doc = parse(sdl);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return { nodes: [], edges: [], error: msg };
+    return { nodes: [], edges: [], error: msg, warnings: [] };
   }
+
+  // Detect duplicate type declarations before building the graph.
+  const nameLocs = new Map<string, Array<{ line: number; column: number }>>();
+  for (const def of doc.definitions) {
+    if ("name" in def && def.name && def.loc) {
+      const name = def.name.value;
+      const pos = getLocation(def.loc.source, def.loc.start);
+      if (!nameLocs.has(name)) nameLocs.set(name, []);
+      nameLocs.get(name)!.push({ line: pos.line, column: pos.column });
+    }
+  }
+  const duplicateWarnings = [...nameLocs.entries()]
+    .filter(([, locs]) => locs.length > 1)
+    .map(([name, locs]) => {
+      const positions = locs.map((l) => `${l.line}:${l.column}`).join(", ");
+      return `Duplicate type "${name}" at ${positions}`;
+    });
 
   for (const def of doc.definitions) {
     switch (def.kind) {
@@ -251,7 +269,6 @@ export function sdlToGraph(sdl: string): ParsedGraph {
     if (n.fields) {
       for (let fi = 0; fi < n.fields.length; fi++) {
         const field = n.fields[fi]!;
-        if (BUILTIN_SCALARS.has(field.typeName)) continue;
         if (field.typeName === n.name) continue;
 
         // Collect Input-typed args (in declaration order) to build a
@@ -262,8 +279,19 @@ export function sdlToGraph(sdl: string): ParsedGraph {
             (tn) => !BUILTIN_SCALARS.has(tn) && nodeKindById.get(tn) === "Input",
           );
 
+        const returnIsScalar = BUILTIN_SCALARS.has(field.typeName);
+
+        // Skip fields that have neither a non-scalar return type nor any
+        // Input-typed args — there is nothing useful to connect in the graph.
+        if (returnIsScalar && inputArgTypeNames.length === 0) continue;
+
         if (inputArgTypeNames.length > 0) {
-          const chain = [...inputArgTypeNames, field.typeName];
+          // Chain: parent → input0 → … → returnType.
+          // When the return type is a scalar it carries no graph node, so
+          // omit it from the chain to avoid dangling targets.
+          const chain = returnIsScalar
+            ? inputArgTypeNames
+            : [...inputArgTypeNames, field.typeName];
           for (let ci = 0; ci < chain.length; ci++) {
             const src = ci === 0 ? n.name : chain[ci - 1]!;
             const tgt = chain[ci]!;
@@ -326,5 +354,5 @@ export function sdlToGraph(sdl: string): ParsedGraph {
   const keptIds = new Set(keptNodes.map((n) => n.id));
   const edges = rawEdges.filter((e) => keptIds.has(e.target) && keptIds.has(e.source));
 
-  return { nodes: keptNodes, edges, error: null };
+  return { nodes: keptNodes, edges, error: null, warnings: duplicateWarnings };
 }

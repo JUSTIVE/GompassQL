@@ -28,7 +28,7 @@ interface SchemaContextValue {
   setHidePrimitiveFields: (v: boolean) => void;
 }
 
-const EMPTY: ParsedGraph = { nodes: [], edges: [], error: null };
+const EMPTY: ParsedGraph = { nodes: [], edges: [], error: null, warnings: [] };
 const STORAGE_KEY = "gompassql:current";
 const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
 

@@ -149,7 +149,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     moved: false,
   });
   const rafRef = useRef<number | null>(null);
-  const hoveredFieldRef = useRef<{ nodeId: string; fieldIndex: number } | null>(null);
+  const hoveredFieldRef = useRef<{ nodeId: string; fieldIndex: number; isRelayHover: boolean } | null>(null);
   const hoveredNodeRef = useRef<string | null>(null);
   const [cursor, setCursor] = useState<"grab" | "pointer">("grab");
   const { resolved: themeResolved } = useTheme();
@@ -474,13 +474,14 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const hitTestField = (
     worldX: number,
     worldY: number,
-  ): { nodeId: string; fieldIndex: number; navigableTarget: string | null } | null => {
+  ): { nodeId: string; fieldIndex: number; navigableTarget: string | null; isRelayHover: boolean } | null => {
     for (const n of laidNodes) {
       const left = n.cx - n.w / 2;
       const right = n.cx + n.w / 2;
       const top = n.cy - n.h / 2;
       const bottom = n.cy + n.h / 2;
       if (worldX < left || worldX > right || worldY < top || worldY > bottom) continue;
+      const localX = worldX - left;
       const localY = worldY - top;
       const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
       if (localY < bodyTop) return null;
@@ -491,18 +492,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         if (!f) return null;
         const nav =
           !BUILTIN_SCALARS.has(f.typeName) && nodeById.has(f.typeName) ? f.typeName : null;
-        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav };
+        // Relay icon sits in the right ~40 px of the row.
+        const isRelayHover = !!f.isRelayConnection && localX > n.w - 44;
+        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav, isRelayHover };
       }
       if (data.kind === "Union") {
         const m = data.members?.[rowIdx];
         if (!m) return null;
         const nav = !BUILTIN_SCALARS.has(m) && nodeById.has(m) ? m : null;
-        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav };
+        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav, isRelayHover: false };
       }
       if (data.kind === "Enum") {
         const v = data.values?.[rowIdx];
         if (!v) return null;
-        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: null };
+        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: null, isRelayHover: false };
       }
       return null;
     }
@@ -576,9 +579,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       prev !== null &&
       hit !== null &&
       prev.nodeId === hit.nodeId &&
-      prev.fieldIndex === hit.fieldIndex;
+      prev.fieldIndex === hit.fieldIndex &&
+      prev.isRelayHover === hit.isRelayHover;
     if (!same) {
-      hoveredFieldRef.current = hit ? { nodeId: hit.nodeId, fieldIndex: hit.fieldIndex } : null;
+      hoveredFieldRef.current = hit
+        ? { nodeId: hit.nodeId, fieldIndex: hit.fieldIndex, isRelayHover: hit.isRelayHover }
+        : null;
     }
     hoveredNodeRef.current = hoveredNode;
   };
@@ -853,7 +859,7 @@ function drawFrame(
   focusId: string | null,
   dimNodeIds: Set<string>,
   hoveredNodeId: string | null,
-  hoveredField: { nodeId: string; fieldIndex: number } | null,
+  hoveredField: { nodeId: string; fieldIndex: number; isRelayHover: boolean } | null,
   spriteCache: Map<string, HTMLCanvasElement>,
   spriteDprRef: { current: number },
   fpsRef: { current: { times: number[]; history: number[]; lastSampleAt: number } },
@@ -1097,6 +1103,53 @@ function drawFrame(
 
         ctx.restore();
       }
+    }
+  }
+
+  // PASS D.2 — Relay Connection tooltip (screen space).
+  if (hoveredField?.isRelayHover) {
+    const n = nodeById.get(hoveredField.nodeId);
+    if (n) {
+      const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
+      const rowCentreY = (n.cy - n.h / 2) + bodyTop + hoveredField.fieldIndex * ROW_H + ROW_H / 2;
+      const sx = (n.cx + n.w / 2) * view.k + view.x + 10;
+      const sy = rowCentreY * view.k + view.y;
+
+      ctx.save();
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.font = `500 11px ${MONO}`;
+
+      const LABEL = "Relay Connection";
+      const PAD_X = 8;
+      const TIP_H = 22;
+      const TIP_W = ctx.measureText(LABEL).width + PAD_X * 2;
+
+      const canvasW = canvas.width / dpr;
+      const canvasH = canvas.height / dpr;
+      const tipX = sx + TIP_W > canvasW ? (n.cx - n.w / 2) * view.k + view.x - TIP_W - 10 : sx;
+      const tipY = Math.max(4, Math.min(canvasH - TIP_H - 4, sy - TIP_H / 2));
+
+      ctx.shadowColor = "rgba(0,0,0,0.18)";
+      ctx.shadowBlur = 6;
+      ctx.shadowOffsetY = 2;
+      ctx.fillStyle = cardColor;
+      ctx.globalAlpha = 0.97;
+      roundRect(ctx, tipX, tipY, TIP_W, TIP_H, 4);
+      ctx.fill();
+      ctx.shadowColor = "transparent";
+      ctx.shadowBlur = 0;
+      ctx.shadowOffsetY = 0;
+      ctx.strokeStyle = RELAY_COLOR;
+      ctx.lineWidth = 1;
+      ctx.globalAlpha = 0.65;
+      roundRect(ctx, tipX, tipY, TIP_W, TIP_H, 4);
+      ctx.stroke();
+
+      ctx.fillStyle = fgColor;
+      ctx.globalAlpha = 0.85;
+      ctx.fillText(LABEL, tipX + PAD_X, tipY + TIP_H / 2 + 4);
+
+      ctx.restore();
     }
   }
 
