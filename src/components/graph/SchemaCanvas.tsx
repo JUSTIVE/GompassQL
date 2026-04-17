@@ -128,6 +128,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
     moved: false,
   });
   const rafRef = useRef<number | null>(null);
+  const hoveredFieldRef = useRef<{ nodeId: string; fieldIndex: number } | null>(null);
   const [cursor, setCursor] = useState<"grab" | "pointer">("grab");
   const [spriteDprLevel, setSpriteDprLevel] = useState(initialSpriteDpr);
   const { resolved: themeResolved } = useTheme();
@@ -438,7 +439,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
     };
   };
 
-  const hitTestFieldTarget = (worldX: number, worldY: number): string | null => {
+  const hitTestField = (
+    worldX: number,
+    worldY: number,
+  ): { nodeId: string; fieldIndex: number; navigableTarget: string | null } | null => {
     for (const n of laidNodes) {
       const left = n.cx - n.w / 2;
       const right = n.cx + n.w / 2;
@@ -453,19 +457,28 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
       if (data.kind === "Object" || data.kind === "Interface" || data.kind === "Input") {
         const f = data.fields?.[rowIdx];
         if (!f) return null;
-        if (BUILTIN_SCALARS.has(f.typeName)) return null;
-        return nodeById.has(f.typeName) ? f.typeName : null;
+        const nav =
+          !BUILTIN_SCALARS.has(f.typeName) && nodeById.has(f.typeName) ? f.typeName : null;
+        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav };
       }
       if (data.kind === "Union") {
         const m = data.members?.[rowIdx];
         if (!m) return null;
-        if (BUILTIN_SCALARS.has(m)) return null;
-        return nodeById.has(m) ? m : null;
+        const nav = !BUILTIN_SCALARS.has(m) && nodeById.has(m) ? m : null;
+        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav };
+      }
+      if (data.kind === "Enum") {
+        const v = data.values?.[rowIdx];
+        if (!v) return null;
+        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: null };
       }
       return null;
     }
     return null;
   };
+
+  const hitTestFieldTarget = (worldX: number, worldY: number): string | null =>
+    hitTestField(worldX, worldY)?.navigableTarget ?? null;
 
   const onMouseDown = (e: React.MouseEvent) => {
     dragRef.current = {
@@ -495,14 +508,33 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
       setViewTick((t) => t + 1);
       return;
     }
-    if (!onNavigate) return;
     const world = screenToWorld(e.clientX, e.clientY);
-    if (!world) return;
-    const hit = hitTestFieldTarget(world.x, world.y);
-    setCursor(hit ? "pointer" : "grab");
+    if (!world) {
+      if (hoveredFieldRef.current !== null) {
+        hoveredFieldRef.current = null;
+        setViewTick((t) => t + 1);
+      }
+      return;
+    }
+    const hit = hitTestField(world.x, world.y);
+    if (onNavigate) setCursor(hit?.navigableTarget ? "pointer" : "grab");
+    const prev = hoveredFieldRef.current;
+    const same =
+      prev !== null &&
+      hit !== null &&
+      prev.nodeId === hit.nodeId &&
+      prev.fieldIndex === hit.fieldIndex;
+    if (!same) {
+      hoveredFieldRef.current = hit ? { nodeId: hit.nodeId, fieldIndex: hit.fieldIndex } : null;
+      setViewTick((t) => t + 1);
+    }
   };
   const endDrag = () => {
     dragRef.current.active = false;
+    if (hoveredFieldRef.current !== null) {
+      hoveredFieldRef.current = null;
+      setViewTick((t) => t + 1);
+    }
   };
   const onClick = (e: React.MouseEvent) => {
     if (!onNavigate) return;
@@ -686,6 +718,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
         edgeGroups,
         nodeById,
         focusId ?? null,
+        hoveredFieldRef.current,
         spriteCache,
         spriteDprLevel,
       );
@@ -756,6 +789,7 @@ function drawFrame(
   edgeGroups: EdgeGroups,
   nodeById: Map<string, LaidNode>,
   focusId: string | null,
+  hoveredField: { nodeId: string; fieldIndex: number } | null,
   spriteCache: Map<string, HTMLCanvasElement>,
   spriteDprLevel: number,
 ) {
@@ -820,18 +854,42 @@ function drawFrame(
     if (sprite) ctx.drawImage(sprite, nLeft, nTop, n.w, n.h);
   }
 
+  // PASS B.5 — hovered field row highlight.
+  if (hoveredField) {
+    const n = nodeById.get(hoveredField.nodeId);
+    if (n) {
+      const nodeLeft = n.cx - n.w / 2;
+      const nodeTop = n.cy - n.h / 2;
+      const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
+      const hy = nodeTop + bodyTop + hoveredField.fieldIndex * ROW_H;
+      ctx.fillStyle = fgColor;
+      ctx.globalAlpha = 0.07;
+      const hpad = 4;
+      roundRect(ctx, nodeLeft + hpad, hy, n.w - hpad * 2, ROW_H, 3);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
   // PASS C — focus ring on top.
   if (focusId) {
     const n = nodeById.get(focusId);
     if (n) {
       const color = KIND_COLORS[n.data.kind];
       ctx.save();
+      // Subtle fill over the whole card.
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.05;
+      roundRect(ctx, n.cx - n.w / 2, n.cy - n.h / 2, n.w, n.h, 6);
+      ctx.fill();
+      // Wide, soft ring.
+      ctx.globalAlpha = 0.5;
       ctx.shadowColor = color;
-      ctx.shadowBlur = 12;
+      ctx.shadowBlur = 18;
       ctx.strokeStyle = color;
-      ctx.lineWidth = 3;
-      const pad = 2;
-      roundRect(ctx, n.cx - n.w / 2 - pad, n.cy - n.h / 2 - pad, n.w + pad * 2, n.h + pad * 2, 8);
+      ctx.lineWidth = 2.5;
+      const pad = 5;
+      roundRect(ctx, n.cx - n.w / 2 - pad, n.cy - n.h / 2 - pad, n.w + pad * 2, n.h + pad * 2, 10);
       ctx.stroke();
       ctx.restore();
     }
