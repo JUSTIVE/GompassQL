@@ -4,6 +4,9 @@ import { ThemeToggle } from "./theme-toggle";
 import { useSchema } from "@/lib/schema-context";
 import { cn } from "@/lib/utils";
 
+declare const __COMMIT_HASH__: string | undefined;
+const COMMIT_HASH = typeof __COMMIT_HASH__ === "string" ? __COMMIT_HASH__ : "";
+
 export function AppShell({ children }: { children: React.ReactNode }) {
   const { location } = useRouterState();
   const path = location.pathname;
@@ -49,6 +52,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       </header>
       <main className="relative flex min-h-0 flex-1 flex-col overflow-hidden">{children}</main>
+      {COMMIT_HASH && (
+        <div className="pointer-events-none fixed bottom-2 right-3 select-none font-mono text-[10px] text-muted-foreground/40">
+          {COMMIT_HASH}
+        </div>
+      )}
     </div>
   );
 }

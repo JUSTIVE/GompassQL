@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useMemo, useState } from "react";
-import { reachableFrom } from "./reachable";
+import { allReachableIds, reachableFrom } from "./reachable";
 import { sdlToGraph, type GraphEdgeData, type GraphNodeData, type ParsedGraph } from "./sdl-to-graph";
 
 interface SchemaContextValue {
@@ -11,6 +11,10 @@ interface SchemaContextValue {
   visibleNodes: GraphNodeData[];
   /** Edges reachable from the current root type. */
   visibleEdges: GraphEdgeData[];
+  /** Nodes with no path from the current root type. */
+  orphanedNodes: GraphNodeData[];
+  /** Edges whose both endpoints are orphaned. */
+  orphanedEdges: GraphEdgeData[];
   setSchema: (input: { sdl: string; name?: string }) => void;
   clearSchema: () => void;
 
@@ -108,6 +112,47 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     return { visibleNodes: nodes, visibleEdges: edges };
   }, [visible.nodes, visible.edges, hidePrimitiveFields]);
 
+  const { orphanedNodes, orphanedEdges } = useMemo(() => {
+    // Use reachability from ALL root operations so that types reachable
+    // from Mutation/Subscription don't appear orphaned when root=Query.
+    // Falls back to effectiveRoot for schemas without standard root ops.
+    const reachableIds = allReachableIds(graph.nodes, graph.edges);
+    if (reachableIds.size === 0 && effectiveRoot) {
+      const { nodes: r } = reachableFrom(graph.nodes, graph.edges, effectiveRoot);
+      for (const n of r) reachableIds.add(n.id);
+    }
+    const rawNodes = graph.nodes.filter((n) => !reachableIds.has(n.id));
+    const orphanIds = new Set(rawNodes.map((n) => n.id));
+    const rawEdges = graph.edges.filter(
+      (e) => orphanIds.has(e.source) && orphanIds.has(e.target),
+    );
+
+    if (!hidePrimitiveFields) return { orphanedNodes: rawNodes, orphanedEdges: rawEdges };
+
+    const indexRemap = new Map<string, Map<number, number>>();
+    const nodes = rawNodes.map((n) => {
+      if (!n.fields) return n;
+      let newIdx = 0;
+      const remap = new Map<number, number>();
+      const fields = n.fields.filter((f, oldIdx) => {
+        if (BUILTIN_SCALARS.has(f.typeName)) return false;
+        remap.set(oldIdx, newIdx++);
+        return true;
+      });
+      if (fields.length === n.fields.length) return n;
+      indexRemap.set(n.id, remap);
+      return { ...n, fields };
+    });
+    const edges = rawEdges.map((e) => {
+      if (e.sourceFieldIndex == null) return e;
+      const remap = indexRemap.get(e.source);
+      if (!remap) return e;
+      const newIdx = remap.get(e.sourceFieldIndex);
+      return newIdx != null ? { ...e, sourceFieldIndex: newIdx } : e;
+    });
+    return { orphanedNodes: nodes, orphanedEdges: edges };
+  }, [graph.nodes, graph.edges, effectiveRoot, hidePrimitiveFields]);
+
   const setSchema = useCallback(
     ({ sdl: nextSdl, name: nextName }: { sdl: string; name?: string }) => {
       const n = nextName?.trim() || "Untitled schema";
@@ -159,6 +204,8 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     hasSchema: graph.nodes.length > 0,
     visibleNodes,
     visibleEdges,
+    orphanedNodes,
+    orphanedEdges,
     setSchema,
     clearSchema,
     rootType: effectiveRoot,

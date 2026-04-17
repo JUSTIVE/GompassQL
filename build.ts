@@ -115,6 +115,9 @@ if (existsSync(outdir)) {
   await rm(outdir, { recursive: true, force: true });
 }
 
+const commitHash = Bun.spawnSync(["git", "rev-parse", "--short=6", "HEAD"])
+  .stdout.toString().trim() || "unknown";
+
 const start = performance.now();
 
 const entrypoints = [...new Bun.Glob("**.html").scanSync("src")]
@@ -131,6 +134,7 @@ const result = await Bun.build({
   sourcemap: "linked",
   define: {
     "process.env.NODE_ENV": JSON.stringify("production"),
+    "__COMMIT_HASH__": JSON.stringify(commitHash),
   },
   ...cliConfig,
 });
