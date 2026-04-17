@@ -87,6 +87,26 @@ const EMPTY_LAYOUT: LayoutResult = { nodes: [], edgePaths: [] };
 const CULL_PAD = 100;
 const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
 
+// Sprite LOD: controls how much detail is baked into each sprite tier.
+// "full"   – all text + icons (zoom ≥ LOD_FULL)
+// "bar"    – colored placeholder bars where text would be (LOD_BAR ≤ zoom < LOD_FULL)
+// "chrome" – card shape + header band only (zoom < LOD_BAR)
+// Tiers are cached separately so switching zoom never discards valid entries.
+type SpriteLOD = "full" | "bar" | "chrome";
+const LOD_FULL = 0.4;  // body text (10 px) ≈ 4 CSS px below this
+const LOD_BAR  = 0.12; // bars become sub-pixel below this
+
+function computeLOD(viewK: number): SpriteLOD {
+  if (viewK >= LOD_FULL) return "full";
+  if (viewK >= LOD_BAR)  return "bar";
+  return "chrome";
+}
+
+// Field-bar width fractions cycle through these to fake varied text lengths.
+const BAR_NAME_FRACS  = [0.62, 0.50, 0.71, 0.55, 0.44, 0.68];
+const BAR_FIELD_FRACS = [0.44, 0.36, 0.52, 0.38, 0.46, 0.32];
+const BAR_TYPE_FRACS  = [0.24, 0.30, 0.20, 0.27, 0.22, 0.28];
+
 // Per-node sprite DPR is decided dynamically and rebuilds when the
 // user zooms in far enough that the baked bitmap would otherwise
 // blur. Discrete levels (1, 2, 3, 4) keep the cache from thrashing
@@ -875,6 +895,7 @@ function drawFrame(
     spriteDprRef.current = neededDpr;
   }
   const spriteDpr = spriteDprRef.current || neededDpr;
+  const lod = computeLOD(view.k);
 
   const bgColor = getComputedCssVar("--background", "#ffffff");
   const cardColor = getComputedCssVar("--card", "#ffffff");
@@ -929,7 +950,7 @@ function drawFrame(
     ) {
       continue;
     }
-    const sprite = getOrBuildSprite(spriteCache, n, spriteContext, spriteDpr);
+    const sprite = getOrBuildSprite(spriteCache, n, spriteContext, spriteDpr, lod);
     if (sprite) {
       const isDim = dimNodeIds.has(n.id);
       if (isDim) ctx.globalAlpha = DIM;
@@ -1131,8 +1152,10 @@ function getOrBuildSprite(
   n: LaidNode,
   ctxColors: SpriteCtx,
   dpr: number,
+  lod: SpriteLOD,
 ): HTMLCanvasElement | null {
-  const existing = cache.get(n.id);
+  const key = `${n.id}:${lod}`;
+  const existing = cache.get(key);
   if (existing) return existing;
   if (typeof document === "undefined") return null;
   const can = document.createElement("canvas");
@@ -1141,8 +1164,8 @@ function getOrBuildSprite(
   const c = can.getContext("2d");
   if (!c) return null;
   c.setTransform(dpr, 0, 0, dpr, 0, 0);
-  drawNodeSprite(c, n, ctxColors);
-  cache.set(n.id, can);
+  drawNodeSprite(c, n, ctxColors, lod);
+  cache.set(key, can);
   return can;
 }
 
@@ -1150,13 +1173,13 @@ function drawNodeSprite(
   ctx: CanvasRenderingContext2D,
   n: LaidNode,
   { cardColor, fgColor, mutedFg }: SpriteCtx,
+  lod: SpriteLOD,
 ) {
   const w = n.w;
   const h = n.h;
   const color = KIND_COLORS[n.data.kind];
 
-  // Card background + unfocused border. Focus ring is drawn on the
-  // main canvas so sprites don't need to rebuild on focus change.
+  // Card background + unfocused border (always drawn).
   roundRect(ctx, 0, 0, w, h, 6);
   ctx.fillStyle = cardColor;
   ctx.fill();
@@ -1166,14 +1189,12 @@ function drawNodeSprite(
   ctx.stroke();
   ctx.globalAlpha = 1;
 
-  // Header band — rounded on top, flat on the bottom so it butts up
-  // cleanly against the body separator without the subtle corner
-  // curves the full rounded-rect used to leave behind.
+  // Header band (always drawn).
   roundRectTopOnly(ctx, 0, 0, w, HEADER_H, 6);
   ctx.fillStyle = color;
   ctx.fill();
 
-  // Header separator.
+  // Header separator (always drawn).
   ctx.strokeStyle = color;
   ctx.globalAlpha = 0.4;
   ctx.lineWidth = 0.75;
@@ -1183,21 +1204,53 @@ function drawNodeSprite(
   ctx.stroke();
   ctx.globalAlpha = 1;
 
-  // Kind label.
+  // "chrome" tier stops here — no text or bars.
+  if (lod === "chrome") return;
+
+  // "bar" tier: draw placeholder bars where text would be.
+  if (lod === "bar") {
+    const avail = w - 16;
+    // Name bar in header.
+    const nFrac = BAR_NAME_FRACS[0]!;
+    ctx.fillStyle = "#ffffff";
+    ctx.globalAlpha = 0.55;
+    roundRect(ctx, 8, 23, avail * nFrac, 5, 2.5);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // Body placeholder bars: one row pair (field + type) per content row.
+    const bodyY = HEADER_H + TOP_BODY_PAD - 2;
+    const rowCount = bodyRowCount(n);
+    for (let i = 0; i < rowCount; i++) {
+      const fy = bodyY + i * ROW_H + 3;
+      const ff = BAR_FIELD_FRACS[i % BAR_FIELD_FRACS.length]!;
+      const tf = BAR_TYPE_FRACS[i % BAR_TYPE_FRACS.length]!;
+      const typeBarW = avail * tf;
+      ctx.fillStyle = fgColor;
+      ctx.globalAlpha = 0.35;
+      roundRect(ctx, 10, fy, avail * ff, 4, 2);
+      ctx.fill();
+      ctx.fillStyle = mutedFg;
+      roundRect(ctx, w - 10 - typeBarW, fy, typeBarW, 4, 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    return;
+  }
+
+  // "full" tier: kind label.
   ctx.font = `600 9px ${MONO}`;
   ctx.fillStyle = "#ffffff";
   ctx.globalAlpha = 0.6;
   ctx.fillText(n.data.kind.toUpperCase(), 8, 14);
   ctx.globalAlpha = 1;
 
-  // Name. fitText re-measures against the card's actual width so the
-  // clamped MAX_WIDTH case (absurdly long names) still gets a pixel-
-  // accurate ellipsis.
+  // "full" tier: node name.
   ctx.font = NODE_NAME_FONT;
   ctx.fillStyle = "#ffffff";
   ctx.fillText(fitText(ctx, n.data.name, w - 16), 8, 30);
 
-  // Body.
+  // "full" tier: body.
   const bodyY = HEADER_H + TOP_BODY_PAD - 2;
   if (n.data.kind === "Enum") {
     ctx.font = `10px ${MONO}`;
@@ -1234,6 +1287,14 @@ function drawNodeSprite(
       drawColoredType(ctx, f.type, w - 10, fy, mutedFg);
     }
   }
+}
+
+function bodyRowCount(n: LaidNode): number {
+  const d = n.data;
+  if (d.kind === "Enum")   return (d.values ?? []).length;
+  if (d.kind === "Union")  return (d.members ?? []).length;
+  if (d.kind === "Scalar") return 1;
+  return (d.fields ?? []).length;
 }
 
 // ─── Relay icon ─────────────────────────────────────────────────────
