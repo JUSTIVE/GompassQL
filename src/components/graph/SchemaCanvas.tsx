@@ -130,6 +130,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   });
   const rafRef = useRef<number | null>(null);
   const hoveredFieldRef = useRef<{ nodeId: string; fieldIndex: number } | null>(null);
+  const hoveredNodeRef = useRef<string | null>(null);
   const [cursor, setCursor] = useState<"grab" | "pointer">("grab");
   const [spriteDprLevel, setSpriteDprLevel] = useState(initialSpriteDpr);
   const { resolved: themeResolved } = useTheme();
@@ -341,7 +342,22 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         active: edges.filter((e) => e.sourceId === focusId || e.targetId === focusId),
       };
     });
-    return { groups };
+
+    let dimNodeIds = new Set<string>();
+    if (shouldDim && focusId) {
+      const connectedIds = new Set<string>([focusId]);
+      for (const e of laidEdges) {
+        if (e.sourceId === focusId) connectedIds.add(e.targetId);
+        else if (e.targetId === focusId) connectedIds.add(e.sourceId);
+      }
+      for (const e of laidEdges) {
+        const src = e.sourceId, tgt = e.targetId;
+        if (!connectedIds.has(src)) dimNodeIds.add(src);
+        if (!connectedIds.has(tgt)) dimNodeIds.add(tgt);
+      }
+    }
+
+    return { groups, dimNodeIds };
   }, [laidEdges, focusId, rootId]);
 
   const bounds = useMemo(() => {
@@ -509,6 +525,18 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     return null;
   };
 
+  const hitTestNode = (worldX: number, worldY: number): string | null => {
+    for (const n of laidNodes) {
+      if (
+        worldX >= n.cx - n.w / 2 &&
+        worldX <= n.cx + n.w / 2 &&
+        worldY >= n.cy - n.h / 2 &&
+        worldY <= n.cy + n.h / 2
+      ) return n.id;
+    }
+    return null;
+  };
+
   const onMouseDown = (e: React.MouseEvent) => {
     dragRef.current = {
       active: true,
@@ -546,6 +574,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       return;
     }
     const hit = hitTestField(world.x, world.y);
+    const hoveredNode = hitTestNode(world.x, world.y);
     if (onNavigate) setCursor(hit?.navigableTarget ? "pointer" : "grab");
     const prev = hoveredFieldRef.current;
     const same =
@@ -553,17 +582,23 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       hit !== null &&
       prev.nodeId === hit.nodeId &&
       prev.fieldIndex === hit.fieldIndex;
+    let dirty = false;
     if (!same) {
       hoveredFieldRef.current = hit ? { nodeId: hit.nodeId, fieldIndex: hit.fieldIndex } : null;
-      setViewTick((t) => t + 1);
+      dirty = true;
     }
+    if (hoveredNodeRef.current !== hoveredNode) {
+      hoveredNodeRef.current = hoveredNode;
+      dirty = true;
+    }
+    if (dirty) setViewTick((t) => t + 1);
   };
   const endDrag = () => {
     dragRef.current.active = false;
-    if (hoveredFieldRef.current !== null) {
-      hoveredFieldRef.current = null;
-      setViewTick((t) => t + 1);
-    }
+    let dirty = false;
+    if (hoveredFieldRef.current !== null) { hoveredFieldRef.current = null; dirty = true; }
+    if (hoveredNodeRef.current !== null) { hoveredNodeRef.current = null; dirty = true; }
+    if (dirty) setViewTick((t) => t + 1);
   };
   const onClick = (e: React.MouseEvent) => {
     if (dragRef.current.moved) return;
@@ -749,6 +784,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         edgeGroups,
         nodeById,
         focusId ?? null,
+        edgeGroups.dimNodeIds,
+        hoveredNodeRef.current,
         hoveredFieldRef.current,
         spriteCache,
         spriteDprLevel,
@@ -825,6 +862,7 @@ interface EdgeGroupSpec {
 
 interface EdgeGroups {
   groups: EdgeGroupSpec[];
+  dimNodeIds: Set<string>;
 }
 
 function drawFrame(
@@ -837,6 +875,8 @@ function drawFrame(
   edgeGroups: EdgeGroups,
   nodeById: Map<string, LaidNode>,
   focusId: string | null,
+  dimNodeIds: Set<string>,
+  hoveredNodeId: string | null,
   hoveredField: { nodeId: string; fieldIndex: number } | null,
   spriteCache: Map<string, HTMLCanvasElement>,
   spriteDprLevel: number,
@@ -902,7 +942,12 @@ function drawFrame(
       continue;
     }
     const sprite = getOrBuildSprite(spriteCache, n, spriteContext, spriteDprLevel);
-    if (sprite) ctx.drawImage(sprite, nLeft, nTop, n.w, n.h);
+    if (sprite) {
+      const isDim = dimNodeIds.has(n.id);
+      if (isDim) ctx.globalAlpha = DIM;
+      ctx.drawImage(sprite, nLeft, nTop, n.w, n.h);
+      if (isDim) ctx.globalAlpha = 1;
+    }
   }
 
   // PASS B.5 — hovered field row highlight.
@@ -922,7 +967,22 @@ function drawFrame(
     }
   }
 
-  // PASS C — focus ring + expanding ripple pulse.
+  // PASS C — hover ring + focus ring + expanding ripple pulse.
+  if (hoveredNodeId && hoveredNodeId !== focusId) {
+    const n = nodeById.get(hoveredNodeId);
+    if (n) {
+      const color = KIND_COLORS[n.data.kind];
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.4;
+      const pad = 3;
+      roundRect(ctx, n.cx - n.w / 2 - pad, n.cy - n.h / 2 - pad, n.w + pad * 2, n.h + pad * 2, 9);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
   if (focusId) {
     const n = nodeById.get(focusId);
     if (n) {
