@@ -1526,15 +1526,11 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const dpr = memoryCappedDpr(idealSpriteDpr(viewK), laidNodes.length);
     spriteDprRef.current = dpr;
 
-    const { dimNodeIds } = edgeGroups;
-    const DIM = 0.1;
-
     // Create placeholder sprites immediately (colored box via tint on
     // a white 1×1 texture — near-zero cost). The ticker progressively
     // builds real textures and swaps them in, so no single frame
     // blocks for 400+ drawNodeSprite calls.
     for (const n of laidNodes) {
-      // Reuse cached texture if available (e.g. scrolling back to same LOD).
       const key = `${n.id}:${lod}`;
       const cachedTex = textureCacheRef.current.get(key);
 
@@ -1542,7 +1538,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       sprite.position.set(n.cx - n.w / 2, n.cy - n.h / 2);
       sprite.width = n.w;
       sprite.height = n.h;
-      sprite.alpha = dimNodeIds.has(n.id) ? DIM : 1;
       sprite.cullable = true;
       if (!cachedTex) {
         sprite.tint = cssColorToHex(KIND_COLORS[n.data.kind]);
@@ -1563,10 +1558,22 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         lod,
         dpr,
         spriteCtx,
-        dimNodeIds,
+        dimNodeIds: new Set<string>(),
       };
     }
-  }, [laidNodes, themeResolved, edgeGroups, lodTick]);
+  }, [laidNodes, themeResolved, lodTick]);
+
+  // Dim/undim node sprites when focus changes — lightweight alpha-only
+  // update, no texture rebuild. Separated from the sprite build effect
+  // so focus changes don't destroy+recreate all sprites (which caused
+  // a visible flash as placeholders briefly appeared).
+  useEffect(() => {
+    const { dimNodeIds } = edgeGroups;
+    const DIM = 0.1;
+    for (const [id, sprite] of nodeSpritesRef.current) {
+      sprite.alpha = dimNodeIds.has(id) ? DIM : 1;
+    }
+  }, [edgeGroups]);
 
   // FPS + timing overlay state
   const fpsOverlayRef = useRef<HTMLDivElement>(null);
