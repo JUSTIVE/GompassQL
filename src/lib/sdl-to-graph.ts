@@ -7,6 +7,7 @@ export interface GraphField {
   type: string;
   typeName: string;
   nullable: boolean;
+  isRelayConnection?: boolean;
   args?: { name: string; type: string }[];
   description?: string;
 }
@@ -215,7 +216,10 @@ export function sdlToGraph(sdl: string): ParsedGraph {
     if (!n.fields) continue;
     for (const f of n.fields) {
       const unwrapped = relayUnwrap.get(f.typeName);
-      if (unwrapped) f.typeName = unwrapped;
+      if (unwrapped) {
+        f.isRelayConnection = true;
+        f.typeName = unwrapped;
+      }
     }
   }
 

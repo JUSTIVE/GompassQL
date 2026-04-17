@@ -166,8 +166,8 @@ export async function layoutGraph(
     directed: true,
     graphAttributes: {
       rankdir: "LR",
-      ranksep: 2.0,
-      nodesep: 0.5,
+      ranksep: 1.2,
+      nodesep: 0.3,
     },
     nodeAttributes: {
       shape: "box",
