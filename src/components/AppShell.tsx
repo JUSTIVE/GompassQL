@@ -53,7 +53,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       </header>
       <main className="relative flex min-h-0 flex-1 flex-col overflow-hidden">{children}</main>
       {COMMIT_HASH && (
-        <div className="pointer-events-none fixed bottom-2 right-3 select-none font-mono text-[10px] text-muted-foreground/40">
+        <div className="pointer-events-none fixed bottom-2 left-1/2 -translate-x-1/2 select-none font-mono text-[10px] text-muted-foreground/40">
           {COMMIT_HASH}
         </div>
       )}

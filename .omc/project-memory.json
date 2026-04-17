@@ -105,8 +105,8 @@
   "hotPaths": [
     {
       "path": "src/components/graph/SchemaCanvas.tsx",
-      "accessCount": 68,
-      "lastAccessed": 1776348969836,
+      "accessCount": 105,
+      "lastAccessed": 1776433618273,
       "type": "file"
     },
     {
@@ -117,14 +117,14 @@
     },
     {
       "path": "src/lib/layout.ts",
-      "accessCount": 23,
-      "lastAccessed": 1776347854743,
+      "accessCount": 25,
+      "lastAccessed": 1776433075467,
       "type": "file"
     },
     {
       "path": "src/components/graph/node-style.ts",
-      "accessCount": 15,
-      "lastAccessed": 1776349059842,
+      "accessCount": 17,
+      "lastAccessed": 1776433071794,
       "type": "file"
     },
     {
@@ -134,9 +134,21 @@
       "type": "file"
     },
     {
+      "path": "src/lib/sdl-to-graph.ts",
+      "accessCount": 12,
+      "lastAccessed": 1776433075083,
+      "type": "file"
+    },
+    {
       "path": "src/routes/Landing.tsx",
       "accessCount": 11,
       "lastAccessed": 1776303854461,
+      "type": "file"
+    },
+    {
+      "path": "src/components/AppShell.tsx",
+      "accessCount": 11,
+      "lastAccessed": 1776432340231,
       "type": "file"
     },
     {
@@ -146,27 +158,15 @@
       "type": "file"
     },
     {
-      "path": "src/components/AppShell.tsx",
-      "accessCount": 10,
-      "lastAccessed": 1776344192644,
-      "type": "file"
-    },
-    {
-      "path": "src/lib/sdl-to-graph.ts",
-      "accessCount": 10,
-      "lastAccessed": 1776346250096,
+      "path": "src/lib/type-colors.tsx",
+      "accessCount": 9,
+      "lastAccessed": 1776432513500,
       "type": "file"
     },
     {
       "path": "src/routes/About.tsx",
       "accessCount": 7,
       "lastAccessed": 1776344189891,
-      "type": "file"
-    },
-    {
-      "path": "src/lib/type-colors.tsx",
-      "accessCount": 6,
-      "lastAccessed": 1776303542083,
       "type": "file"
     },
     {
@@ -296,6 +296,18 @@
       "type": "file"
     },
     {
+      "path": "",
+      "accessCount": 2,
+      "lastAccessed": 1776432509198,
+      "type": "directory"
+    },
+    {
+      "path": "src/lib/sample-sdl.ts",
+      "accessCount": 2,
+      "lastAccessed": 1776433075738,
+      "type": "file"
+    },
+    {
       "path": "components.json",
       "accessCount": 1,
       "lastAccessed": 1776265450755,
@@ -323,12 +335,6 @@
       "path": "src/lib/storage.ts",
       "accessCount": 1,
       "lastAccessed": 1776265686448,
-      "type": "file"
-    },
-    {
-      "path": "src/lib/sample-sdl.ts",
-      "accessCount": 1,
-      "lastAccessed": 1776265698593,
       "type": "file"
     },
     {

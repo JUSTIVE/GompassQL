@@ -161,6 +161,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const [layoutResult, setLayoutResult] = useState<LayoutResult>(EMPTY_LAYOUT);
   const [isPending, setIsPending] = useState(nodes.length > 0);
   const [lastTiming, setLastTiming] = useState<LayoutWorkerResponse["timings"] | null>(null);
+  const lastTimingRef = useRef<LayoutWorkerResponse["timings"] | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const requestIdRef = useRef(0);
 
@@ -182,6 +183,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       if (e.data.id !== requestIdRef.current) return;
       setLayoutResult(e.data.result);
       setLastTiming(e.data.timings);
+      lastTimingRef.current = e.data.timings;
       setIsPending(false);
     };
     worker.onerror = (err) => {
@@ -402,7 +404,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // in the same frame (no React state update cycle lag). The draw loop
   // computes the needed DPR on every frame and clears the cache in-place
   // when the DPR needs to rise, then rebuilds lazily from there.
-  const spriteCacheRef = useRef(new Map<string, HTMLCanvasElement>());
+  const spriteCacheRef = useRef(new Map<string, HTMLCanvasElement | OffscreenCanvas>());
   const spriteDprRef = useRef(0);
   useEffect(() => {
     spriteCacheRef.current.clear();
@@ -782,6 +784,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         spriteCacheRef.current,
         spriteDprRef,
         fpsRef,
+        lastTimingRef,
       );
     };
 
@@ -807,11 +810,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       style={{ cursor, touchAction: "none" }}
     >
       <canvas ref={canvasRef} style={{ width: size.w, height: size.h, display: "block" }} />
-      {lastTiming && (
-        <div className="pointer-events-none absolute right-3 top-3 z-20 rounded-md border border-border bg-card/90 px-2 py-1 text-xs text-muted-foreground tabular-nums shadow-sm backdrop-blur">
-          layout {lastTiming.layoutMs.toFixed(0)}ms · total {lastTiming.totalMs.toFixed(0)}ms
-        </div>
-      )}
       {isPending && (
         <div
           className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-background/60 backdrop-blur-sm"
@@ -860,9 +858,10 @@ function drawFrame(
   dimNodeIds: Set<string>,
   hoveredNodeId: string | null,
   hoveredField: { nodeId: string; fieldIndex: number; isRelayHover: boolean } | null,
-  spriteCache: Map<string, HTMLCanvasElement>,
+  spriteCache: Map<string, HTMLCanvasElement | OffscreenCanvas>,
   spriteDprRef: { current: number },
   fpsRef: { current: { times: number[]; history: number[]; lastSampleAt: number } },
+  lastTimingRef: { current: LayoutWorkerResponse["timings"] | null },
 ): void {
   const dpr = window.devicePixelRatio || 1;
   const targetW = Math.ceil(size.w * dpr);
@@ -911,8 +910,8 @@ function drawFrame(
   const vp: [number, number, number, number] = [vpLeft, vpTop, vpRight, vpBottom];
   if (lod !== "chrome") {
     for (const g of edgeGroups.groups) {
-      drawEdgeBatch(ctx, g.dim, g.color, g.dash, ...vp, DIM);
-      drawEdgeBatch(ctx, g.active, g.color, g.dash, ...vp, 1);
+      if (g.dim.length > 0) drawEdgeBatch(ctx, g.dim, g.color, g.dash, ...vp, DIM);
+      if (g.active.length > 0) drawEdgeBatch(ctx, g.active, g.color, g.dash, ...vp, 1);
     }
     ctx.setLineDash([]);
   }
@@ -1174,32 +1173,33 @@ function drawFrame(
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
 
-  const CHART_W = 82;
-  const CHART_H = 28;
-  const PAD = 8;
-  const TEXT_H = 16;
+  const CHART_W = 280;
+  const CHART_H = 80;
+  const PAD = 14;
+  const TEXT_ROW = 20;
+  const timing = lastTimingRef.current;
+  const textRows = timing ? 3 : 1;
   const panelW = CHART_W + PAD * 2;
-  const panelH = CHART_H + TEXT_H + PAD * 2;
-  const px = canvas.width  - panelW - 10;
-  const py = canvas.height - panelH - 10;
+  const panelH = CHART_H + textRows * TEXT_ROW + PAD * 2 + 6;
+  const px = canvas.width  - panelW - 16;
+  const py = canvas.height - panelH - 16;
 
   // Panel background.
   ctx.fillStyle = mutedFg;
-  ctx.globalAlpha = 0.06;
-  roundRect(ctx, px, py, panelW, panelH, 5);
+  ctx.globalAlpha = 0.08;
+  roundRect(ctx, px, py, panelW, panelH, 8);
   ctx.fill();
 
   // Bars.
   const maxFps = 65;
-  const barW = CHART_W / fp.history.length;
+  const barW = fp.history.length > 0 ? CHART_W / fp.history.length : 6;
   const chartX = px + PAD;
   const chartY = py + PAD;
-  ctx.fillStyle = mutedFg;
   for (let i = 0; i < fp.history.length; i++) {
     const v = fp.history[i]!;
     const bh = Math.max(1, (v / maxFps) * CHART_H);
     const isLow = v < 30;
-    ctx.globalAlpha = isLow ? 0.55 : 0.28;
+    ctx.globalAlpha = isLow ? 0.6 : 0.3;
     ctx.fillStyle = isLow ? "#f87171" : mutedFg;
     ctx.fillRect(
       chartX + i * barW,
@@ -1209,13 +1209,27 @@ function drawFrame(
     );
   }
 
-  // FPS text.
-  ctx.font = `600 11px ${MONO}`;
+  // Text rows.
+  ctx.font = `600 13px ${MONO}`;
   ctx.fillStyle = mutedFg;
-  ctx.globalAlpha = 0.55;
+  ctx.globalAlpha = 0.65;
+  ctx.textBaseline = "top";
+  const textY = chartY + CHART_H + 8;
+
+  ctx.textAlign = "left";
+  ctx.fillText(`${fps} fps`, px + PAD, textY);
   ctx.textAlign = "right";
-  ctx.textBaseline = "bottom";
-  ctx.fillText(`${fps} fps`, px + panelW - PAD, py + panelH - PAD + 2);
+  ctx.fillText(`${laidNodes.length} nodes · ${laidEdges.length} edges`, px + panelW - PAD, textY);
+
+  if (timing) {
+    ctx.font = `500 12px ${MONO}`;
+    ctx.textAlign = "left";
+    ctx.globalAlpha = 0.5;
+    ctx.fillText(`similarity ${timing.similarityMs.toFixed(0)}ms`, px + PAD, textY + TEXT_ROW);
+    ctx.fillText(`layout ${timing.layoutMs.toFixed(0)}ms`, px + PAD, textY + TEXT_ROW * 2);
+    ctx.textAlign = "right";
+    ctx.fillText(`total ${timing.totalMs.toFixed(0)}ms`, px + panelW - PAD, textY + TEXT_ROW * 2);
+  }
 
   ctx.restore();
 }
@@ -1227,24 +1241,23 @@ function drawDotGrid(
   dotColor: string,
 ) {
   const dotGap = 24;
-  const dotR = 1;
   const step = dotGap * view.k;
-  // Below ~6 px the grid is too dense to be useful and costs ~100k fillRect calls.
   if (step < 6) return;
   const { w, h } = size;
   ctx.save();
-  ctx.beginPath();
-  ctx.rect(0, 0, w, h);
-  ctx.clip();
   ctx.fillStyle = dotColor;
   ctx.globalAlpha = 0.18;
   const startX = ((view.x % step) + step) % step;
   const startY = ((view.y % step) + step) % step;
+  // Batch all dots into one path, one fill() call. Previously each dot
+  // was an individual fillRect(1,1) — 14k+ GPU submissions at mid-zoom.
+  ctx.beginPath();
   for (let px = startX; px < w; px += step) {
     for (let py = startY; py < h; py += step) {
-      ctx.fillRect(px, py, dotR, dotR);
+      ctx.rect(px, py, 1, 1);
     }
   }
+  ctx.fill();
   ctx.restore();
 }
 
@@ -1263,11 +1276,16 @@ function drawEdgeBatch(
 
   ctx.save();
   ctx.globalAlpha = alpha;
-  // One path for every stroke in this style group.
+  // Single pass: build the stroke path and collect visible edges for
+  // arrowheads. The previous two-pass design iterated + bbox-tested
+  // every edge twice — one for stroke, once for arrowhead fill. With
+  // 1,294 edges that doubled the per-frame comparison count for no
+  // reason. Now we iterate once, push visible refs into a small array,
+  // stroke, then iterate the already-filtered set for arrowheads.
   ctx.strokeStyle = color;
   ctx.setLineDash(dash);
+  const visible: LaidEdge[] = [];
   ctx.beginPath();
-  let anyVisible = false;
   for (const e of edges) {
     const bb = e.bbox;
     if (
@@ -1278,31 +1296,21 @@ function drawEdgeBatch(
     ) {
       continue;
     }
-    anyVisible = true;
+    visible.push(e);
     ctx.moveTo(e.start.x, e.start.y);
     for (const seg of e.segments) {
       ctx.bezierCurveTo(seg.c1.x, seg.c1.y, seg.c2.x, seg.c2.y, seg.end.x, seg.end.y);
     }
     if (e.arrowTip) ctx.lineTo(e.arrowTip.x, e.arrowTip.y);
   }
-  if (!anyVisible) { ctx.restore(); return; }
+  if (visible.length === 0) { ctx.restore(); return; }
   ctx.stroke();
 
-  // One path for every arrowhead fill in this group. Dashes don't
-  // apply to fill() but reset for safety downstream.
+  // Arrowheads from the already-filtered visible set — no bbox re-test.
   ctx.setLineDash([]);
   ctx.fillStyle = color;
   ctx.beginPath();
-  for (const e of edges) {
-    const bb = e.bbox;
-    if (
-      bb.maxX < vpLeft - CULL_PAD ||
-      bb.minX > vpRight + CULL_PAD ||
-      bb.maxY < vpTop - CULL_PAD ||
-      bb.minY > vpBottom + CULL_PAD
-    ) {
-      continue;
-    }
+  for (const e of visible) {
     const lastSeg = e.segments[e.segments.length - 1]!;
     const tangentFrom = e.arrowTip ? lastSeg.end : lastSeg.c2;
     const tangentTo = e.arrowTip ?? lastSeg.end;
@@ -1331,7 +1339,7 @@ interface SpriteCtx {
 }
 
 function getOrBuildSprite(
-  cache: Map<string, HTMLCanvasElement>,
+  cache: Map<string, HTMLCanvasElement | OffscreenCanvas>,
   n: LaidNode,
   ctxColors: SpriteCtx,
   dpr: number,
@@ -1341,11 +1349,18 @@ function getOrBuildSprite(
   const key = `${n.id}:${lod}`;
   const existing = cache.get(key);
   if (existing) return existing;
-  if (!buildAllowed || typeof document === "undefined") return null;
-  const can = document.createElement("canvas");
-  can.width = Math.ceil(n.w * dpr);
-  can.height = Math.ceil(n.h * dpr);
-  const c = can.getContext("2d");
+  if (!buildAllowed) return null;
+  const pw = Math.ceil(n.w * dpr);
+  const ph = Math.ceil(n.h * dpr);
+  const can: HTMLCanvasElement | OffscreenCanvas =
+    typeof OffscreenCanvas !== "undefined"
+      ? new OffscreenCanvas(pw, ph)
+      : document.createElement("canvas");
+  if ("width" in can && !(can instanceof OffscreenCanvas)) {
+    can.width = pw;
+    can.height = ph;
+  }
+  const c = can.getContext("2d") as CanvasRenderingContext2D | null;
   if (!c) return null;
   c.setTransform(dpr, 0, 0, dpr, 0, 0);
   drawNodeSprite(c, n, ctxColors, lod);
@@ -1485,7 +1500,7 @@ function drawNodeSprite(
         drawRelayIcon(ctx, iconCx, fy - 2);
         ctx.font = `10px ${MONO}`;
       }
-      drawColoredType(ctx, f.type, w - 10, fy, mutedFg);
+      drawColoredType(ctx, f.type, w - 10, fy);
     }
   }
 }
@@ -1562,22 +1577,29 @@ function roundRectTopOnly(
   ctx.closePath();
 }
 
+// measureText cache — keyed by the raw string. Safe because
+// drawColoredType is always called with the same 10px mono font
+// already set on ctx, and font metrics don't change with theme.
+// Bounded by the number of unique type strings in the schema.
+const typeWidthCache = new Map<string, number>();
+
+function cachedTextWidth(ctx: CanvasRenderingContext2D, text: string): number {
+  let w = typeWidthCache.get(text);
+  if (w !== undefined) return w;
+  w = ctx.measureText(text).width;
+  typeWidthCache.set(text, w);
+  return w;
+}
+
 function drawColoredType(
   ctx: CanvasRenderingContext2D,
   typeStr: string,
   rightX: number,
   y: number,
-  defaultColor: string,
 ) {
-  const segments = colorizeType(typeStr);
-  const totalWidth = ctx.measureText(typeStr).width;
-  let cx = rightX - totalWidth;
-  for (const seg of segments) {
-    ctx.fillStyle = seg.color;
-    ctx.fillText(seg.text, cx, y);
-    cx += ctx.measureText(seg.text).width;
-  }
-  void defaultColor;
+  const w = cachedTextWidth(ctx, typeStr);
+  ctx.fillStyle = "#f59e0b";
+  ctx.fillText(typeStr, rightX - w, y);
 }
 
 // function truncate(s: string, n: number) {
@@ -1586,10 +1608,21 @@ function drawColoredType(
 
 /**
  * Shorten `s` to the longest prefix (+ "…") that still fits within
- * `maxWidth` pixels using the currently-set canvas font.
+ * `maxWidth` pixels using the currently-set canvas font. Results are
+ * cached by (string, maxWidth) so LOD/DPR transitions don't re-run
+ * the binary-search measureText loop for names that already fit.
  */
+const fitTextCache = new Map<string, string>();
+
 function fitText(ctx: CanvasRenderingContext2D, s: string, maxWidth: number): string {
-  if (ctx.measureText(s).width <= maxWidth) return s;
+  const cacheKey = `${s}|${maxWidth}`;
+  const cached = fitTextCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  if (ctx.measureText(s).width <= maxWidth) {
+    fitTextCache.set(cacheKey, s);
+    return s;
+  }
   const ellipsis = "…";
   let lo = 0;
   let hi = s.length;
@@ -1599,5 +1632,7 @@ function fitText(ctx: CanvasRenderingContext2D, s: string, maxWidth: number): st
     if (ctx.measureText(cand).width <= maxWidth) lo = mid;
     else hi = mid - 1;
   }
-  return lo > 0 ? s.slice(0, lo) + ellipsis : ellipsis;
+  const result = lo > 0 ? s.slice(0, lo) + ellipsis : ellipsis;
+  fitTextCache.set(cacheKey, result);
+  return result;
 }

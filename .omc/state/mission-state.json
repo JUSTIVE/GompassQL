@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-04-16T13:19:03.336Z",
+  "updatedAt": "2026-04-17T13:42:46.445Z",
   "missions": [
     {
       "id": "session:58fc0495-9a78-4c9d-864a-afd4572c3e69:none",
@@ -7,15 +7,15 @@
       "name": "none",
       "objective": "Session mission",
       "createdAt": "2026-04-16T13:16:49.945Z",
-      "updatedAt": "2026-04-16T13:19:03.336Z",
+      "updatedAt": "2026-04-17T13:42:46.445Z",
       "status": "done",
-      "workerCount": 1,
+      "workerCount": 3,
       "taskCounts": {
-        "total": 1,
+        "total": 3,
         "pending": 0,
         "blocked": 0,
         "inProgress": 0,
-        "completed": 1,
+        "completed": 3,
         "failed": 0
       },
       "agents": [
@@ -28,24 +28,60 @@
           "latestUpdate": "completed",
           "completedSummary": null,
           "updatedAt": "2026-04-16T13:19:03.336Z"
+        },
+        {
+          "name": "scientist:a69c05f",
+          "role": "scientist",
+          "ownership": "a69c05fb5d984e7c9",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-04-17T13:31:42.916Z"
+        },
+        {
+          "name": "scientist:a978769",
+          "role": "scientist",
+          "ownership": "a978769a73090c5ec",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-04-17T13:42:46.445Z"
         }
       ],
       "timeline": [
         {
-          "id": "session-start:a15ab69926ac3fd61:2026-04-16T13:16:49.945Z",
-          "at": "2026-04-16T13:16:49.945Z",
+          "id": "session-start:a69c05fb5d984e7c9:2026-04-17T13:28:13.983Z",
+          "at": "2026-04-17T13:28:13.983Z",
           "kind": "update",
-          "agent": "document-specialist:a15ab69",
-          "detail": "started document-specialist:a15ab69",
-          "sourceKey": "session-start:a15ab69926ac3fd61"
+          "agent": "scientist:a69c05f",
+          "detail": "started scientist:a69c05f",
+          "sourceKey": "session-start:a69c05fb5d984e7c9"
         },
         {
-          "id": "session-stop:a15ab69926ac3fd61:2026-04-16T13:19:03.336Z",
-          "at": "2026-04-16T13:19:03.336Z",
+          "id": "session-stop:a69c05fb5d984e7c9:2026-04-17T13:31:42.916Z",
+          "at": "2026-04-17T13:31:42.916Z",
           "kind": "completion",
-          "agent": "document-specialist:a15ab69",
+          "agent": "scientist:a69c05f",
           "detail": "completed",
-          "sourceKey": "session-stop:a15ab69926ac3fd61"
+          "sourceKey": "session-stop:a69c05fb5d984e7c9"
+        },
+        {
+          "id": "session-start:a978769a73090c5ec:2026-04-17T13:37:44.939Z",
+          "at": "2026-04-17T13:37:44.939Z",
+          "kind": "update",
+          "agent": "scientist:a978769",
+          "detail": "started scientist:a978769",
+          "sourceKey": "session-start:a978769a73090c5ec"
+        },
+        {
+          "id": "session-stop:a978769a73090c5ec:2026-04-17T13:42:46.445Z",
+          "at": "2026-04-17T13:42:46.445Z",
+          "kind": "completion",
+          "agent": "scientist:a978769",
+          "detail": "completed",
+          "sourceKey": "session-stop:a978769a73090c5ec"
         }
       ]
     }

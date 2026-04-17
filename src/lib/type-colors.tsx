@@ -8,27 +8,7 @@ interface TypeSegment {
 }
 
 export function colorizeType(typeStr: string): TypeSegment[] {
-  const segments: TypeSegment[] = [];
-  let current = "";
-  for (const ch of typeStr) {
-    if (ch === "[" || ch === "]") {
-      if (current) {
-        segments.push({ text: current, color: AMBER });
-        current = "";
-      }
-      segments.push({ text: ch, color: EMERALD });
-    } else if (ch === "!") {
-      if (current) {
-        segments.push({ text: current, color: AMBER });
-        current = "";
-      }
-      segments.push({ text: ch, color: ROSE });
-    } else {
-      current += ch;
-    }
-  }
-  if (current) segments.push({ text: current, color: AMBER });
-  return segments;
+  return [{ text: typeStr, color: AMBER }];
 }
 
 export function ColoredType({ type, className }: { type: string; className?: string }) {
