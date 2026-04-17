@@ -109,10 +109,6 @@ function memoryCappedDpr(ideal: number, nodeCount: number): number {
   return Math.max(1, Math.min(ideal, cap));
 }
 
-function initialSpriteDpr(): number {
-  if (typeof window === "undefined") return 1;
-  return Math.min(2, Math.max(1, window.devicePixelRatio || 1));
-}
 
 export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClearFocus }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -132,7 +128,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const hoveredFieldRef = useRef<{ nodeId: string; fieldIndex: number } | null>(null);
   const hoveredNodeRef = useRef<string | null>(null);
   const [cursor, setCursor] = useState<"grab" | "pointer">("grab");
-  const [spriteDprLevel, setSpriteDprLevel] = useState(initialSpriteDpr);
   const { resolved: themeResolved } = useTheme();
 
   // Layout runs off the main thread in a dedicated Web Worker bundled
@@ -379,33 +374,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     return { minX, minY, maxX, maxY };
   }, [laidNodes]);
 
-  // Sprite cache — one offscreen canvas per node, rebuilt when a new
-  // layout arrives, the theme changes, or the sprite DPR level goes
-  // up (so zoomed-in text still renders crisply). The map starts
-  // empty; the draw loop populates entries lazily so invisible nodes
-  // never pay the sprite-build cost.
-  const spriteCache = useMemo(() => {
-    return new Map<string, HTMLCanvasElement>();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [laidNodes, themeResolved, spriteDprLevel]);
-
-  // Adaptive sprite DPR: upgrade when the current zoom level would
-  // start to blur the baked sprites, reset to a sensible baseline on
-  // layout change. Only upgrades during gestures (never downgrades)
-  // so pan + pinch stay a single bitmap blit per frame — no
-  // mid-gesture cache invalidation.
-  const prevLaidNodesRef = useRef<LaidNode[] | null>(null);
+  // Sprite cache and DPR are managed as refs so upgrades take effect
+  // in the same frame (no React state update cycle lag). The draw loop
+  // computes the needed DPR on every frame and clears the cache in-place
+  // when the DPR needs to rise, then rebuilds lazily from there.
+  const spriteCacheRef = useRef(new Map<string, HTMLCanvasElement>());
+  const spriteDprRef = useRef(0);
   useEffect(() => {
-    const ideal = idealSpriteDpr(viewRef.current.k);
-    const capped = memoryCappedDpr(ideal, laidNodes.length);
-    if (prevLaidNodesRef.current !== laidNodes) {
-      prevLaidNodesRef.current = laidNodes;
-      const base = memoryCappedDpr(initialSpriteDpr(), laidNodes.length);
-      setSpriteDprLevel(Math.max(base, capped));
-      return;
-    }
-    setSpriteDprLevel((cur) => Math.max(cur, capped));
-  }, [viewTick, laidNodes]);
+    spriteCacheRef.current.clear();
+    spriteDprRef.current = 0;
+  }, [laidNodes, themeResolved]);
 
   // Auto-fit.
   const fittedKey = useRef("");
@@ -787,8 +765,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         edgeGroups.dimNodeIds,
         hoveredNodeRef.current,
         hoveredFieldRef.current,
-        spriteCache,
-        spriteDprLevel,
+        spriteCacheRef.current,
+        spriteDprRef,
       );
     };
 
@@ -811,7 +789,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         rafRef.current = null;
       }
     };
-  }, [laidNodes, laidEdges, edgeGroups, focusId, size, viewTick, nodeById, spriteCache, spriteDprLevel]);
+  }, [laidNodes, laidEdges, edgeGroups, focusId, size, viewTick, nodeById]);
 
   return (
     <div
@@ -879,7 +857,7 @@ function drawFrame(
   hoveredNodeId: string | null,
   hoveredField: { nodeId: string; fieldIndex: number } | null,
   spriteCache: Map<string, HTMLCanvasElement>,
-  spriteDprLevel: number,
+  spriteDprRef: { current: number },
 ): void {
   const dpr = window.devicePixelRatio || 1;
   const targetW = Math.ceil(size.w * dpr);
@@ -887,6 +865,16 @@ function drawFrame(
   if (canvas.width !== targetW) canvas.width = targetW;
   if (canvas.height !== targetH) canvas.height = targetH;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  // Compute the needed sprite DPR for this frame and upgrade in-place
+  // if the zoom level demands sharper sprites. Clearing and rebuilding
+  // happens lazily within the same frame — no React re-render required.
+  const neededDpr = memoryCappedDpr(idealSpriteDpr(view.k), laidNodes.length);
+  if (neededDpr > spriteDprRef.current) {
+    spriteCache.clear();
+    spriteDprRef.current = neededDpr;
+  }
+  const spriteDpr = spriteDprRef.current || neededDpr;
 
   const bgColor = getComputedCssVar("--background", "#ffffff");
   const cardColor = getComputedCssVar("--card", "#ffffff");
@@ -941,7 +929,7 @@ function drawFrame(
     ) {
       continue;
     }
-    const sprite = getOrBuildSprite(spriteCache, n, spriteContext, spriteDprLevel);
+    const sprite = getOrBuildSprite(spriteCache, n, spriteContext, spriteDpr);
     if (sprite) {
       const isDim = dimNodeIds.has(n.id);
       if (isDim) ctx.globalAlpha = DIM;
