@@ -140,7 +140,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     history: Array<number>(40).fill(0),
     lastSampleAt: 0,
   });
-  const [viewTick, setViewTick] = useState(0);
   const dragRef = useRef({
     active: false,
     lastX: 0,
@@ -424,7 +423,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const cx = (bounds.minX + bounds.maxX) / 2;
     const cy = (bounds.minY + bounds.maxY) / 2;
     viewRef.current = { x: size.w / 2 - cx * k, y: size.h / 2 - cy * k, k };
-    setViewTick((t) => t + 1);
   }, [laidNodes, size, bounds]);
 
   // Focus pan + zoom. Raises zoom to a readable floor so selecting a
@@ -441,7 +439,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       x: size.w / 2 - n.cx * k,
       y: size.h / 2 - n.cy * k,
     };
-    setViewTick((t) => t + 1);
   }, [focusId, nodeById, size.w, size.h]);
 
   // Wheel zoom.
@@ -458,7 +455,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const k = Math.max(0.05, Math.min(4, v.k * scale));
       const ratio = k / v.k;
       viewRef.current = { k, x: mx - (mx - v.x) * ratio, y: my - (my - v.y) * ratio };
-      setViewTick((t) => t + 1);
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
@@ -565,15 +561,11 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       }
       const v = viewRef.current;
       viewRef.current = { ...v, x: v.x + dx, y: v.y + dy };
-      setViewTick((t) => t + 1);
       return;
     }
     const world = screenToWorld(e.clientX, e.clientY);
     if (!world) {
-      if (hoveredFieldRef.current !== null) {
-        hoveredFieldRef.current = null;
-        setViewTick((t) => t + 1);
-      }
+      hoveredFieldRef.current = null;
       return;
     }
     const hit = hitTestField(world.x, world.y);
@@ -585,23 +577,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       hit !== null &&
       prev.nodeId === hit.nodeId &&
       prev.fieldIndex === hit.fieldIndex;
-    let dirty = false;
     if (!same) {
       hoveredFieldRef.current = hit ? { nodeId: hit.nodeId, fieldIndex: hit.fieldIndex } : null;
-      dirty = true;
     }
-    if (hoveredNodeRef.current !== hoveredNode) {
-      hoveredNodeRef.current = hoveredNode;
-      dirty = true;
-    }
-    if (dirty) setViewTick((t) => t + 1);
+    hoveredNodeRef.current = hoveredNode;
   };
   const endDrag = () => {
     dragRef.current.active = false;
-    let dirty = false;
-    if (hoveredFieldRef.current !== null) { hoveredFieldRef.current = null; dirty = true; }
-    if (hoveredNodeRef.current !== null) { hoveredNodeRef.current = null; dirty = true; }
-    if (dirty) setViewTick((t) => t + 1);
+    hoveredFieldRef.current = null;
+    hoveredNodeRef.current = null;
   };
   const onClick = (e: React.MouseEvent) => {
     if (dragRef.current.moved) return;
@@ -692,7 +676,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         }
         const v = viewRef.current;
         viewRef.current = { ...v, x: v.x + dx, y: v.y + dy };
-        setViewTick((t) => t + 1);
         return;
       }
 
@@ -713,7 +696,6 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           x: cx - (cx - v.x) * ratio,
           y: cy - (cy - v.y) * ratio,
         };
-        setViewTick((t) => t + 1);
       }
     };
 
@@ -776,7 +758,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
     if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
 
-    const draw = () => {
+    const loop = () => {
+      rafRef.current = requestAnimationFrame(loop);
       drawFrame(
         canvas,
         ctx,
@@ -796,18 +779,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       );
     };
 
-    if (focusId) {
-      const loop = () => {
-        rafRef.current = requestAnimationFrame(loop);
-        draw();
-      };
-      rafRef.current = requestAnimationFrame(loop);
-    } else {
-      rafRef.current = requestAnimationFrame(() => {
-        rafRef.current = null;
-        draw();
-      });
-    }
+    rafRef.current = requestAnimationFrame(loop);
 
     return () => {
       if (rafRef.current != null) {
@@ -815,7 +787,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         rafRef.current = null;
       }
     };
-  }, [laidNodes, laidEdges, edgeGroups, focusId, size, viewTick, nodeById]);
+  }, [laidNodes, laidEdges, edgeGroups, focusId, size, nodeById]);
 
   return (
     <div
@@ -940,11 +912,12 @@ function drawFrame(
   }
   void focusId; // used indirectly via edgeGroups + focus ring below
 
-  // PASS B — nodes. One drawImage per visible node using the sprite
-  // cache. Sprites carry the full card (chrome + text) at the current
-  // sprite DPR level; they're rebuilt only when the zoom level rises
-  // enough to warrant more resolution, so pan/zoom stays one blit per
-  // node per frame.
+  // PASS B — nodes. Per-frame sprite build budget: if building sprites
+  // would bust the frame time, draw a solid-color fallback this frame
+  // and signal the wrapper to schedule an immediate follow-up RAF so
+  // the remaining sprites get built without ever dropping a frame.
+  const SPRITE_BUDGET_MS = 4;
+  const budgetDeadline = performance.now() + SPRITE_BUDGET_MS;
   const spriteContext = { cardColor, fgColor, mutedFg };
   for (const n of laidNodes) {
     const nLeft = n.cx - n.w / 2;
@@ -959,12 +932,19 @@ function drawFrame(
     ) {
       continue;
     }
-    const sprite = getOrBuildSprite(spriteCache, n, spriteContext, spriteDpr, lod);
+    const buildAllowed = performance.now() < budgetDeadline;
+    const sprite = getOrBuildSprite(spriteCache, n, spriteContext, spriteDpr, lod, buildAllowed);
+    const isDim = dimNodeIds.has(n.id);
     if (sprite) {
-      const isDim = dimNodeIds.has(n.id);
       if (isDim) ctx.globalAlpha = DIM;
       ctx.drawImage(sprite, nLeft, nTop, n.w, n.h);
       if (isDim) ctx.globalAlpha = 1;
+    } else {
+      ctx.globalAlpha = isDim ? DIM : 1;
+      ctx.fillStyle = KIND_COLORS[n.data.kind];
+      roundRect(ctx, nLeft, nTop, n.w, n.h, 6);
+      ctx.fill();
+      ctx.globalAlpha = 1;
     }
   }
 
@@ -1235,11 +1215,12 @@ function getOrBuildSprite(
   ctxColors: SpriteCtx,
   dpr: number,
   lod: SpriteLOD,
+  buildAllowed: boolean,
 ): HTMLCanvasElement | null {
   const key = `${n.id}:${lod}`;
   const existing = cache.get(key);
   if (existing) return existing;
-  if (typeof document === "undefined") return null;
+  if (!buildAllowed || typeof document === "undefined") return null;
   const can = document.createElement("canvas");
   can.width = Math.ceil(n.w * dpr);
   can.height = Math.ceil(n.h * dpr);
