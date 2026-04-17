@@ -1032,6 +1032,74 @@ function drawFrame(
   // Silence unused — keep laidEdges in scope for future hit-testing.
   void laidEdges;
 
+  // PASS D — deprecated field tooltip (screen space).
+  if (hoveredField) {
+    const n = nodeById.get(hoveredField.nodeId);
+    if (n) {
+      const isDepField = n.data.fields?.[hoveredField.fieldIndex]?.isDeprecated;
+      const isDepValue = n.data.values?.[hoveredField.fieldIndex]?.isDeprecated;
+      if (isDepField || isDepValue) {
+        const raw = n.data.fields?.[hoveredField.fieldIndex]?.deprecationReason
+          ?? n.data.values?.[hoveredField.fieldIndex]?.deprecationReason;
+        const reason = raw?.trim() || "Deprecated";
+
+        // Field row centre in world space → screen space (CSS px).
+        const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
+        const rowCentreY = (n.cy - n.h / 2) + bodyTop + hoveredField.fieldIndex * ROW_H + ROW_H / 2;
+        const sx = (n.cx + n.w / 2) * view.k + view.x + 10;
+        const sy = rowCentreY * view.k + view.y;
+
+        ctx.save();
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.font = `500 11px ${MONO}`;
+
+        const PAD_X = 8;
+        const textW = ctx.measureText(reason).width;
+        const TIP_H = 22;
+        const TIP_W = textW + PAD_X * 2 + 14; // 14 = icon space
+
+        // Flip left if it would overflow right edge.
+        const canvasW = canvas.width / dpr;
+        const canvasH = canvas.height / dpr;
+        const tipX = sx + TIP_W > canvasW ? (n.cx - n.w / 2) * view.k + view.x - TIP_W - 10 : sx;
+        const tipY = Math.max(4, Math.min(canvasH - TIP_H - 4, sy - TIP_H / 2));
+
+        // Shadow.
+        ctx.shadowColor = "rgba(0,0,0,0.18)";
+        ctx.shadowBlur = 6;
+        ctx.shadowOffsetY = 2;
+
+        // Background + amber border.
+        ctx.fillStyle = cardColor;
+        ctx.globalAlpha = 0.97;
+        roundRect(ctx, tipX, tipY, TIP_W, TIP_H, 4);
+        ctx.fill();
+        ctx.shadowColor = "transparent";
+        ctx.shadowBlur = 0;
+        ctx.shadowOffsetY = 0;
+        ctx.strokeStyle = "#f59e0b";
+        ctx.lineWidth = 1;
+        ctx.globalAlpha = 0.65;
+        roundRect(ctx, tipX, tipY, TIP_W, TIP_H, 4);
+        ctx.stroke();
+
+        // ⚠ icon.
+        ctx.font = `12px sans-serif`;
+        ctx.fillStyle = "#f59e0b";
+        ctx.globalAlpha = 0.9;
+        ctx.fillText("⚠", tipX + PAD_X, tipY + TIP_H / 2 + 4);
+
+        // Reason text.
+        ctx.font = `500 11px ${MONO}`;
+        ctx.fillStyle = fgColor;
+        ctx.globalAlpha = 0.85;
+        ctx.fillText(reason, tipX + PAD_X + 14, tipY + TIP_H / 2 + 4);
+
+        ctx.restore();
+      }
+    }
+  }
+
   // FPS overlay — bottom-right corner, screen-space (identity transform).
   const now = performance.now();
   const fp = fpsRef.current;
@@ -1346,7 +1414,18 @@ function drawNodeSprite(
       const f = fields[i]!;
       const fy = bodyY + i * ROW_H + 10;
       ctx.fillStyle = fgColor;
+      ctx.globalAlpha = f.isDeprecated ? 0.4 : 1;
       ctx.fillText(f.name, 10, fy);
+      if (f.isDeprecated) {
+        const nameW = ctx.measureText(f.name).width;
+        ctx.strokeStyle = fgColor;
+        ctx.lineWidth = 0.75;
+        ctx.beginPath();
+        ctx.moveTo(10, fy - 3.5);
+        ctx.lineTo(10 + nameW, fy - 3.5);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
       if (f.isRelayConnection) {
         const typeW = ctx.measureText(f.type).width;
         const iconCx = w - 10 - typeW - 8;

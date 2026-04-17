@@ -1,4 +1,4 @@
-import { Kind, parse, type TypeNode } from "graphql";
+import { Kind, parse, type ConstDirectiveNode, type TypeNode } from "graphql";
 
 export type NodeKind = "Object" | "Interface" | "Union" | "Enum" | "Scalar" | "Input";
 
@@ -10,11 +10,15 @@ export interface GraphField {
   isRelayConnection?: boolean;
   args?: { name: string; type: string; typeName: string }[];
   description?: string;
+  isDeprecated?: boolean;
+  deprecationReason?: string;
 }
 
 export interface EnumValue {
   name: string;
   description?: string;
+  isDeprecated?: boolean;
+  deprecationReason?: string;
 }
 
 export interface GraphNodeData {
@@ -76,6 +80,14 @@ function isRelayBoilerplate(node: GraphNodeData): boolean {
   return false;
 }
 
+function parseDeprecated(directives: readonly ConstDirectiveNode[] | undefined): { isDeprecated: boolean; deprecationReason?: string } {
+  const d = directives?.find((d) => d.name.value === "deprecated");
+  if (!d) return { isDeprecated: false };
+  const reason = d.arguments?.find((a) => a.name.value === "reason");
+  const reasonValue = reason?.value.kind === Kind.STRING ? reason.value.value : undefined;
+  return { isDeprecated: true, deprecationReason: reasonValue };
+}
+
 function renderType(t: TypeNode): { rendered: string; base: string } {
   if (t.kind === Kind.NON_NULL_TYPE) {
     const inner = renderType(t.type);
@@ -116,6 +128,7 @@ export function sdlToGraph(sdl: string): ParsedGraph {
         const fields: GraphField[] = [];
         for (const f of def.fields ?? []) {
           const t = renderType(f.type);
+          const dep = parseDeprecated(f.directives);
           fields.push({
             name: f.name.value,
             type: t.rendered,
@@ -130,6 +143,7 @@ export function sdlToGraph(sdl: string): ParsedGraph {
                     typeName: renderType(a.type).base,
                   }))
                 : undefined,
+            ...(dep.isDeprecated && { isDeprecated: true, deprecationReason: dep.deprecationReason }),
           });
         }
 
@@ -155,10 +169,14 @@ export function sdlToGraph(sdl: string): ParsedGraph {
           kind: "Enum",
           description: def.description?.value,
           values:
-            def.values?.map((v) => ({
-              name: v.name.value,
-              description: v.description?.value,
-            })) ?? [],
+            def.values?.map((v) => {
+              const dep = parseDeprecated(v.directives);
+              return {
+                name: v.name.value,
+                description: v.description?.value,
+                ...(dep.isDeprecated && { isDeprecated: true, deprecationReason: dep.deprecationReason }),
+              };
+            }) ?? [],
         });
         break;
       case Kind.UNION_TYPE_DEFINITION: {

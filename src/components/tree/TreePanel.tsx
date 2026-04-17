@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Clock, Filter, Search, Share2, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Clock, Filter, Search, Share2, TriangleAlert, X } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
@@ -674,7 +674,15 @@ function TypeDetail({
           {node.values?.map((v) => (
             <li key={v.name} className="rounded px-2 py-1">
               <div className="flex flex-col gap-0.5">
-                <span className="text-foreground">{v.name}</span>
+                <span className={cn("flex items-center gap-1", v.isDeprecated && "text-muted-foreground/60")}>
+                  {v.isDeprecated && <TriangleAlert className="h-2.5 w-2.5 shrink-0 text-amber-500/70" />}
+                  <span className={cn("text-foreground", v.isDeprecated && "line-through decoration-muted-foreground/40")}>{v.name}</span>
+                </span>
+                {v.deprecationReason && (
+                  <span className="text-[11px] font-sans leading-snug text-amber-600/70 dark:text-amber-400/70">
+                    {v.deprecationReason}
+                  </span>
+                )}
                 {v.description && (
                   <span className="text-[11px] font-sans leading-snug text-muted-foreground">
                     {v.description}
@@ -723,6 +731,8 @@ function TypeDetail({
                   chain={chain}
                   description={f.description}
                   args={f.args?.map((a) => ({ ...a, navigable: isNavigable(a.typeName) }))}
+                  isDeprecated={f.isDeprecated}
+                  deprecationReason={f.deprecationReason}
                   onNavigate={onNavigate}
                 />
               </li>
@@ -749,12 +759,16 @@ function FieldRow({
   chain,
   description,
   args,
+  isDeprecated,
+  deprecationReason,
   onNavigate,
 }: {
   label: string;
   chain: ChainItem[];
   description?: string;
   args?: { name: string; type: string; typeName: string; navigable: boolean }[];
+  isDeprecated?: boolean;
+  deprecationReason?: string;
   onNavigate: (id: string) => void;
 }) {
   const [hovered, setHovered] = useState(false);
@@ -767,6 +781,13 @@ function FieldRow({
   const arityBadge = hasArgs ? (
     <span className="font-mono text-[10px] text-muted-foreground/60">
       ({requiredArgCount}/{args!.length})
+    </span>
+  ) : null;
+
+  const deprecatedNote = isDeprecated ? (
+    <span className="flex items-center gap-1 font-sans text-[11px] leading-snug text-amber-600/80 dark:text-amber-400/80">
+      <TriangleAlert className="h-2.5 w-2.5 shrink-0" />
+      {deprecationReason ?? "Deprecated"}
     </span>
   ) : null;
 
@@ -825,10 +846,11 @@ function FieldRow({
         className={cn(
           "group flex w-full flex-col gap-0.5 rounded px-2 py-1 text-left",
           single.navigable ? "cursor-pointer hover:bg-secondary/60" : "cursor-default",
+          isDeprecated && "opacity-60",
         )}
       >
         <span className="flex w-full items-center justify-between gap-2">
-          <span className="flex min-w-0 items-center gap-1 truncate text-foreground">
+          <span className={cn("flex min-w-0 items-center gap-1 truncate text-foreground", isDeprecated && "line-through decoration-muted-foreground/50")}>
             {label}
             {arityBadge}
           </span>
@@ -840,6 +862,7 @@ function FieldRow({
             {single.navigable && <ChevronRight className="h-3 w-3 text-muted-foreground" />}
           </span>
         </span>
+        {deprecatedNote}
         {description && (
           <span className="font-sans text-[11px] leading-snug text-muted-foreground">
             {description}
@@ -852,12 +875,12 @@ function FieldRow({
 
   return (
     <div
-      className="flex w-full flex-col gap-0.5 rounded px-2 py-1 hover:bg-secondary/60"
+      className={cn("flex w-full flex-col gap-0.5 rounded px-2 py-1 hover:bg-secondary/60", isDeprecated && "opacity-60")}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
       <span className="flex w-full items-center justify-between gap-2">
-        <span className="flex min-w-0 items-center gap-1 truncate text-foreground">
+        <span className={cn("flex min-w-0 items-center gap-1 truncate text-foreground", isDeprecated && "line-through decoration-muted-foreground/50")}>
           {label}
           {arityBadge}
         </span>
@@ -872,6 +895,7 @@ function FieldRow({
           ))}
         </span>
       </span>
+      {deprecatedNote}
       {description && (
         <span className="font-sans text-[11px] leading-snug text-muted-foreground">
           {description}
