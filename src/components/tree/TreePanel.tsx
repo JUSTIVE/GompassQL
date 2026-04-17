@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, Share2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
@@ -64,6 +64,12 @@ export function TreePanel() {
     const idx = focusStack.indexOf(id);
     if (idx >= 0) {
       popTo(idx);
+      return;
+    }
+    // If the type is not visible in the current graph, make it the new root
+    // so it appears in the canvas and can be highlighted.
+    if (!byId.has(id)) {
+      setRootType(id);
       return;
     }
     pushFocus(id);
@@ -305,6 +311,7 @@ function TypeDetail({
                   typeLabel={f.type}
                   description={f.description}
                   navigable={nav}
+                  isRelayConnection={f.isRelayConnection}
                   onClick={() => nav && onNavigate(f.typeName)}
                 />
               </li>
@@ -324,12 +331,14 @@ function FieldRow({
   typeLabel,
   description,
   navigable,
+  isRelayConnection,
   onClick,
 }: {
   label: string;
   typeLabel: string;
   description?: string;
   navigable: boolean;
+  isRelayConnection?: boolean;
   onClick: () => void;
 }) {
   return (
@@ -352,6 +361,9 @@ function FieldRow({
             navigable && "group-hover:opacity-80",
           )}
         >
+          {isRelayConnection && typeLabel && (
+            <Share2 className="h-2.5 w-2.5 shrink-0 text-violet-500 opacity-70" />
+          )}
           {typeLabel ? <ColoredType type={typeLabel} /> : null}
           {navigable && <ChevronRight className="h-3 w-3 text-muted-foreground" />}
         </span>

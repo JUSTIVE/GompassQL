@@ -184,7 +184,14 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate }: Prop
     if (!worker) return;
     const layoutNodes = nodes.map((n) => ({
       id: n.id,
-      width: estimateNodeWidth(n.name, n.fields?.map((x) => [x.name, x.typeName] as const) ?? []),
+      width: estimateNodeWidth(
+        n.name,
+        n.kind === "Enum"
+          ? (n.values?.map((v) => [v.name, ""] as const) ?? [])
+          : n.kind === "Union"
+            ? (n.members?.map((m) => ["| " + m, ""] as const) ?? [])
+            : (n.fields?.map((x) => [x.name, x.typeName] as const) ?? []),
+      ),
       height: estimateNodeHeight(
         n.kind,
         n.fields?.length ?? 0,
@@ -818,10 +825,15 @@ function drawFrame(
     const n = nodeById.get(focusId);
     if (n) {
       const color = KIND_COLORS[n.data.kind];
+      ctx.save();
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 12;
       ctx.strokeStyle = color;
-      ctx.lineWidth = 2.5;
-      roundRect(ctx, n.cx - n.w / 2, n.cy - n.h / 2, n.w, n.h, 6);
+      ctx.lineWidth = 3;
+      const pad = 2;
+      roundRect(ctx, n.cx - n.w / 2 - pad, n.cy - n.h / 2 - pad, n.w + pad * 2, n.h + pad * 2, 8);
       ctx.stroke();
+      ctx.restore();
     }
   }
 
@@ -1029,9 +1041,48 @@ function drawNodeSprite(
       const fy = bodyY + i * ROW_H + 10;
       ctx.fillStyle = fgColor;
       ctx.fillText(f.name, 10, fy);
+      if (f.isRelayConnection) {
+        const typeW = ctx.measureText(f.type).width;
+        const iconCx = w - 10 - typeW - 8;
+        drawRelayIcon(ctx, iconCx, fy - 2);
+        ctx.font = `10px ${MONO}`;
+      }
       drawColoredType(ctx, f.type, w - 10, fy, mutedFg);
     }
   }
+}
+
+// ─── Relay icon ─────────────────────────────────────────────────────
+
+/** Draws a tiny 3-node relay network icon (8×7 px) centred at (cx, cy). */
+function drawRelayIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number) {
+  ctx.save();
+  const color = "#8b5cf6"; // violet-500 — relay brand color
+  const r = 1.5;
+  const pts = [
+    { x: cx, y: cy - 3.5 },
+    { x: cx - 3.5, y: cy + 2 },
+    { x: cx + 3.5, y: cy + 2 },
+  ];
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 0.8;
+  ctx.globalAlpha = 0.55;
+  ctx.beginPath();
+  ctx.moveTo(pts[0]!.x, pts[0]!.y);
+  ctx.lineTo(pts[1]!.x, pts[1]!.y);
+  ctx.moveTo(pts[0]!.x, pts[0]!.y);
+  ctx.lineTo(pts[2]!.x, pts[2]!.y);
+  ctx.moveTo(pts[1]!.x, pts[1]!.y);
+  ctx.lineTo(pts[2]!.x, pts[2]!.y);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = color;
+  for (const p of pts) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
 }
 
 // ─── Drawing helpers ─────────────────────────────────────────────────
