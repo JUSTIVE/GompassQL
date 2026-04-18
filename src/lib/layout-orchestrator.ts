@@ -18,6 +18,17 @@ import { cacheGet, cachePut, hashLayoutInputs } from "./layout-cache";
 const SINGLETON_GAP = 20;
 const SINGLETON_MAX_ROW_WIDTH = 1200;
 const PACK_MARGIN = 80;
+const FALLBACK_GRID_GAP = 40;
+
+// Components above these thresholds skip dot entirely. GraphViz's
+// rank + mincross + spline-routing stages grow super-linearly in the
+// edge count specifically — spline routing on a few thousand edges
+// drives the WASM heap past Chrome's renderer budget and crashes the
+// tab. Node count matters less than edge count, so we gate on both.
+// Over the limit: alphabetized grid on the main thread (no edges —
+// navigation stays on the tree panel).
+const LAYOUT_NODE_LIMIT = 500;
+const LAYOUT_EDGE_LIMIT = 2000;
 
 export interface OrchestratorTimings {
   similarityMs: number;
@@ -26,6 +37,7 @@ export interface OrchestratorTimings {
   componentCount: number;
   parallelWorkers: number;
   singletonCount: number;
+  fallbackNodeCount: number;
   fromCache: boolean;
   cacheLookupMs: number;
 }
@@ -47,6 +59,45 @@ export interface OrchestratorRequest {
 interface Pending {
   resolve: (r: LayoutWorkerResponse) => void;
   reject: (e: Error) => void;
+}
+
+/**
+ * Main-thread fallback for oversized components. Places nodes on an
+ * √n×√n grid sorted by id so users can still find types by name, and
+ * returns zero edges — rendering 10k straight lines across random grid
+ * positions would fill tile memory with visually meaningless spaghetti.
+ */
+function fallbackGridLayout(
+  layoutNodes: readonly LayoutNodeInput[],
+): LayoutResult {
+  if (layoutNodes.length === 0) return { nodes: [], edgePaths: [] };
+  const sorted = [...layoutNodes].sort((a, b) => a.id.localeCompare(b.id));
+  const cols = Math.max(1, Math.ceil(Math.sqrt(sorted.length)));
+
+  const positioned: PositionedNode[] = [];
+  let x = 0;
+  let y = 0;
+  let rowH = 0;
+  let col = 0;
+  for (const ln of sorted) {
+    if (col >= cols) {
+      y += rowH + FALLBACK_GRID_GAP;
+      x = 0;
+      col = 0;
+      rowH = 0;
+    }
+    positioned.push({
+      id: ln.id,
+      width: ln.width,
+      height: ln.height,
+      x: x + ln.width / 2,
+      y: y + ln.height / 2,
+    });
+    x += ln.width + FALLBACK_GRID_GAP;
+    if (ln.height > rowH) rowH = ln.height;
+    col++;
+  }
+  return { nodes: positioned, edgePaths: [] };
 }
 
 function layoutSingletonsGrid(
@@ -279,6 +330,7 @@ export class LayoutOrchestrator {
           totalMs: +(tCacheLookupEnd - tStart).toFixed(1),
           componentCount: 0,
           singletonCount: 0,
+          fallbackNodeCount: 0,
           parallelWorkers: this.workers.length,
           fromCache: true,
           cacheLookupMs: +(tCacheLookupEnd - tStart).toFixed(1),
@@ -313,6 +365,9 @@ export class LayoutOrchestrator {
       edgesByComp[ci]!.push(e);
     }
 
+    const fallbackResults: LayoutResult[] = [];
+    let fallbackNodeCount = 0;
+
     for (let i = 0; i < comps.length; i++) {
       const comp = comps[i]!;
       if (comp.nodeIds.size === 1) {
@@ -322,13 +377,29 @@ export class LayoutOrchestrator {
         continue;
       }
       const compNodeIds = [...comp.nodeIds];
-      const compNodes: GraphNodeData[] = [];
       const compLayoutNodes: LayoutNodeInput[] = [];
       for (const id of compNodeIds) {
-        const n = nodeById.get(id);
         const ln = layoutNodeById.get(id);
-        if (n) compNodes.push(n);
         if (ln) compLayoutNodes.push(ln);
+      }
+
+      const compEdgeCount = edgesByComp[i]!.length;
+      if (
+        comp.nodeIds.size > LAYOUT_NODE_LIMIT ||
+        compEdgeCount > LAYOUT_EDGE_LIMIT
+      ) {
+        // Oversized component — skip dot, lay out as alphabetical grid
+        // on the main thread. Prevents GraphViz's WASM heap from
+        // taking the tab down on very large schemas.
+        fallbackResults.push(fallbackGridLayout(compLayoutNodes));
+        fallbackNodeCount += comp.nodeIds.size;
+        continue;
+      }
+
+      const compNodes: GraphNodeData[] = [];
+      for (const id of compNodeIds) {
+        const n = nodeById.get(id);
+        if (n) compNodes.push(n);
       }
       multiComps.push({
         nodes: compNodes,
@@ -337,24 +408,39 @@ export class LayoutOrchestrator {
       });
     }
 
-    // 3. Dispatch multi-node components in parallel
+    // 3. Dispatch multi-node components in parallel. Each component's
+    // full `GraphNodeData[]` can be 5–10 MB on a big schema; we strip
+    // it down to just the fields the worker actually needs so the
+    // structured-clone into each Worker doesn't duplicate that memory.
     const tDispatchStart = performance.now();
     const compResponses = await Promise.all(
-      multiComps.map((c) =>
-        this.dispatch({
-          nodes: c.nodes,
-          edges: c.edges,
+      multiComps.map((c) => {
+        const knownIds = c.nodes.map((n) => n.id);
+        const unions = c.nodes
+          .filter((n) => n.kind === "Union")
+          .map((n) => ({ id: n.id, members: n.members ?? [] }));
+        const minEdges = c.edges.map((e) => ({
+          id: e.id,
+          source: e.source,
+          target: e.target,
+          kind: e.kind,
+        }));
+        return this.dispatch({
+          unions,
+          knownIds,
+          edges: minEdges,
           layoutNodes: c.layoutNodes,
           rootId: null,
-        }),
-      ),
+        });
+      }),
     );
     const tLayoutDone = performance.now();
 
-    // 4. Compose boxes: multi-comp results + singleton grid (if any)
+    // 4. Compose boxes: multi-comp results + fallback grids + singleton grid (if any)
     const boxes: BoxedResult[] = compResponses.map((r) =>
       boundingBox(r.result),
     );
+    for (const fr of fallbackResults) boxes.push(boundingBox(fr));
     if (singletonLayoutNodes.length > 0) {
       const { nodes: gridNodes } = layoutSingletonsGrid(singletonLayoutNodes);
       boxes.push(
@@ -391,6 +477,7 @@ export class LayoutOrchestrator {
         totalMs: +(tEnd - tStart).toFixed(1),
         componentCount: multiComps.length,
         singletonCount: singletonLayoutNodes.length,
+        fallbackNodeCount,
         parallelWorkers: this.workers.length,
         fromCache: false,
         cacheLookupMs: +(tCacheLookupEnd - tStart).toFixed(1),
@@ -410,8 +497,17 @@ export class LayoutOrchestrator {
 }
 
 export function defaultPoolSize(): number {
-  const hc =
-    typeof navigator !== "undefined" ? navigator.hardwareConcurrency : 0;
+  if (typeof navigator === "undefined") return 2;
+  const hc = navigator.hardwareConcurrency ?? 0;
+  // deviceMemory is reported in GB (e.g. 4, 8). Only Chromium exposes
+  // it; Safari/Firefox leave it undefined so assume a modern laptop.
+  const mem = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8;
+  const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+  // Each Worker carries its own GraphViz WASM instance (~10–30 MB
+  // resident). On 4 GB phones with ~256 MB tab budget, spinning up 4
+  // of those on top of the edge/sprite tile caches OOMs the renderer.
+  if (isMobile || mem <= 4) return 1;
   if (!hc || hc <= 2) return 2;
   return Math.min(4, hc - 2);
 }

@@ -6,24 +6,33 @@ import {
   type LayoutResult,
   type SimilarityHint,
 } from "./layout";
-import type { GraphEdgeData, GraphNodeData } from "./sdl-to-graph";
-import { computeSimilarityPairs } from "./similarity";
+import { computeSimilarityPairs, type UnionInput } from "./similarity";
 
 /**
  * Dedicated worker entrypoint. Lays out a single (sub-)graph with
  * GraphViz. The main-thread `LayoutOrchestrator` handles hub-edge
- * filtering and weakly-connected-component splitting — this worker
- * just runs similarity + dot for whatever it's given.
+ * filtering, weakly-connected-component splitting, AND stripping
+ * non-layout node metadata before postMessage — this worker accepts a
+ * minimal payload so very large schemas don't duplicate MB of
+ * description/field data across N worker clones.
  *
  * This file is bundled to a standalone module at `/layout-worker.js`:
  *   - dev: `src/index.ts` serves it via `Bun.build()` at request time
  *   - prod: `build.ts` emits `dist/layout-worker.js` alongside the HTML bundle
  */
 
+export interface WorkerEdgeInput {
+  id: string;
+  source: string;
+  target: string;
+  kind: string;
+}
+
 export interface LayoutWorkerRequest {
   id: number;
-  nodes: GraphNodeData[];
-  edges: GraphEdgeData[];
+  unions: UnionInput[];
+  knownIds: string[];
+  edges: WorkerEdgeInput[];
   layoutNodes: LayoutNodeInput[];
   rootId?: string | null;
 }
@@ -53,10 +62,11 @@ preloadLayoutEngine().catch(() => {
 });
 
 ctx.onmessage = async (e: MessageEvent<LayoutWorkerRequest>) => {
-  const { id, nodes, edges, layoutNodes, rootId } = e.data;
+  const { id, unions, knownIds, edges, layoutNodes, rootId } = e.data;
   const t0 = performance.now();
 
-  const allPairs = computeSimilarityPairs(nodes, edges);
+  const knownIdSet = new Set(knownIds);
+  const allPairs = computeSimilarityPairs(unions, knownIdSet);
   const hintBudget = Math.min(
     allPairs.length,
     MAX_HINTS_PER_NODE * layoutNodes.length,

@@ -8,7 +8,7 @@ import {
   type OrchestratorRequest,
   type OrchestratorTimings,
 } from "@/lib/layout-orchestrator";
-import type { GraphEdgeData, GraphNodeData } from "@/lib/sdl-to-graph";
+import type { GraphEdgeData, GraphNodeData, NodeKind } from "@/lib/sdl-to-graph";
 import { useTheme } from "@/lib/theme";
 import {
   HEADER_H,
@@ -93,6 +93,48 @@ const EMPTY_LAYOUT: LayoutResult = { nodes: [], edgePaths: [] };
 const CULL_PAD = 100;
 const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
 
+// Edge tiling. Large schemas tessellate millions of vertices across
+// their 10k+ edges; a single monolithic `Graphics` for all of them
+// blows through mobile GPU budgets. We partition world-space into
+// TILE_SIZE cells, build per-tile Graphics lazily when the tile enters
+// the viewport, and destroy them once they've been off-screen long
+// enough. Edges whose bbox spans multiple tiles are registered in each
+// overlapping tile — duplication is bounded (typically 1–2×) because
+// dot's layout keeps connected nodes spatially close.
+const TILE_SIZE = 2048;
+const TILE_EVICT_FRAMES = 180;
+const TILE_VIEW_PADDING = 256;
+
+// Sprite viewport management. Mirrors the edge-tile strategy: only
+// sprites currently inside the padded viewport get real textures;
+// off-screen sprites show a tinted placeholder so texture memory
+// scales with visible area instead of total node count.
+const SPRITE_VIEW_PADDING = 200;
+const SPRITE_EVICT_FRAMES = 180;
+
+// Quiet-period gate for GPU uploads. While the user is actively
+// panning or zooming we keep sprites on their tinted placeholder and
+// defer tile/texture builds — a fast pan on a large schema can queue
+// hundreds of `texImage2D` calls per second and crash mobile GPU
+// drivers. Once the view has been stable for this many milliseconds
+// we resume progressive builds.
+const MOTION_SETTLE_MS = 150;
+
+interface EdgeTileGroupLists {
+  dim: LaidEdge[];
+  active: LaidEdge[];
+}
+
+interface EdgeTile {
+  key: string;
+  col: number;
+  row: number;
+  groupLists: EdgeTileGroupLists[];
+  edgeGraphics: Graphics | null;
+  arrowGraphics: Graphics | null;
+  lastSeenFrame: number;
+}
+
 // LOD tiers
 type SpriteLOD = "full" | "bar" | "chrome";
 const LOD_FULL = 0.22;
@@ -122,21 +164,35 @@ const BAR_NAME_FRACS = [0.62, 0.50, 0.71, 0.55, 0.44, 0.68];
 const BAR_FIELD_FRACS = [0.44, 0.36, 0.52, 0.38, 0.46, 0.32];
 const BAR_TYPE_FRACS = [0.24, 0.30, 0.20, 0.27, 0.22, 0.28];
 
-const MAX_SPRITE_DPR = 4;
-
-function idealSpriteDpr(viewK: number): number {
+// Conservative DPR caps that survive 1,400-node schemas on every
+// device we care about. Per-tab GPU budget in Chrome lands around
+// 500 MB even on desktop; at bar DPR=2 a 1,400-sprite schema plus
+// framebuffer and internal Pixi state overruns that on an active
+// pan and the renderer process dies ("Aw, Snap!"). Bar LOD is just
+// fake-bar hints, DPR 1 is indistinguishable at zoom. Full LOD gets
+// DPR 2 so text is still crisp for zoomed-in inspection.
+function spriteDprForLod(lod: SpriteLOD): number {
   const monitorDpr =
     typeof window !== "undefined" ? Math.max(1, window.devicePixelRatio || 1) : 1;
-  const needed = Math.ceil(monitorDpr * Math.max(1, viewK));
-  return Math.min(MAX_SPRITE_DPR, Math.max(1, needed));
+  if (lod === "chrome") return 1;
+  if (lod === "bar") return 1;
+  return Math.min(2, Math.max(1, Math.ceil(monitorDpr)));
 }
 
-function memoryCappedDpr(ideal: number, nodeCount: number): number {
-  if (nodeCount <= 0) return ideal;
-  // Budget raised so 400-node schemas still get DPR≥2 on retina.
-  // Old 1250 forced DPR=1 at 400 nodes → blurry text.
-  const cap = Math.max(1, Math.floor(Math.sqrt(5000 / nodeCount)));
-  return Math.max(1, Math.min(ideal, cap));
+// LOD-aware live texture cache caps. "bar" is cheap (48 KB/texture at
+// DPR=1) so we let a 1,400-node grid fully populate; "full" costs 4×
+// more per texture so we keep the ceiling tight. When the cap is hit
+// the drain simply stops — remaining sprites stay on the tint
+// placeholder until off-screen sprites evict and free room. We never
+// evict currently-in-view sprites to make space, because on a
+// schema whose viewport contains more sprites than the cap allows
+// that would become a permanent build→evict→rebuild churn and crash
+// the GPU driver within a couple of seconds.
+const MAX_TEXTURE_CACHE_BAR = 1600;
+const MAX_TEXTURE_CACHE_FULL = 400;
+
+function maxTextureCacheFor(lod: SpriteLOD): number {
+  return lod === "bar" ? MAX_TEXTURE_CACHE_BAR : MAX_TEXTURE_CACHE_FULL;
 }
 
 function getComputedCssVar(name: string, fallback: string): string {
@@ -411,6 +467,50 @@ function drawNodeSprite(
   }
 }
 
+/**
+ * Shared "chrome/bar LOD" placeholder texture for one node kind.
+ * Small (256×128 DPR 1 = 128 KB) and reused across every sprite of
+ * that kind — so a 1,400-node schema only ever needs 6 placeholder
+ * uploads total (one per NodeKind) instead of 1,400. Each texture
+ * paints a rounded card silhouette with the kind's accent color as
+ * the header strip and a low-alpha body tint beneath.
+ */
+function buildKindPlaceholderTexture(kind: NodeKind): Texture {
+  const w = 256;
+  const h = 128;
+  const headerH = 32;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return Texture.WHITE;
+  const color = KIND_COLORS[kind];
+
+  // Body: low-alpha kind color so the card reads as "muted" behind the
+  // header. The card stays legible on both light and dark backgrounds
+  // because Pixi composites against the scene's actual background.
+  roundRect(ctx, 0, 0, w, h, 10);
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.18;
+  ctx.fill();
+
+  // Header: full-opacity kind color strip across the top.
+  ctx.globalAlpha = 1;
+  roundRectTopOnly(ctx, 0, 0, w, headerH, 10);
+  ctx.fillStyle = color;
+  ctx.fill();
+
+  // Outline to sharpen the card edge after scaling.
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = 0.55;
+  ctx.lineWidth = 1.5;
+  roundRect(ctx, 0.75, 0.75, w - 1.5, h - 1.5, 9.5);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  return Texture.from(canvas);
+}
+
 // ─── Dashed bezier walker ─────────────────────────────────────────────
 
 /** Sample a cubic bezier at parameter t */
@@ -523,6 +623,63 @@ function drawSolidBezierEdge(g: Graphics, edge: LaidEdge) {
   }
 }
 
+/**
+ * Build the edge + arrow Graphics for a single tile. The scope of a
+ * tile is bounded, so vertex-buffer size per Graphics stays small even
+ * when the whole schema has 10k+ edges. Called lazily the first time a
+ * tile enters the viewport; destroyed after it's been off-screen long.
+ */
+function buildEdgeTileGraphics(
+  tile: EdgeTile,
+  groups: EdgeGroupSpec[],
+): { edge: Graphics; arrow: Graphics } {
+  const edge = new Graphics();
+  const arrow = new Graphics();
+  const DIM = 0.1;
+  const STROKE_W = 1.4;
+
+  for (let gi = 0; gi < groups.length; gi++) {
+    const group = groups[gi]!;
+    const lists = tile.groupLists[gi];
+    if (!lists) continue;
+    const colorHex = group.colorHex;
+
+    if (lists.dim.length > 0) {
+      if (group.dash.length > 0) {
+        for (const e of lists.dim) {
+          drawDashedBezierEdge(edge, e, group.dash, colorHex, DIM, STROKE_W);
+        }
+        edge.stroke({ width: STROKE_W, color: colorHex, alpha: DIM });
+      } else {
+        edge.beginPath();
+        for (const e of lists.dim) drawSolidBezierEdge(edge, e);
+        edge.stroke({ width: STROKE_W, color: colorHex, alpha: DIM });
+      }
+      arrow.beginPath();
+      for (const e of lists.dim) drawArrowHead(arrow, e);
+      arrow.fill({ color: colorHex, alpha: DIM });
+    }
+
+    if (lists.active.length > 0) {
+      if (group.dash.length > 0) {
+        for (const e of lists.active) {
+          drawDashedBezierEdge(edge, e, group.dash, colorHex, 1, STROKE_W);
+        }
+        edge.stroke({ width: STROKE_W, color: colorHex, alpha: 1 });
+      } else {
+        edge.beginPath();
+        for (const e of lists.active) drawSolidBezierEdge(edge, e);
+        edge.stroke({ width: STROKE_W, color: colorHex, alpha: 1 });
+      }
+      arrow.beginPath();
+      for (const e of lists.active) drawArrowHead(arrow, e);
+      arrow.fill({ color: colorHex, alpha: 1 });
+    }
+  }
+
+  return { edge, arrow };
+}
+
 /** Draw arrowhead for an edge onto a Pixi Graphics already set up for fill */
 function drawArrowHead(g: Graphics, edge: LaidEdge) {
   const lastSeg = edge.segments[edge.segments.length - 1]!;
@@ -595,16 +752,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const sceneRef = useRef<{
     gridTiling: TilingSprite | null;
     world: Container | null;
-    edgeGraphics: Graphics | null;
-    arrowGraphics: Graphics | null;
+    edgeTileContainer: Container | null;
+    arrowTileContainer: Container | null;
     nodeContainer: Container | null;
     hoverGraphics: Graphics | null;
     focusGraphics: Graphics | null;
   }>({
     gridTiling: null,
     world: null,
-    edgeGraphics: null,
-    arrowGraphics: null,
+    edgeTileContainer: null,
+    arrowTileContainer: null,
     nodeContainer: null,
     hoverGraphics: null,
     focusGraphics: null,
@@ -615,6 +772,41 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const spriteDprRef = useRef(0);
   const nodeSpritesRef = useRef(new Map<string, Sprite>());
   const spriteCtxRef = useRef<SpriteCtx | null>(null);
+
+  // Edge tile cache — spatial grid of per-tile Graphics. See `TILE_SIZE`
+  // below. Each tile is built lazily when it first enters the viewport
+  // and destroyed after `TILE_EVICT_FRAMES` frames off-screen, capping
+  // GPU memory so large schemas don't crash the mobile renderer.
+  const edgeTilesRef = useRef(new Map<string, EdgeTile>());
+  const frameCounterRef = useRef(0);
+
+  // Per-sprite viewport bookkeeping. `spriteLastSeenFrameRef` tracks
+  // the last frame a sprite was inside the (padded) viewport so the
+  // ticker can destroy textures for sprites that have been off-screen
+  // for long enough — this is what lets us crank DPR up on the "full"
+  // tier without holding textures for all N nodes at once.
+  const spriteLastSeenFrameRef = useRef(new Map<string, number>());
+  const lastSpriteSweepViewRef = useRef({ x: 0, y: 0, k: 0, lod: "full" as SpriteLOD });
+  // Progressive sprite-creation queue. On a big schema the viewport
+  // sweep can discover thousands of nodes needing a Sprite at once
+  // (e.g. zooming out to see the whole graph). Allocating that many
+  // `new Sprite` + `addChild` pairs in a single frame overwhelms
+  // the Pixi renderer hard enough to crash the tab, so we defer to
+  // this queue and drain a budgeted chunk per frame.
+  const spriteCreateQueueRef = useRef<LaidNode[] | null>(null);
+
+  // Shared "kind placeholder" textures — one per node kind. Used as
+  // sprite source at chrome/bar LOD instead of Texture.WHITE + tint.
+  // Lets us paint rounded corners and a header strip (proper card
+  // silhouette) without paying for 1,400 individual texture uploads.
+  const kindTextureCacheRef = useRef<Map<NodeKind, Texture>>(new Map());
+  // Last timestamp the view changed significantly. Texture uploads
+  // (Pixi `Texture.from(canvas)` → WebGL `texImage2D`) and tile
+  // Graphics builds are gated on this: during an active pan/zoom we
+  // pause all GPU uploads so the mobile driver doesn't get flooded
+  // and crash the renderer. Once the view has been stable for
+  // `MOTION_SETTLE_MS` we resume building progressively.
+  const lastViewChangeAtRef = useRef(0);
 
   // Progressive sprite build queue — filled by the node useEffect,
   // drained by the ticker a few nodes per frame (budget-limited).
@@ -1173,7 +1365,11 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const mountEl = pixiContainerRef.current;
     if (!mountEl) return;
 
-    const dpr = window.devicePixelRatio || 1;
+    // Cap framebuffer resolution at 2× regardless of monitor DPR. A
+    // retina-3x 4K display at native resolution is a ~115 MB backbuffer
+    // before any content, which alone can push the GPU process over its
+    // per-tab budget and fire "Aw, Snap!" on first render.
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
     // Use themeResolved (from React context) for the first-frame
     // background. We can't read CSS vars here because React fires
     // child effects before parent — ThemeProvider hasn't toggled the
@@ -1216,15 +1412,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const world = new Container();
       world.cullable = true;
 
-      const edgeGraphics = new Graphics();
-      const arrowGraphics = new Graphics();
+      const edgeTileContainer = new Container();
+      const arrowTileContainer = new Container();
       const nodeContainer = new Container();
       nodeContainer.cullable = true;
       const hoverGraphics = new Graphics();
       const focusGraphics = new Graphics();
 
-      world.addChild(edgeGraphics);
-      world.addChild(arrowGraphics);
+      world.addChild(edgeTileContainer);
+      world.addChild(arrowTileContainer);
       world.addChild(nodeContainer);
       world.addChild(hoverGraphics);
       world.addChild(focusGraphics);
@@ -1237,12 +1433,23 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       sceneRef.current = {
         gridTiling,
         world,
-        edgeGraphics,
-        arrowGraphics,
+        edgeTileContainer,
+        arrowTileContainer,
         nodeContainer,
         hoverGraphics,
         focusGraphics,
       };
+
+      // Build one shared placeholder texture per NodeKind. Sprites at
+      // chrome/bar LOD point at the matching entry so every colored
+      // card shares the same upload instead of us uploading 1,400
+      // of them.
+      for (const kind of Object.keys(KIND_COLORS) as NodeKind[]) {
+        kindTextureCacheRef.current.set(
+          kind,
+          buildKindPlaceholderTexture(kind),
+        );
+      }
 
       // FPS tick counter
       let fpsTimes: number[] = [];
@@ -1341,15 +1548,269 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           }
         }
 
+        // Edge tile visibility + lazy build. Per frame: step the
+        // counter, intersect each tile with the padded viewport,
+        // lazy-build the tile's Graphics on first visit, and evict
+        // tiles that have been off-screen for long enough to free GPU
+        // memory. This is the core mobile-memory fix — a monolithic
+        // Graphics holding all 10k+ edges at once overflows WebGL
+        // vertex budgets on low-end devices.
+        frameCounterRef.current++;
+        const tiles = edgeTilesRef.current;
+        if (tiles.size > 0 && scene.edgeTileContainer && scene.arrowTileContainer) {
+          const viewMinX = -v.x / v.k - TILE_VIEW_PADDING;
+          const viewMinY = -v.y / v.k - TILE_VIEW_PADDING;
+          const viewMaxX = (sw - v.x) / v.k + TILE_VIEW_PADDING;
+          const viewMaxY = (sh - v.y) / v.k + TILE_VIEW_PADDING;
+
+          const liveGroups = edgeGroupsRef.current.groups;
+          const frame = frameCounterRef.current;
+          // Cap tile lazy-build time per frame. A zoom-out or sudden
+          // pan can pull many tiles into view at once; without this
+          // budget they'd all tessellate in the same frame and drop
+          // 30–60 ms. Also gated on motion settle — the same mobile
+          // GPU driver that dies from rapid texture uploads also
+          // dies from rapid vertex-buffer uploads during a fast pan.
+          const TILE_BUILD_BUDGET_MS = 2;
+          const tileStable =
+            performance.now() - lastViewChangeAtRef.current >= MOTION_SETTLE_MS;
+          const buildDeadline = performance.now() + TILE_BUILD_BUDGET_MS;
+
+          for (const tile of tiles.values()) {
+            const tileMinX = tile.col * TILE_SIZE;
+            const tileMinY = tile.row * TILE_SIZE;
+            const tileMaxX = tileMinX + TILE_SIZE;
+            const tileMaxY = tileMinY + TILE_SIZE;
+            const intersects = !(
+              tileMaxX < viewMinX ||
+              tileMinX > viewMaxX ||
+              tileMaxY < viewMinY ||
+              tileMinY > viewMaxY
+            );
+
+            if (intersects) {
+              tile.lastSeenFrame = frame;
+              if (!tile.edgeGraphics) {
+                if (!tileStable) continue;
+                if (performance.now() >= buildDeadline) continue;
+                const built = buildEdgeTileGraphics(tile, liveGroups);
+                tile.edgeGraphics = built.edge;
+                tile.arrowGraphics = built.arrow;
+                scene.edgeTileContainer.addChild(tile.edgeGraphics);
+                scene.arrowTileContainer.addChild(tile.arrowGraphics);
+              }
+              tile.edgeGraphics.visible = true;
+              if (tile.arrowGraphics) tile.arrowGraphics.visible = true;
+            } else {
+              if (tile.edgeGraphics) tile.edgeGraphics.visible = false;
+              if (tile.arrowGraphics) tile.arrowGraphics.visible = false;
+              if (
+                tile.edgeGraphics &&
+                frame - tile.lastSeenFrame > TILE_EVICT_FRAMES
+              ) {
+                tile.edgeGraphics.destroy();
+                tile.edgeGraphics = null;
+                if (tile.arrowGraphics) {
+                  tile.arrowGraphics.destroy();
+                  tile.arrowGraphics = null;
+                }
+              }
+            }
+          }
+        }
+
+        // Progressive sprite creation drain. The sweep below can
+        // enqueue thousands of nodes needing a Sprite in one pass;
+        // draining them here with a small per-frame budget keeps
+        // `new Sprite` + `addChild` load bounded per frame and
+        // prevents the Pixi renderer from stalling out.
+        const spriteCreateQueue = spriteCreateQueueRef.current;
+        if (
+          spriteCreateQueue &&
+          spriteCreateQueue.length > 0 &&
+          scene.nodeContainer
+        ) {
+          const nodeContainer = scene.nodeContainer;
+          const createDeadline = performance.now() + 2;
+          while (
+            spriteCreateQueue.length > 0 &&
+            performance.now() < createDeadline
+          ) {
+            const node = spriteCreateQueue.pop()!;
+            if (nodeSpritesRef.current.has(node.id)) continue;
+            const kindTex = kindTextureCacheRef.current.get(node.data.kind);
+            const sprite = new Sprite(kindTex ?? Texture.WHITE);
+            sprite.position.set(node.cx - node.w / 2, node.cy - node.h / 2);
+            sprite.width = node.w;
+            sprite.height = node.h;
+            sprite.cullable = true;
+            if (!kindTex) {
+              sprite.tint = cssColorToHex(KIND_COLORS[node.data.kind]);
+            }
+            nodeContainer.addChild(sprite);
+            nodeSpritesRef.current.set(node.id, sprite);
+          }
+          if (spriteCreateQueue.length === 0) {
+            spriteCreateQueueRef.current = null;
+          }
+        }
+
+        // Sprite viewport sweep. Runs on any significant view change
+        // (pan/zoom/LOD). Sprites are queued for progressive creation
+        // (only for nodes currently in the padded viewport) and
+        // destroyed once off-screen for SPRITE_EVICT_FRAMES — so memory
+        // scales with visible area instead of total node count.
+        const laidNodesLive = laidNodesRef.current;
+        if (
+          laidNodesLive.length > 0 &&
+          spriteCtxRef.current &&
+          scene.nodeContainer
+        ) {
+          const nodeContainer = scene.nodeContainer;
+          const spriteCtx = spriteCtxRef.current;
+          const lod = currentLodRef.current;
+          const dpr = spriteDprForLod(lod);
+          spriteDprRef.current = dpr;
+
+          const prev = lastSpriteSweepViewRef.current;
+          const viewMoved =
+            Math.abs(v.x - prev.x) > 40 ||
+            Math.abs(v.y - prev.y) > 40 ||
+            Math.abs(v.k - prev.k) / Math.max(0.0001, prev.k) > 0.05 ||
+            lod !== prev.lod;
+
+          if (viewMoved) {
+            lastSpriteSweepViewRef.current = { x: v.x, y: v.y, k: v.k, lod };
+            lastViewChangeAtRef.current = performance.now();
+
+            const vpMinX = -v.x / v.k - SPRITE_VIEW_PADDING;
+            const vpMinY = -v.y / v.k - SPRITE_VIEW_PADDING;
+            const vpMaxX = (sw - v.x) / v.k + SPRITE_VIEW_PADDING;
+            const vpMaxY = (sh - v.y) / v.k + SPRITE_VIEW_PADDING;
+
+            let queue = spriteBuildQueueRef.current;
+            if (queue && (queue.lod !== lod || queue.dpr !== dpr)) {
+              queue = null;
+              spriteBuildQueueRef.current = null;
+            }
+            const queuedIds = queue
+              ? new Set(queue.nodes.map((n) => n.id))
+              : new Set<string>();
+
+            // Iterate laidNodes (not sparse sprite map) so in-view
+            // nodes without a sprite get one lazily and off-view ones
+            // go away. Upfront Sprite allocation for all 1,400 nodes
+            // stalled the Pixi renderer hard enough to crash the tab.
+            const idsToEvict = new Set<string>();
+            for (const node of laidNodesLive) {
+              const inView = !(
+                node.cx + node.w / 2 < vpMinX ||
+                node.cx - node.w / 2 > vpMaxX ||
+                node.cy + node.h / 2 < vpMinY ||
+                node.cy - node.h / 2 > vpMaxY
+              );
+              const id = node.id;
+              let sprite = nodeSpritesRef.current.get(id);
+
+              if (inView) {
+                if (!sprite) {
+                  // Defer to the progressive create queue. Allocating
+                  // here would synchronously spawn N sprites when the
+                  // viewport first covers a big grid.
+                  if (!spriteCreateQueueRef.current) {
+                    spriteCreateQueueRef.current = [];
+                  }
+                  spriteCreateQueueRef.current.push(node);
+                  spriteLastSeenFrameRef.current.set(
+                    id,
+                    frameCounterRef.current,
+                  );
+                  continue;
+                }
+                spriteLastSeenFrameRef.current.set(id, frameCounterRef.current);
+                // Non-full LOD: show the shared per-kind placeholder.
+                // Six uploads total, reused across every sprite of the
+                // same kind — cheap and gives a proper card silhouette
+                // instead of the old solid tinted rectangle.
+                if (lod !== "full") {
+                  const kindTex = kindTextureCacheRef.current.get(
+                    node.data.kind,
+                  );
+                  if (kindTex && sprite.texture !== kindTex) {
+                    sprite.texture = kindTex;
+                    sprite.tint = 0xffffff;
+                  }
+                  continue;
+                }
+                const key = `${id}:${lod}`;
+                const cachedTex = textureCacheRef.current.get(key);
+                if (cachedTex) {
+                  if (sprite.texture !== cachedTex) {
+                    sprite.texture = cachedTex;
+                    sprite.tint = 0xffffff;
+                  }
+                } else if (!queuedIds.has(id)) {
+                  if (!spriteBuildQueueRef.current) {
+                    spriteBuildQueueRef.current = {
+                      nodes: [],
+                      lod,
+                      dpr,
+                      spriteCtx,
+                      dimNodeIds: new Set<string>(),
+                    };
+                  }
+                  spriteBuildQueueRef.current.nodes.push(node);
+                  queuedIds.add(id);
+                }
+              } else if (sprite) {
+                const last = spriteLastSeenFrameRef.current.get(id) ?? 0;
+                if (frameCounterRef.current - last > SPRITE_EVICT_FRAMES) {
+                  idsToEvict.add(id);
+                  nodeContainer.removeChild(sprite);
+                  sprite.destroy();
+                  nodeSpritesRef.current.delete(id);
+                  spriteLastSeenFrameRef.current.delete(id);
+                }
+              }
+            }
+
+            // Second pass: single scan over the texture cache — drop
+            // keys whose id prefix is in the evict set. Safe to delete
+            // during Map iteration; V8 skips removed unvisited entries.
+            if (idsToEvict.size > 0) {
+              for (const key of textureCacheRef.current.keys()) {
+                const sep = key.indexOf(":");
+                if (sep < 0) continue;
+                const ownerId = key.slice(0, sep);
+                if (idsToEvict.has(ownerId)) {
+                  const tex = textureCacheRef.current.get(key);
+                  if (tex) tex.destroy(true);
+                  textureCacheRef.current.delete(key);
+                }
+              }
+            }
+          }
+        }
+
         // Progressive sprite building — drain the queue a few nodes
-        // per frame (4ms budget) so LOD transitions never block.
+        // per frame (4ms budget). Gated on view stability: while the
+        // user is actively panning or zooming, a steady stream of
+        // `Texture.from(canvas)` uploads crashes mobile GPU drivers,
+        // so we wait for MOTION_SETTLE_MS of no significant view
+        // change before resuming. Sprites stay on their tint
+        // placeholder until then.
         const buildQ = spriteBuildQueueRef.current;
-        if (buildQ && buildQ.nodes.length > 0) {
+        const motionStable =
+          performance.now() - lastViewChangeAtRef.current >= MOTION_SETTLE_MS;
+        if (buildQ && buildQ.nodes.length > 0 && motionStable) {
           const deadline = performance.now() + 4;
+          const lodCap = maxTextureCacheFor(buildQ.lod);
           while (buildQ.nodes.length > 0 && performance.now() < deadline) {
+            if (textureCacheRef.current.size >= lodCap) break;
             const n = buildQ.nodes.pop()!;
             const key = `${n.id}:${buildQ.lod}`;
             if (textureCacheRef.current.has(key)) continue;
+
             const pw = Math.ceil(n.w * buildQ.dpr);
             const ph = Math.ceil(n.h * buildQ.dpr);
             const can = document.createElement("canvas");
@@ -1369,10 +1830,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             }
           }
           if (buildQ.nodes.length === 0) {
-            // Drain complete. Every sprite now references a texture for
-            // `buildQ.lod`, so textures keyed to any other LOD are
-            // safely orphan — evict them to cap memory growth during
-            // zooming sessions.
+            // Drain complete: every sprite currently in view has a
+            // texture for `buildQ.lod`. Any cached texture keyed to a
+            // different LOD is unused by live sprites, so release it
+            // to cap GPU memory during LOD zigzags (zoom-in, zoom-out,
+            // zoom-in again without pause). The viewport sweep handles
+            // the orthogonal case — sprites that stayed off-screen.
             const keepSuffix = `:${buildQ.lod}`;
             const toDelete: string[] = [];
             for (const key of textureCacheRef.current.keys()) {
@@ -1433,12 +1896,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       sceneRef.current = {
         gridTiling: null,
         world: null,
-        edgeGraphics: null,
-        arrowGraphics: null,
+        edgeTileContainer: null,
+        arrowTileContainer: null,
         nodeContainer: null,
         hoverGraphics: null,
         focusGraphics: null,
       };
+      // Explicit tile cache teardown. Pixi destroys Graphics children
+      // via app.destroy, but holding stale references in the ref would
+      // leak when the component remounts.
+      edgeTilesRef.current.clear();
+      for (const tex of kindTextureCacheRef.current.values()) {
+        tex.destroy(true);
+      }
+      kindTextureCacheRef.current.clear();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1450,6 +1921,13 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // Keep nodeById accessible in the ticker
   const nodeByIdRef = useRef(nodeById);
   nodeByIdRef.current = nodeById;
+
+  // Keep `laidNodes` accessible in the ticker without re-adding the
+  // ticker callback each render — the ticker is registered once and
+  // captures its surrounding closure's `laidNodes` value (initially
+  // empty), so state updates need this ref to be seen.
+  const laidNodesRef = useRef(laidNodes);
+  laidNodesRef.current = laidNodes;
 
   // Resize Pixi renderer
   useEffect(() => {
@@ -1474,78 +1952,95 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     scene.gridTiling.tileScale.set(1);
   }, [themeResolved]);
 
-  // Rebuild edges when laidEdges/edgeGroups change
+  // Keep a reference to the latest edgeGroups (with colors/dashes) so
+  // the ticker can rebuild a tile's Graphics on demand without closing
+  // over a stale effect value.
+  const edgeGroupsRef = useRef(edgeGroups);
+  edgeGroupsRef.current = edgeGroups;
+
+  // Rebuild tile assignments when the edge set or focus-dim state
+  // changes. This only touches the in-memory grouping structure —
+  // Graphics objects themselves are destroyed and recreated lazily by
+  // the ticker as tiles come into view.
   useEffect(() => {
     const scene = sceneRef.current;
-    if (!scene.edgeGraphics || !scene.arrowGraphics) return;
+    if (!scene.edgeTileContainer || !scene.arrowTileContainer) return;
 
-    const eg = scene.edgeGraphics;
-    const ag = scene.arrowGraphics;
-    eg.clear();
-    ag.clear();
+    // Drop old tile Graphics. New grouping means existing vertex
+    // buffers are invalid.
+    for (const tile of edgeTilesRef.current.values()) {
+      tile.edgeGraphics?.destroy();
+      tile.arrowGraphics?.destroy();
+    }
+    edgeTilesRef.current.clear();
+    scene.edgeTileContainer.removeChildren();
+    scene.arrowTileContainer.removeChildren();
 
     const lod = currentLodRef.current;
     if (lod === "chrome") return;
 
-    const DIM = 0.1;
-    const STROKE_W = 1.4;
-
-    for (const g of edgeGroups.groups) {
-      const colorHex = g.colorHex;
-
-      // Dim edges
-      if (g.dim.length > 0) {
-        if (g.dash.length > 0) {
-          for (const edge of g.dim) {
-            drawDashedBezierEdge(eg, edge, g.dash, colorHex, DIM, STROKE_W);
+    const groupCount = edgeGroups.groups.length;
+    const assign = (edge: LaidEdge, gi: number, isActive: boolean) => {
+      const minCol = Math.floor(edge.bbox.minX / TILE_SIZE);
+      const maxCol = Math.floor(edge.bbox.maxX / TILE_SIZE);
+      const minRow = Math.floor(edge.bbox.minY / TILE_SIZE);
+      const maxRow = Math.floor(edge.bbox.maxY / TILE_SIZE);
+      for (let c = minCol; c <= maxCol; c++) {
+        for (let r = minRow; r <= maxRow; r++) {
+          const key = `${c},${r}`;
+          let tile = edgeTilesRef.current.get(key);
+          if (!tile) {
+            tile = {
+              key,
+              col: c,
+              row: r,
+              groupLists: Array.from({ length: groupCount }, () => ({
+                dim: [],
+                active: [],
+              })),
+              edgeGraphics: null,
+              arrowGraphics: null,
+              lastSeenFrame: 0,
+            };
+            edgeTilesRef.current.set(key, tile);
           }
-          eg.stroke({ width: STROKE_W, color: colorHex, alpha: DIM });
-        } else {
-          eg.beginPath();
-          for (const edge of g.dim) {
-            drawSolidBezierEdge(eg, edge);
-          }
-          eg.stroke({ width: STROKE_W, color: colorHex, alpha: DIM });
+          const list = tile.groupLists[gi]!;
+          if (isActive) list.active.push(edge);
+          else list.dim.push(edge);
         }
-        // Arrowheads for dim
-        ag.beginPath();
-        for (const edge of g.dim) {
-          drawArrowHead(ag, edge);
-        }
-        ag.fill({ color: colorHex, alpha: DIM });
       }
+    };
 
-      // Active edges
-      if (g.active.length > 0) {
-        if (g.dash.length > 0) {
-          for (const edge of g.active) {
-            drawDashedBezierEdge(eg, edge, g.dash, colorHex, 1, STROKE_W);
-          }
-          eg.stroke({ width: STROKE_W, color: colorHex, alpha: 1 });
-        } else {
-          eg.beginPath();
-          for (const edge of g.active) {
-            drawSolidBezierEdge(eg, edge);
-          }
-          eg.stroke({ width: STROKE_W, color: colorHex, alpha: 1 });
-        }
-        // Arrowheads for active
-        ag.beginPath();
-        for (const edge of g.active) {
-          drawArrowHead(ag, edge);
-        }
-        ag.fill({ color: colorHex, alpha: 1 });
-      }
-    }
-  }, [laidEdges, edgeGroups, lodTick]);
+    edgeGroups.groups.forEach((group, gi) => {
+      for (const e of group.dim) assign(e, gi, false);
+      for (const e of group.active) assign(e, gi, true);
+    });
+    // Deliberately omit `lodTick`: rebuilding tile assignments (and
+    // destroying all live tile Graphics) on every LOD crossing was the
+    // real source of the boundary frame drop — many tiles would all
+    // lazy-rebuild on the next frame. The tile structure is
+    // LOD-independent; only the container visibility toggles below
+    // react to LOD changes.
+  }, [laidEdges, edgeGroups]);
 
-  // Effect A: sprite lifecycle — runs only when the node set or theme
-  // changes. Full reset (destroy textures + sprites), then recreate
-  // sprites with placeholder tints and queue progressive texture build
-  // for the current LOD. LOD transitions do NOT retrigger this effect,
-  // which is the fix for the jank at LOD boundaries — previously we
-  // destroyed and recreated 1,400+ sprites every time the user zoomed
-  // past a threshold.
+  // chrome LOD hides edges entirely. Toggle container visibility on
+  // the root tile containers — no per-tile destroy/rebuild needed.
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene.edgeTileContainer || !scene.arrowTileContainer) return;
+    const show = currentLodRef.current !== "chrome";
+    scene.edgeTileContainer.visible = show;
+    scene.arrowTileContainer.visible = show;
+  }, [lodTick]);
+
+  // Effect A: sprite lifecycle reset. Runs only when the node set or
+  // theme changes. Destroys any pre-existing textures and sprites so
+  // the ticker's viewport sweep can rebuild from scratch — crucially,
+  // we do NOT upfront-allocate the 1,400+ `new Sprite` + `addChild`
+  // pairs anymore. On a big schema that synchronous loop would stall
+  // the Pixi renderer hard enough to crash the tab ("GPU stall due to
+  // ReadPixels"). Sprites are now created lazily per viewport sweep
+  // (see ticker below), so mount stays cheap regardless of node count.
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene.nodeContainer) return;
@@ -1564,77 +2059,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const spriteCtx: SpriteCtx = { cardColor, fgColor, mutedFg };
     spriteCtxRef.current = spriteCtx;
 
-    const viewK = viewRef.current.k;
-    const lod = currentLodRef.current;
-    const dpr = memoryCappedDpr(idealSpriteDpr(viewK), laidNodes.length);
-    spriteDprRef.current = dpr;
-
-    for (const n of laidNodes) {
-      const sprite = new Sprite(Texture.WHITE);
-      sprite.position.set(n.cx - n.w / 2, n.cy - n.h / 2);
-      sprite.width = n.w;
-      sprite.height = n.h;
-      sprite.cullable = true;
-      sprite.tint = cssColorToHex(KIND_COLORS[n.data.kind]);
-      scene.nodeContainer.addChild(sprite);
-      nodeSpritesRef.current.set(n.id, sprite);
-    }
-
-    if (laidNodes.length > 0) {
-      spriteBuildQueueRef.current = {
-        nodes: [...laidNodes],
-        lod,
-        dpr,
-        spriteCtx,
-        dimNodeIds: new Set<string>(),
-      };
-    } else {
-      spriteBuildQueueRef.current = null;
-    }
+    spriteLastSeenFrameRef.current.clear();
+    spriteBuildQueueRef.current = null;
+    spriteCreateQueueRef.current = null;
   }, [laidNodes, themeResolved]);
-
-  // Effect B: LOD transition — swap textures in place. Existing sprites
-  // keep their current texture (no flash to placeholder) while the
-  // ticker progressively builds new-LOD textures; the swap to the new
-  // texture happens as each is ready. Stale-LOD textures are evicted
-  // from the cache only after the build queue fully drains.
-  useEffect(() => {
-    const scene = sceneRef.current;
-    if (!scene.nodeContainer) return;
-    const spriteCtx = spriteCtxRef.current;
-    if (!spriteCtx) return;
-    if (nodeSpritesRef.current.size === 0) return;
-
-    const viewK = viewRef.current.k;
-    const lod = currentLodRef.current;
-    const dpr = memoryCappedDpr(idealSpriteDpr(viewK), laidNodes.length);
-    spriteDprRef.current = dpr;
-
-    const needBuild: LaidNode[] = [];
-    for (const n of laidNodes) {
-      const sprite = nodeSpritesRef.current.get(n.id);
-      if (!sprite) continue;
-      const cached = textureCacheRef.current.get(`${n.id}:${lod}`);
-      if (cached) {
-        sprite.texture = cached;
-        sprite.tint = 0xffffff;
-      } else {
-        needBuild.push(n);
-      }
-    }
-
-    if (needBuild.length > 0) {
-      spriteBuildQueueRef.current = {
-        nodes: needBuild,
-        lod,
-        dpr,
-        spriteCtx,
-        dimNodeIds: new Set<string>(),
-      };
-    } else {
-      spriteBuildQueueRef.current = null;
-    }
-  }, [lodTick, laidNodes]);
 
   // Dim/undim node sprites when focus changes — lightweight alpha-only
   // update, no texture rebuild. Separated from the sprite build effect
@@ -1720,6 +2148,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 <div>
                   {lastTiming.componentCount} comp · {lastTiming.singletonCount} singletons · {lastTiming.parallelWorkers}w
                 </div>
+                {lastTiming.fallbackNodeCount > 0 && (
+                  <div>fallback grid: {lastTiming.fallbackNodeCount} nodes</div>
+                )}
               </>
             )}
           </div>

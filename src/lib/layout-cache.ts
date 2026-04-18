@@ -18,7 +18,7 @@ const DB_NAME = "gompassql-layout-cache";
 const DB_VERSION = 1;
 const STORE = "results";
 const MAX_ENTRIES = 20;
-const CACHE_VERSION = "v1";
+const CACHE_VERSION = "v2";
 
 interface CacheEntry {
   hash: string;

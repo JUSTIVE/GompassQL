@@ -1,5 +1,3 @@
-import type { GraphEdgeData, GraphNodeData } from "./sdl-to-graph";
-
 /**
  * A directed-agnostic suggestion that two nodes belong near each other in
  * the layout. `score` is in (0, 1]; higher means the layout engine should
@@ -18,18 +16,24 @@ export interface SimilarityPair {
   reasons: string[];
 }
 
+/**
+ * Minimal Union fingerprint: just the union's own id and the type names
+ * it lists as members. Accepting this shape (instead of full
+ * `GraphNodeData`) keeps the worker postMessage payload tiny on huge
+ * schemas — descriptions, fields, and arg metadata aren't needed here.
+ */
+export interface UnionInput {
+  id: string;
+  members: readonly string[];
+}
+
 /** Weight given to each union-member ↔ union-member hint. */
 const UNION_ADJACENCY_WEIGHT = 0.6;
 
 export function computeSimilarityPairs(
-  nodes: GraphNodeData[],
-  edges: GraphEdgeData[],
+  unions: readonly UnionInput[],
+  knownIds: ReadonlySet<string>,
 ): SimilarityPair[] {
-  void edges;
-
-  const byName = new Map<string, GraphNodeData>();
-  for (const n of nodes) byName.set(n.name, n);
-
   type Acc = { score: number; reasons: string[] };
   const pairMap = new Map<string, Acc>();
   const pairKey = (a: string, b: string) => (a < b ? `${a}|${b}` : `${b}|${a}`);
@@ -44,16 +48,18 @@ export function computeSimilarityPairs(
     pairMap.set(key, cur);
   };
 
-  for (const u of nodes) {
-    if (u.kind !== "Union" || !u.members) continue;
+  for (const u of unions) {
     const memberIds: string[] = [];
     for (const m of u.members) {
-      const n = byName.get(m);
-      if (n) memberIds.push(n.id);
+      // Type name === node id in the current sdl-to-graph pipeline, so
+      // we can skip the byName indirection. `knownIds` filters out
+      // members whose type was dropped (e.g. Relay Edge/Connection
+      // unwrapping) — including them would pull out nonexistent nodes.
+      if (knownIds.has(m)) memberIds.push(m);
     }
     for (let i = 0; i < memberIds.length; i++) {
       for (let j = i + 1; j < memberIds.length; j++) {
-        add(memberIds[i]!, memberIds[j]!, UNION_ADJACENCY_WEIGHT, `union:${u.name}`);
+        add(memberIds[i]!, memberIds[j]!, UNION_ADJACENCY_WEIGHT, `union:${u.id}`);
       }
     }
   }

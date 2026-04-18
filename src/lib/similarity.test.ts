@@ -11,7 +11,11 @@ function pair(pairs: SimilarityPair[], a: string, b: string): SimilarityPair | u
 function fromSdl(sdl: string) {
   const g = sdlToGraph(sdl);
   expect(g.error).toBeNull();
-  return computeSimilarityPairs(g.nodes, g.edges);
+  const unions = g.nodes
+    .filter((n) => n.kind === "Union")
+    .map((n) => ({ id: n.id, members: n.members ?? [] }));
+  const knownIds = new Set(g.nodes.map((n) => n.id));
+  return computeSimilarityPairs(unions, knownIds);
 }
 
 describe("computeSimilarityPairs — union member adjacency", () => {

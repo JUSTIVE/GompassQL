@@ -58,15 +58,29 @@ export function LandingRoute() {
   const historyMeta = useMemo(
     () =>
       history.map((entry) => {
-        const g = sdlToGraph(entry.sdl);
-        const byKind: Record<string, number> = {};
-        for (const n of g.nodes) byKind[n.kind] = (byKind[n.kind] ?? 0) + 1;
+        // Cheap regex-based counts. Previously called `sdlToGraph`
+        // per entry, which runs the full graphql-js parser — on a
+        // history list containing a 72k-line schema that crashes the
+        // renderer with "Aw, Snap!" just from mounting the Landing
+        // page. A couple of regex scans over the string avoid ever
+        // materializing an AST.
+        const sdl = entry.sdl;
+        const countMatches = (re: RegExp) => {
+          let n = 0;
+          for (const _ of sdl.matchAll(re)) n++;
+          return n;
+        };
+        const types =
+          countMatches(/^\s*type\s+\w+/gm) +
+          countMatches(/^\s*interface\s+\w+/gm) +
+          countMatches(/^\s*input\s+\w+/gm);
+        const enums = countMatches(/^\s*enum\s+\w+/gm);
+        const unions = countMatches(/^\s*union\s+\w+/gm);
         const parts: string[] = [];
-        const types = (byKind["Object"] ?? 0) + (byKind["Interface"] ?? 0) + (byKind["Input"] ?? 0);
         if (types) parts.push(`${types} types`);
-        if (byKind["Enum"]) parts.push(`${byKind["Enum"]} enums`);
-        if (byKind["Union"]) parts.push(`${byKind["Union"]} unions`);
-        const lines = entry.sdl.split("\n").length;
+        if (enums) parts.push(`${enums} enums`);
+        if (unions) parts.push(`${unions} unions`);
+        const lines = sdl.split("\n").length;
         parts.push(`${lines} lines`);
         const hash6 = entry.hash.slice(0, 6).padStart(6, "0");
         return { summary: parts.join(" · "), hash6 };
