@@ -2,7 +2,12 @@ import { Application, Container, Graphics, Sprite, Texture, TilingSprite } from 
 import { Loader2 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { BezierSegment, LayoutResult } from "@/lib/layout";
-import type { LayoutWorkerRequest, LayoutWorkerResponse } from "@/lib/layout-worker";
+import {
+  LayoutOrchestrator,
+  defaultPoolSize,
+  type OrchestratorRequest,
+  type OrchestratorTimings,
+} from "@/lib/layout-orchestrator";
 import type { GraphEdgeData, GraphNodeData } from "@/lib/sdl-to-graph";
 import { useTheme } from "@/lib/theme";
 import {
@@ -92,8 +97,22 @@ const MONO = "ui-monospace, SFMono-Regular, Menlo, monospace";
 type SpriteLOD = "full" | "bar" | "chrome";
 const LOD_FULL = 0.22;
 const LOD_BAR = 0.07;
+// Hysteresis: once inside a tier, require a slightly larger excursion
+// before exiting. Prevents oscillation (and its sprite rebuild cost)
+// when the user parks their zoom right on a boundary.
+const LOD_HYSTERESIS = 0.015;
 
-function computeLOD(viewK: number): SpriteLOD {
+function computeLOD(viewK: number, prev: SpriteLOD): SpriteLOD {
+  if (prev === "full") {
+    if (viewK >= LOD_FULL - LOD_HYSTERESIS) return "full";
+    if (viewK >= LOD_BAR) return "bar";
+    return "chrome";
+  }
+  if (prev === "bar") {
+    if (viewK >= LOD_FULL) return "full";
+    if (viewK >= LOD_BAR - LOD_HYSTERESIS) return "bar";
+    return "chrome";
+  }
   if (viewK >= LOD_FULL) return "full";
   if (viewK >= LOD_BAR) return "bar";
   return "chrome";
@@ -566,9 +585,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // Layout state
   const [layoutResult, setLayoutResult] = useState<LayoutResult>(EMPTY_LAYOUT);
   const [isPending, setIsPending] = useState(nodes.length > 0);
-  const [lastTiming, setLastTiming] = useState<LayoutWorkerResponse["timings"] | null>(null);
-  const lastTimingRef = useRef<LayoutWorkerResponse["timings"] | null>(null);
-  const workerRef = useRef<Worker | null>(null);
+  const [lastTiming, setLastTiming] = useState<OrchestratorTimings | null>(null);
+  const lastTimingRef = useRef<OrchestratorTimings | null>(null);
+  const orchestratorRef = useRef<LayoutOrchestrator | null>(null);
   const requestIdRef = useRef(0);
 
   // Pixi app + scene graph refs
@@ -595,6 +614,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const textureCacheRef = useRef(new Map<string, Texture>());
   const spriteDprRef = useRef(0);
   const nodeSpritesRef = useRef(new Map<string, Sprite>());
+  const spriteCtxRef = useRef<SpriteCtx | null>(null);
 
   // Progressive sprite build queue — filled by the node useEffect,
   // drained by the ticker a few nodes per frame (budget-limited).
@@ -623,24 +643,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     return () => ro.disconnect();
   }, []);
 
-  // One worker per canvas instance.
+  // Pool of layout workers. Orchestrator splits the graph into
+  // weakly-connected components and dispatches each to a free worker
+  // in parallel, so large schemas finish in wall-clock ~= (biggest
+  // component time) rather than (sum of all components).
   useEffect(() => {
-    const worker = new Worker("/layout-worker.js", { type: "module" });
-    worker.onmessage = (e: MessageEvent<LayoutWorkerResponse>) => {
-      if (e.data.id !== requestIdRef.current) return;
-      setLayoutResult(e.data.result);
-      setLastTiming(e.data.timings);
-      lastTimingRef.current = e.data.timings;
+    const orch = new LayoutOrchestrator(defaultPoolSize());
+    orch.setFatalHandler((err) => {
+      console.error("layout orchestrator error:", err.message);
       setIsPending(false);
-    };
-    worker.onerror = (err) => {
-      console.error("layout worker error:", err.message ?? err);
-      setIsPending(false);
-    };
-    workerRef.current = worker;
+    });
+    orchestratorRef.current = orch;
     return () => {
-      worker.terminate();
-      workerRef.current = null;
+      orch.terminate();
+      orchestratorRef.current = null;
     };
   }, []);
 
@@ -651,8 +667,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       setIsPending(false);
       return;
     }
-    const worker = workerRef.current;
-    if (!worker) return;
+    const orch = orchestratorRef.current;
+    if (!orch) return;
     const layoutNodes = nodes.map((n) => ({
       id: n.id,
       width: estimateNodeWidth(
@@ -672,14 +688,26 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }));
     const id = ++requestIdRef.current;
     setIsPending(true);
-    const request: LayoutWorkerRequest = {
+    const request: OrchestratorRequest = {
       id,
       nodes,
       edges,
       layoutNodes,
       rootId: rootId ?? null,
     };
-    worker.postMessage(request);
+    orch
+      .layout(request)
+      .then((resp) => {
+        if (resp.id !== requestIdRef.current) return;
+        setLayoutResult(resp.result);
+        setLastTiming(resp.timings);
+        lastTimingRef.current = resp.timings;
+        setIsPending(false);
+      })
+      .catch((err: Error) => {
+        console.error("layout failed:", err.message);
+        setIsPending(false);
+      });
   }, [nodes, edges, rootId]);
 
   const laidNodes = useMemo<LaidNode[]>(() => {
@@ -1233,7 +1261,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         scene.world.scale.set(v.k, v.k);
 
         // Detect LOD change → trigger node/edge rebuild
-        const newLod = computeLOD(v.k);
+        const newLod = computeLOD(v.k, currentLodRef.current);
         if (newLod !== currentLodRef.current) {
           currentLodRef.current = newLod;
           setLodTick((t) => t + 1);
@@ -1341,6 +1369,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             }
           }
           if (buildQ.nodes.length === 0) {
+            // Drain complete. Every sprite now references a texture for
+            // `buildQ.lod`, so textures keyed to any other LOD are
+            // safely orphan — evict them to cap memory growth during
+            // zooming sessions.
+            const keepSuffix = `:${buildQ.lod}`;
+            const toDelete: string[] = [];
+            for (const key of textureCacheRef.current.keys()) {
+              if (!key.endsWith(keepSuffix)) toDelete.push(key);
+            }
+            for (const key of toDelete) {
+              const tex = textureCacheRef.current.get(key);
+              if (tex) tex.destroy(true);
+              textureCacheRef.current.delete(key);
+            }
             spriteBuildQueueRef.current = null;
           }
         }
@@ -1442,7 +1484,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     eg.clear();
     ag.clear();
 
-    const lod = computeLOD(viewRef.current.k);
+    const lod = currentLodRef.current;
     if (lod === "chrome") return;
 
     const DIM = 0.1;
@@ -1497,22 +1539,22 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
   }, [laidEdges, edgeGroups, lodTick]);
 
-  // Rebuild node textures and sprites when laidNodes or theme changes
+  // Effect A: sprite lifecycle — runs only when the node set or theme
+  // changes. Full reset (destroy textures + sprites), then recreate
+  // sprites with placeholder tints and queue progressive texture build
+  // for the current LOD. LOD transitions do NOT retrigger this effect,
+  // which is the fix for the jank at LOD boundaries — previously we
+  // destroyed and recreated 1,400+ sprites every time the user zoomed
+  // past a threshold.
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene.nodeContainer) return;
 
-    // Destroy old textures
-    for (const tex of textureCacheRef.current.values()) {
-      tex.destroy(true);
-    }
+    for (const tex of textureCacheRef.current.values()) tex.destroy(true);
     textureCacheRef.current.clear();
     spriteDprRef.current = 0;
 
-    // Clear old sprites
-    for (const spr of nodeSpritesRef.current.values()) {
-      spr.destroy();
-    }
+    for (const spr of nodeSpritesRef.current.values()) spr.destroy();
     nodeSpritesRef.current.clear();
     scene.nodeContainer.removeChildren();
 
@@ -1520,38 +1562,67 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const fgColor = getComputedCssVar("--foreground", "#0f172a");
     const mutedFg = getComputedCssVar("--muted-foreground", "#64748b");
     const spriteCtx: SpriteCtx = { cardColor, fgColor, mutedFg };
+    spriteCtxRef.current = spriteCtx;
 
     const viewK = viewRef.current.k;
-    const lod = computeLOD(viewK);
+    const lod = currentLodRef.current;
     const dpr = memoryCappedDpr(idealSpriteDpr(viewK), laidNodes.length);
     spriteDprRef.current = dpr;
 
-    // Create placeholder sprites immediately (colored box via tint on
-    // a white 1×1 texture — near-zero cost). The ticker progressively
-    // builds real textures and swaps them in, so no single frame
-    // blocks for 400+ drawNodeSprite calls.
     for (const n of laidNodes) {
-      const key = `${n.id}:${lod}`;
-      const cachedTex = textureCacheRef.current.get(key);
-
-      const sprite = new Sprite(cachedTex ?? Texture.WHITE);
+      const sprite = new Sprite(Texture.WHITE);
       sprite.position.set(n.cx - n.w / 2, n.cy - n.h / 2);
       sprite.width = n.w;
       sprite.height = n.h;
       sprite.cullable = true;
-      if (!cachedTex) {
-        sprite.tint = cssColorToHex(KIND_COLORS[n.data.kind]);
-      }
-
+      sprite.tint = cssColorToHex(KIND_COLORS[n.data.kind]);
       scene.nodeContainer.addChild(sprite);
       nodeSpritesRef.current.set(n.id, sprite);
     }
 
-    // Queue progressive texture builds — the ticker drains this
-    // with a per-frame budget so LOD transitions don't jank.
-    const needBuild = laidNodes.filter(
-      (n) => !textureCacheRef.current.has(`${n.id}:${lod}`),
-    );
+    if (laidNodes.length > 0) {
+      spriteBuildQueueRef.current = {
+        nodes: [...laidNodes],
+        lod,
+        dpr,
+        spriteCtx,
+        dimNodeIds: new Set<string>(),
+      };
+    } else {
+      spriteBuildQueueRef.current = null;
+    }
+  }, [laidNodes, themeResolved]);
+
+  // Effect B: LOD transition — swap textures in place. Existing sprites
+  // keep their current texture (no flash to placeholder) while the
+  // ticker progressively builds new-LOD textures; the swap to the new
+  // texture happens as each is ready. Stale-LOD textures are evicted
+  // from the cache only after the build queue fully drains.
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene.nodeContainer) return;
+    const spriteCtx = spriteCtxRef.current;
+    if (!spriteCtx) return;
+    if (nodeSpritesRef.current.size === 0) return;
+
+    const viewK = viewRef.current.k;
+    const lod = currentLodRef.current;
+    const dpr = memoryCappedDpr(idealSpriteDpr(viewK), laidNodes.length);
+    spriteDprRef.current = dpr;
+
+    const needBuild: LaidNode[] = [];
+    for (const n of laidNodes) {
+      const sprite = nodeSpritesRef.current.get(n.id);
+      if (!sprite) continue;
+      const cached = textureCacheRef.current.get(`${n.id}:${lod}`);
+      if (cached) {
+        sprite.texture = cached;
+        sprite.tint = 0xffffff;
+      } else {
+        needBuild.push(n);
+      }
+    }
+
     if (needBuild.length > 0) {
       spriteBuildQueueRef.current = {
         nodes: needBuild,
@@ -1560,8 +1631,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         spriteCtx,
         dimNodeIds: new Set<string>(),
       };
+    } else {
+      spriteBuildQueueRef.current = null;
     }
-  }, [laidNodes, themeResolved, lodTick]);
+  }, [lodTick, laidNodes]);
 
   // Dim/undim node sprites when focus changes — lightweight alpha-only
   // update, no texture rebuild. Separated from the sprite build effect
@@ -1638,8 +1711,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         </div>
         {lastTiming && (
           <div className="mt-1 space-y-0.5 opacity-70">
-            <div>similarity {lastTiming.similarityMs.toFixed(0)}ms</div>
-            <div>layout {lastTiming.layoutMs.toFixed(0)}ms · total {lastTiming.totalMs.toFixed(0)}ms</div>
+            {lastTiming.fromCache ? (
+              <div>cached · total {lastTiming.totalMs.toFixed(0)}ms</div>
+            ) : (
+              <>
+                <div>similarity {lastTiming.similarityMs.toFixed(0)}ms max</div>
+                <div>layout {lastTiming.layoutMs.toFixed(0)}ms · total {lastTiming.totalMs.toFixed(0)}ms</div>
+                <div>
+                  {lastTiming.componentCount} comp · {lastTiming.singletonCount} singletons · {lastTiming.parallelWorkers}w
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>

@@ -10,10 +10,10 @@ import type { GraphEdgeData, GraphNodeData } from "./sdl-to-graph";
 import { computeSimilarityPairs } from "./similarity";
 
 /**
- * Dedicated worker entrypoint. The pipeline (similarity hint
- * computation + GraphViz layout) runs here so the main thread never
- * blocks on large schemas. The main thread tags each request with an
- * id; stale responses (older `id`) are discarded on the receiving end.
+ * Dedicated worker entrypoint. Lays out a single (sub-)graph with
+ * GraphViz. The main-thread `LayoutOrchestrator` handles hub-edge
+ * filtering and weakly-connected-component splitting — this worker
+ * just runs similarity + dot for whatever it's given.
  *
  * This file is bundled to a standalone module at `/layout-worker.js`:
  *   - dev: `src/index.ts` serves it via `Bun.build()` at request time
@@ -66,14 +66,16 @@ ctx.onmessage = async (e: MessageEvent<LayoutWorkerRequest>) => {
     .map((p) => ({ source: p.a, target: p.b, weight: p.score }));
   const t1 = performance.now();
 
-  const layoutEdges: LayoutEdgeInput[] = edges
-    .filter((edge) => edge.source !== edge.target)
-    .map((edge) => ({
+  const layoutEdges: LayoutEdgeInput[] = [];
+  for (const edge of edges) {
+    if (edge.source === edge.target) continue;
+    layoutEdges.push({
       id: edge.id,
       source: edge.source,
       target: edge.target,
       kind: edge.kind,
-    }));
+    });
+  }
 
   const result = await layoutGraph(
     layoutNodes,
