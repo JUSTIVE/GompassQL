@@ -333,7 +333,7 @@ export function LandingRoute() {
         <div className="shrink-0 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-400">
           <div className="mb-1.5 flex items-center gap-1.5 font-medium">
             <TriangleAlert className="h-3.5 w-3.5 shrink-0" />
-            Schema has duplicate type declarations — fix before visualizing
+            Schema has duplicate or conflicting type declarations — fix before visualizing
           </div>
           <ul className="space-y-0.5 font-mono">
             {warnings.map((w) => <li key={w}>{w}</li>)}

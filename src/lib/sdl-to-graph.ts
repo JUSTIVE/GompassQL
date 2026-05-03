@@ -114,22 +114,43 @@ export function sdlToGraph(sdl: string): ParsedGraph {
     return { nodes: [], edges: [], error: msg, warnings: [] };
   }
 
-  // Detect duplicate type declarations before building the graph.
-  const nameLocs = new Map<string, Array<{ line: number; column: number }>>();
+  // Detect duplicate / conflicting type-system declarations before
+  // building the graph. Limited to type/interface/enum/input/union/scalar —
+  // directives, schema, and `extend` blocks are skipped.
+  const KIND_LABELS: Partial<Record<string, string>> = {
+    [Kind.OBJECT_TYPE_DEFINITION]: "type",
+    [Kind.INTERFACE_TYPE_DEFINITION]: "interface",
+    [Kind.INPUT_OBJECT_TYPE_DEFINITION]: "input",
+    [Kind.ENUM_TYPE_DEFINITION]: "enum",
+    [Kind.UNION_TYPE_DEFINITION]: "union",
+    [Kind.SCALAR_TYPE_DEFINITION]: "scalar",
+  };
+  const nameDecls = new Map<
+    string,
+    Array<{ kind: string; line: number; column: number }>
+  >();
   for (const def of doc.definitions) {
-    if ("name" in def && def.name && def.loc) {
-      const name = def.name.value;
-      const pos = getLocation(def.loc.source, def.loc.start);
-      if (!nameLocs.has(name)) nameLocs.set(name, []);
-      nameLocs.get(name)!.push({ line: pos.line, column: pos.column });
+    const label = KIND_LABELS[def.kind];
+    if (!label || !("name" in def) || !def.name || !def.loc) continue;
+    const name = def.name.value;
+    const pos = getLocation(def.loc.source, def.loc.start);
+    if (!nameDecls.has(name)) nameDecls.set(name, []);
+    nameDecls.get(name)!.push({ kind: label, line: pos.line, column: pos.column });
+  }
+  const duplicateWarnings: string[] = [];
+  for (const [name, decls] of nameDecls) {
+    if (decls.length < 2) continue;
+    const distinctKinds = new Set(decls.map((d) => d.kind));
+    if (distinctKinds.size === 1) {
+      const positions = decls.map((d) => `${d.line}:${d.column}`).join(", ");
+      duplicateWarnings.push(`Duplicate ${decls[0]!.kind} "${name}" at ${positions}`);
+    } else {
+      const positions = decls
+        .map((d) => `${d.kind} at ${d.line}:${d.column}`)
+        .join(", ");
+      duplicateWarnings.push(`Conflicting declarations for "${name}": ${positions}`);
     }
   }
-  const duplicateWarnings = [...nameLocs.entries()]
-    .filter(([, locs]) => locs.length > 1)
-    .map(([name, locs]) => {
-      const positions = locs.map((l) => `${l.line}:${l.column}`).join(", ");
-      return `Duplicate type "${name}" at ${positions}`;
-    });
 
   for (const def of doc.definitions) {
     switch (def.kind) {
