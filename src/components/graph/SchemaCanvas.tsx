@@ -1,4 +1,4 @@
-import { Application, Container, Graphics, Sprite, Texture, TilingSprite } from "pixi.js";
+import { Application, Container, Graphics, NineSliceSprite, Sprite, Texture, TilingSprite } from "pixi.js";
 import { Loader2 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { BezierSegment, LayoutResult } from "@/lib/layout";
@@ -475,10 +475,20 @@ function drawNodeSprite(
  * paints a rounded card silhouette with the kind's accent color as
  * the header strip and a low-alpha body tint beneath.
  */
+// Placeholder texture dims and nine-slice borders. The header strip
+// height is encoded as `topHeight` so NineSliceSprite renders it at a
+// fixed 32px regardless of how tall the node is — without nine-slice,
+// stretching a 256×128 texture to fill a 600px-tall node would scale
+// the header to ~150px, which looks wrong.
+const PLACEHOLDER_TEX_W = 256;
+const PLACEHOLDER_TEX_H = 128;
+const PLACEHOLDER_HEADER_H = 32;
+const PLACEHOLDER_CORNER = 11;
+
 function buildKindPlaceholderTexture(kind: NodeKind): Texture {
-  const w = 256;
-  const h = 128;
-  const headerH = 32;
+  const w = PLACEHOLDER_TEX_W;
+  const h = PLACEHOLDER_TEX_H;
+  const headerH = PLACEHOLDER_HEADER_H;
   const canvas = document.createElement("canvas");
   canvas.width = w;
   canvas.height = h;
@@ -770,7 +780,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // Node sprite/texture cache
   const textureCacheRef = useRef(new Map<string, Texture>());
   const spriteDprRef = useRef(0);
-  const nodeSpritesRef = useRef(new Map<string, Sprite>());
+  const nodeSpritesRef = useRef(new Map<string, NineSliceSprite>());
   const spriteCtxRef = useRef<SpriteCtx | null>(null);
 
   // Edge tile cache — spatial grid of per-tile Graphics. See `TILE_SIZE`
@@ -1639,10 +1649,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             const node = spriteCreateQueue.pop()!;
             if (nodeSpritesRef.current.has(node.id)) continue;
             const kindTex = kindTextureCacheRef.current.get(node.data.kind);
-            const sprite = new Sprite(kindTex ?? Texture.WHITE);
+            const usingPlaceholder = !!kindTex;
+            const sprite = new NineSliceSprite({
+              texture: kindTex ?? Texture.WHITE,
+              leftWidth: usingPlaceholder ? PLACEHOLDER_CORNER : 0,
+              topHeight: usingPlaceholder ? PLACEHOLDER_HEADER_H : 0,
+              rightWidth: usingPlaceholder ? PLACEHOLDER_CORNER : 0,
+              bottomHeight: usingPlaceholder ? PLACEHOLDER_CORNER : 0,
+              width: node.w,
+              height: node.h,
+            });
             sprite.position.set(node.cx - node.w / 2, node.cy - node.h / 2);
-            sprite.width = node.w;
-            sprite.height = node.h;
             sprite.cullable = true;
             if (!kindTex) {
               sprite.tint = cssColorToHex(KIND_COLORS[node.data.kind]);
@@ -1739,6 +1756,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   if (kindTex && sprite.texture !== kindTex) {
                     sprite.texture = kindTex;
                     sprite.tint = 0xffffff;
+                    sprite.leftWidth = PLACEHOLDER_CORNER;
+                    sprite.topHeight = PLACEHOLDER_HEADER_H;
+                    sprite.rightWidth = PLACEHOLDER_CORNER;
+                    sprite.bottomHeight = PLACEHOLDER_CORNER;
                   }
                   continue;
                 }
@@ -1748,6 +1769,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   if (sprite.texture !== cachedTex) {
                     sprite.texture = cachedTex;
                     sprite.tint = 0xffffff;
+                    sprite.leftWidth = 0;
+                    sprite.topHeight = 0;
+                    sprite.rightWidth = 0;
+                    sprite.bottomHeight = 0;
                   }
                 } else if (!queuedIds.has(id)) {
                   if (!spriteBuildQueueRef.current) {
@@ -1826,6 +1851,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               if (spr) {
                 spr.texture = tex;
                 spr.tint = 0xffffff;
+                spr.leftWidth = 0;
+                spr.topHeight = 0;
+                spr.rightWidth = 0;
+                spr.bottomHeight = 0;
               }
             }
           }

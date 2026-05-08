@@ -27,8 +27,8 @@ const FALLBACK_GRID_GAP = 40;
 // tab. Node count matters less than edge count, so we gate on both.
 // Over the limit: alphabetized grid on the main thread (no edges —
 // navigation stays on the tree panel).
-const LAYOUT_NODE_LIMIT = 500;
-const LAYOUT_EDGE_LIMIT = 2000;
+const LAYOUT_NODE_LIMIT = 1500;
+const LAYOUT_EDGE_LIMIT = 12000;
 
 export interface OrchestratorTimings {
   similarityMs: number;
