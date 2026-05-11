@@ -84,6 +84,7 @@ export function estimateNodeHeight(
   fieldCount = 0,
   valueCount = 0,
   memberCount = 0,
+  interfaceCount = 0,
 ): number {
   const rows =
     kind === "Enum"
@@ -92,7 +93,7 @@ export function estimateNodeHeight(
         ? memberCount
         : kind === "Scalar"
           ? 0
-          : fieldCount;
+          : fieldCount + interfaceCount;
   const body = rows === 0 ? 14 : rows * ROW_H;
   return HEADER_H + TOP_BODY_PAD + body + BOTTOM_PAD;
 }

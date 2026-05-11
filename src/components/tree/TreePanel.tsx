@@ -3,7 +3,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
 import { useSchema } from "@/lib/schema-context";
-import type { GraphNodeData } from "@/lib/sdl-to-graph";
+import type { GraphNodeData, NodeKind } from "@/lib/sdl-to-graph";
 import { ColoredType } from "@/lib/type-colors";
 import { cn } from "@/lib/utils";
 
@@ -123,12 +123,15 @@ export function TreePanel() {
     name,
     hidePrimitiveFields,
     setHidePrimitiveFields,
+    hideRelayBoilerplate,
+    setHideRelayBoilerplate,
   } = useSchema();
   const [allTypesOpen, setAllTypesOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [inputFocused, setInputFocused] = useState(false);
   const [searchHistory, setSearchHistory] = useState<string[]>(() => loadSearchHistory());
+  const [kindFilter, setKindFilter] = useState<Set<NodeKind>>(() => new Set());
   const inputRef = useRef<HTMLInputElement>(null);
   const selectedItemRef = useRef<HTMLButtonElement>(null);
 
@@ -274,7 +277,32 @@ export function TreePanel() {
     return out.slice(0, 80);
   }, [query, graph.nodes]);
 
-  useEffect(() => { setSelectedIdx(0); }, [searchResults]);
+  const kindCounts = useMemo(() => {
+    const counts = new Map<NodeKind, number>();
+    for (const r of searchResults) {
+      counts.set(r.typeKind, (counts.get(r.typeKind) ?? 0) + 1);
+    }
+    return counts;
+  }, [searchResults]);
+
+  const filteredResults = useMemo(
+    () =>
+      kindFilter.size === 0
+        ? searchResults
+        : searchResults.filter((r) => kindFilter.has(r.typeKind)),
+    [searchResults, kindFilter],
+  );
+
+  const toggleKindFilter = (kind: NodeKind) => {
+    setKindFilter((prev) => {
+      const next = new Set(prev);
+      if (next.has(kind)) next.delete(kind);
+      else next.add(kind);
+      return next;
+    });
+  };
+
+  useEffect(() => { setSelectedIdx(0); }, [filteredResults]);
 
   useEffect(() => {
     selectedItemRef.current?.scrollIntoView({ block: "nearest" });
@@ -295,12 +323,12 @@ export function TreePanel() {
     if (e.key === "Escape") { setQuery(""); inputRef.current?.blur(); return; }
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setSelectedIdx((i) => Math.min(i + 1, searchResults.length - 1));
+      setSelectedIdx((i) => Math.min(i + 1, filteredResults.length - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setSelectedIdx((i) => Math.max(i - 1, 0));
     } else if (e.key === "Enter") {
-      const r = searchResults[selectedIdx];
+      const r = filteredResults[selectedIdx];
       if (r) jumpToAndClose(r.typeId);
     }
   };
@@ -383,6 +411,20 @@ export function TreePanel() {
             <Filter className="h-2.5 w-2.5" />
             Hide primitives
           </button>
+          <button
+            type="button"
+            onClick={() => setHideRelayBoilerplate(!hideRelayBoilerplate)}
+            className={cn(
+              "flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors",
+              hideRelayBoilerplate
+                ? "border-primary bg-primary/10 text-primary"
+                : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground",
+            )}
+            title="Hide the Relay Node interface, PageInfo, and *Edge / *Connection types"
+          >
+            <Filter className="h-2.5 w-2.5" />
+            Hide Relay
+          </button>
         </div>
       </div>
 
@@ -428,12 +470,54 @@ export function TreePanel() {
 
       {/* Search results */}
       {query.trim() && (
-        <div className="min-h-0 flex-1 overflow-auto">
-          {searchResults.length === 0 ? (
+        <div className="flex min-h-0 flex-1 flex-col">
+          {searchResults.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1 border-b border-border px-3 py-1.5">
+              {(Object.keys(KIND_STYLES) as NodeKind[])
+                .filter((k) => (kindCounts.get(k) ?? 0) > 0)
+                .map((k) => {
+                  const style = KIND_STYLES[k];
+                  const active = kindFilter.has(k);
+                  const count = kindCounts.get(k) ?? 0;
+                  return (
+                    <button
+                      key={k}
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => toggleKindFilter(k)}
+                      className={cn(
+                        "flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors",
+                        active
+                          ? cn(style.header, "border-transparent")
+                          : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground",
+                      )}
+                    >
+                      <span>{style.label}</span>
+                      <span className={cn("font-mono text-[9px]", active ? "" : "opacity-70")}>
+                        {count}
+                      </span>
+                    </button>
+                  );
+                })}
+              {kindFilter.size > 0 && (
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => setKindFilter(new Set())}
+                  className="ml-auto flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+                >
+                  <X className="h-2.5 w-2.5" />
+                  Clear
+                </button>
+              )}
+            </div>
+          )}
+          <div className="min-h-0 flex-1 overflow-auto">
+          {filteredResults.length === 0 ? (
             <div className="p-6 text-center text-xs text-muted-foreground">No results</div>
           ) : (
             <ul>
-              {searchResults.map((r, i) => {
+              {filteredResults.map((r, i) => {
                 const style = KIND_STYLES[r.typeKind];
                 const isSelected = i === selectedIdx;
                 return (
@@ -477,6 +561,7 @@ export function TreePanel() {
               })}
             </ul>
           )}
+          </div>
         </div>
       )}
 

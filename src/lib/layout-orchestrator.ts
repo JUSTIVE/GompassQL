@@ -1,6 +1,7 @@
 import type { LayoutNodeInput, LayoutResult, PositionedNode } from "./layout";
 import type { LayoutWorkerRequest, LayoutWorkerResponse } from "./layout-worker";
 import type { GraphEdgeData, GraphNodeData } from "./sdl-to-graph";
+import type { UnionInput } from "./similarity";
 import { weaklyConnectedComponents } from "./components";
 import { cacheGet, cachePut, hashLayoutInputs } from "./layout-cache";
 
@@ -18,17 +19,18 @@ import { cacheGet, cachePut, hashLayoutInputs } from "./layout-cache";
 const SINGLETON_GAP = 20;
 const SINGLETON_MAX_ROW_WIDTH = 1200;
 const PACK_MARGIN = 80;
-const FALLBACK_GRID_GAP = 40;
 
-// Components above these thresholds skip dot entirely. GraphViz's
-// rank + mincross + spline-routing stages grow super-linearly in the
-// edge count specifically — spline routing on a few thousand edges
-// drives the WASM heap past Chrome's renderer budget and crashes the
-// tab. Node count matters less than edge count, so we gate on both.
-// Over the limit: alphabetized grid on the main thread (no edges —
-// navigation stays on the tree panel).
-const LAYOUT_NODE_LIMIT = 1500;
-const LAYOUT_EDGE_LIMIT = 12000;
+// Chunk targets — single dot call is limited to this many nodes /
+// edges. Components above these sizes are recursively bisected
+// (alphabetically) into sub-chunks, each laid out as its own dot
+// invocation. Cross-chunk edges are drawn as a single straight-line
+// polyline segment after the sub-layouts are shelf-packed. Keeping
+// each dot call modest prevents GraphViz's WASM heap from growing
+// past the renderer's per-tab budget during polyline routing, which
+// is where most hub-heavy schemas (e.g. Relay `Node` interface with
+// 100+ implementors) used to abort.
+const CHUNK_TARGET_NODES = 500;
+const CHUNK_TARGET_EDGES = 4000;
 
 export interface OrchestratorTimings {
   similarityMs: number;
@@ -59,45 +61,6 @@ export interface OrchestratorRequest {
 interface Pending {
   resolve: (r: LayoutWorkerResponse) => void;
   reject: (e: Error) => void;
-}
-
-/**
- * Main-thread fallback for oversized components. Places nodes on an
- * √n×√n grid sorted by id so users can still find types by name, and
- * returns zero edges — rendering 10k straight lines across random grid
- * positions would fill tile memory with visually meaningless spaghetti.
- */
-function fallbackGridLayout(
-  layoutNodes: readonly LayoutNodeInput[],
-): LayoutResult {
-  if (layoutNodes.length === 0) return { nodes: [], edgePaths: [] };
-  const sorted = [...layoutNodes].sort((a, b) => a.id.localeCompare(b.id));
-  const cols = Math.max(1, Math.ceil(Math.sqrt(sorted.length)));
-
-  const positioned: PositionedNode[] = [];
-  let x = 0;
-  let y = 0;
-  let rowH = 0;
-  let col = 0;
-  for (const ln of sorted) {
-    if (col >= cols) {
-      y += rowH + FALLBACK_GRID_GAP;
-      x = 0;
-      col = 0;
-      rowH = 0;
-    }
-    positioned.push({
-      id: ln.id,
-      width: ln.width,
-      height: ln.height,
-      x: x + ln.width / 2,
-      y: y + ln.height / 2,
-    });
-    x += ln.width + FALLBACK_GRID_GAP;
-    if (ln.height > rowH) rowH = ln.height;
-    col++;
-  }
-  return { nodes: positioned, edgePaths: [] };
 }
 
 function layoutSingletonsGrid(
@@ -365,9 +328,6 @@ export class LayoutOrchestrator {
       edgesByComp[ci]!.push(e);
     }
 
-    const fallbackResults: LayoutResult[] = [];
-    let fallbackNodeCount = 0;
-
     for (let i = 0; i < comps.length; i++) {
       const comp = comps[i]!;
       if (comp.nodeIds.size === 1) {
@@ -382,20 +342,6 @@ export class LayoutOrchestrator {
         const ln = layoutNodeById.get(id);
         if (ln) compLayoutNodes.push(ln);
       }
-
-      const compEdgeCount = edgesByComp[i]!.length;
-      if (
-        comp.nodeIds.size > LAYOUT_NODE_LIMIT ||
-        compEdgeCount > LAYOUT_EDGE_LIMIT
-      ) {
-        // Oversized component — skip dot, lay out as alphabetical grid
-        // on the main thread. Prevents GraphViz's WASM heap from
-        // taking the tab down on very large schemas.
-        fallbackResults.push(fallbackGridLayout(compLayoutNodes));
-        fallbackNodeCount += comp.nodeIds.size;
-        continue;
-      }
-
       const compNodes: GraphNodeData[] = [];
       for (const id of compNodeIds) {
         const n = nodeById.get(id);
@@ -408,39 +354,28 @@ export class LayoutOrchestrator {
       });
     }
 
-    // 3. Dispatch multi-node components in parallel. Each component's
-    // full `GraphNodeData[]` can be 5–10 MB on a big schema; we strip
-    // it down to just the fields the worker actually needs so the
-    // structured-clone into each Worker doesn't duplicate that memory.
+    // 3. Dispatch multi-node components in parallel. Components above
+    // CHUNK_TARGET_NODES / CHUNK_TARGET_EDGES are recursively bisected
+    // into sub-chunks and stitched back together with shelf-packing;
+    // cross-chunk edges are emitted as straight polyline segments
+    // post-layout. This keeps each GraphViz invocation modest so its
+    // WASM heap never has to route polylines across more than a few
+    // hundred nodes at once.
     const tDispatchStart = performance.now();
     const compResponses = await Promise.all(
       multiComps.map((c) => {
-        const knownIds = c.nodes.map((n) => n.id);
         const unions = c.nodes
           .filter((n) => n.kind === "Union")
           .map((n) => ({ id: n.id, members: n.members ?? [] }));
-        const minEdges = c.edges.map((e) => ({
-          id: e.id,
-          source: e.source,
-          target: e.target,
-          kind: e.kind,
-        }));
-        return this.dispatch({
-          unions,
-          knownIds,
-          edges: minEdges,
-          layoutNodes: c.layoutNodes,
-          rootId: null,
-        });
+        return this.chunkAndLayout(c.layoutNodes, c.edges, unions);
       }),
     );
     const tLayoutDone = performance.now();
 
-    // 4. Compose boxes: multi-comp results + fallback grids + singleton grid (if any)
+    // 4. Compose boxes: multi-comp results + singleton grid (if any)
     const boxes: BoxedResult[] = compResponses.map((r) =>
       boundingBox(r.result),
     );
-    for (const fr of fallbackResults) boxes.push(boundingBox(fr));
     if (singletonLayoutNodes.length > 0) {
       const { nodes: gridNodes } = layoutSingletonsGrid(singletonLayoutNodes);
       boxes.push(
@@ -458,7 +393,11 @@ export class LayoutOrchestrator {
     const tEnd = performance.now();
 
     const similarityMs = compResponses.reduce(
-      (max, r) => Math.max(max, r.timings.similarityMs),
+      (max, r) => Math.max(max, r.similarityMs),
+      0,
+    );
+    const chunkCount = compResponses.reduce(
+      (sum, r) => sum + r.chunkCount,
       0,
     );
 
@@ -477,11 +416,139 @@ export class LayoutOrchestrator {
         totalMs: +(tEnd - tStart).toFixed(1),
         componentCount: multiComps.length,
         singletonCount: singletonLayoutNodes.length,
-        fallbackNodeCount,
+        fallbackNodeCount: Math.max(0, chunkCount - multiComps.length),
         parallelWorkers: this.workers.length,
         fromCache: false,
         cacheLookupMs: +(tCacheLookupEnd - tStart).toFixed(1),
       },
+    };
+  }
+
+  /**
+   * Recursively bisect a connected component (by sorted node id) until
+   * every sub-piece fits within CHUNK_TARGET_NODES / CHUNK_TARGET_EDGES,
+   * dispatch each sub-piece as its own dot call, then stitch the
+   * results together via shelf-packing. Edges that span two chunks are
+   * not laid out by dot — we add them back as a single straight-line
+   * polyline segment from the source's right edge to the target's left
+   * edge, matching the look of `splines: "polyline"` within a chunk.
+   *
+   * The recursion bottoms out when no further bisection helps (single
+   * node or no progress), so a degenerate input still always returns.
+   */
+  private async chunkAndLayout(
+    layoutNodes: LayoutNodeInput[],
+    edges: GraphEdgeData[],
+    unions: UnionInput[],
+  ): Promise<{
+    result: LayoutResult;
+    similarityMs: number;
+    layoutMs: number;
+    chunkCount: number;
+  }> {
+    if (layoutNodes.length === 0) {
+      return {
+        result: { nodes: [], edgePaths: [] },
+        similarityMs: 0,
+        layoutMs: 0,
+        chunkCount: 0,
+      };
+    }
+
+    if (
+      layoutNodes.length <= CHUNK_TARGET_NODES &&
+      edges.length <= CHUNK_TARGET_EDGES
+    ) {
+      const knownIds = layoutNodes.map((n) => n.id);
+      const minEdges = edges.map((e) => ({
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        kind: e.kind,
+      }));
+      const resp = await this.dispatch({
+        unions,
+        knownIds,
+        edges: minEdges,
+        layoutNodes,
+        rootId: null,
+      });
+      return {
+        result: resp.result,
+        similarityMs: resp.timings.similarityMs,
+        layoutMs: resp.timings.layoutMs,
+        chunkCount: 1,
+      };
+    }
+
+    // Bisect alphabetically — stable, deterministic, and tends to
+    // group related types (consistent prefixes are common in GraphQL
+    // schemas) so most edges stay intra-chunk.
+    const sorted = [...layoutNodes].sort((a, b) => a.id.localeCompare(b.id));
+    const mid = Math.max(1, Math.floor(sorted.length / 2));
+    const leftNodes = sorted.slice(0, mid);
+    const rightNodes = sorted.slice(mid);
+    const leftIds = new Set(leftNodes.map((n) => n.id));
+
+    const leftEdges: GraphEdgeData[] = [];
+    const rightEdges: GraphEdgeData[] = [];
+    const crossEdges: GraphEdgeData[] = [];
+    for (const e of edges) {
+      const sL = leftIds.has(e.source);
+      const tL = leftIds.has(e.target);
+      if (sL && tL) leftEdges.push(e);
+      else if (!sL && !tL) rightEdges.push(e);
+      else crossEdges.push(e);
+    }
+
+    const [left, right] = await Promise.all([
+      this.chunkAndLayout(leftNodes, leftEdges, unions),
+      this.chunkAndLayout(rightNodes, rightEdges, unions),
+    ]);
+
+    const placements = shelfPack([
+      boundingBox(left.result),
+      boundingBox(right.result),
+    ]);
+    const merged = mergeResults(placements);
+
+    // Synthesize a single-segment polyline path for each cross-chunk
+    // edge using the merged (post-pack) node positions. We exit the
+    // source's right edge (matches dot's `rankdir=LR` exit point) and
+    // enter the target's left edge. The c1/c2 control points are set
+    // to the same endpoints so the bezier renders as a straight line.
+    if (crossEdges.length > 0) {
+      const posById = new Map<string, PositionedNode>();
+      for (const n of merged.nodes) posById.set(n.id, n);
+      for (const e of crossEdges) {
+        const a = posById.get(e.source);
+        const b = posById.get(e.target);
+        if (!a || !b) continue;
+        const sx = a.x + a.width / 2;
+        const sy = a.y;
+        const tx = b.x - b.width / 2;
+        const ty = b.y;
+        merged.edgePaths.push({
+          edgeId: e.id,
+          source: e.source,
+          target: e.target,
+          start: { x: sx, y: sy },
+          segments: [
+            {
+              c1: { x: sx, y: sy },
+              c2: { x: tx, y: ty },
+              end: { x: tx, y: ty },
+            },
+          ],
+        });
+      }
+    }
+
+    return {
+      result: merged,
+      similarityMs: Math.max(left.similarityMs, right.similarityMs),
+      layoutMs: Math.max(left.layoutMs, right.layoutMs),
+      chunkCount: left.chunkCount + right.chunkCount,
     };
   }
 

@@ -90,6 +90,17 @@ function getViz(): Promise<Viz> {
 }
 
 /**
+ * Drop the cached Viz instance. GraphViz's Emscripten module sets
+ * `ABORT=true` and exports an unusable state when WASM runs out of
+ * memory; subsequent renderJSON calls would hit aborted state and
+ * never recover. We discard the promise so the next `getViz()` builds
+ * a fresh module against a freshly-allocated WASM heap.
+ */
+function resetViz(): void {
+  vizPromise = null;
+}
+
+/**
  * Preload the WASM module. Safe to call multiple times — the promise
  * is cached. Callers that know they'll need layout soon can invoke
  * this eagerly so the first render doesn't pay the cold-start cost.
@@ -108,8 +119,6 @@ export async function layoutGraph(
   // `rootId` is informational — in `dot`, ranks are derived from the
   // edge structure.
   void rootId;
-
-  const viz = await getViz();
 
   const nodeSet = new Set(nodes.map((n) => n.id));
 
@@ -162,12 +171,21 @@ export async function layoutGraph(
     }
   }
 
+  // Always polyline — explicit user requirement. Polyline draws
+  // straight segments that route around node boxes, which is the
+  // cheapest spline mode that still avoids edges passing through
+  // unrelated nodes. We do NOT step down to `line` / `none` on OOM;
+  // if WASM aborts we discard the cached instance (Emscripten's
+  // module is unusable after `ABORT=true`) and surface the error so
+  // the caller decides what to do — that keeps every rendered layout
+  // genuinely polyline-routed.
   const graph: Graph = {
     directed: true,
     graphAttributes: {
       rankdir: "LR",
       ranksep: 1.2,
       nodesep: 0.3,
+      splines: "polyline",
     },
     nodeAttributes: {
       shape: "box",
@@ -177,14 +195,19 @@ export async function layoutGraph(
     edges: vizEdges,
   };
 
-  // `yInvert: true` flips GraphViz's bottom-origin Y to screen-style
-  // top-origin Y, matching our canvas.
-  const rendered = viz.renderJSON(graph, {
-    engine: "dot",
-    yInvert: true,
-  }) as VizGraphJson;
-
-  return parseRendered(rendered, nodes);
+  try {
+    const v = await getViz();
+    // `yInvert: true` flips GraphViz's bottom-origin Y to screen-style
+    // top-origin Y, matching our canvas.
+    const rendered = v.renderJSON(graph, {
+      engine: "dot",
+      yInvert: true,
+    }) as VizGraphJson;
+    return parseRendered(rendered, nodes);
+  } catch (e) {
+    resetViz();
+    throw e;
+  }
 }
 
 // ─── GraphViz JSON parsing ───────────────────────────────────────────

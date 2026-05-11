@@ -50,6 +50,13 @@ export interface ParsedGraph {
   warnings: string[];
 }
 
+export interface SdlToGraphOptions {
+  /** When true (default), the standard Relay `Node` interface, `PageInfo`,
+   *  and `*Edge` / `*Connection` types are folded away and field types are
+   *  unwrapped to the underlying node. Set to false to surface them. */
+  hideRelayBoilerplate?: boolean;
+}
+
 const BUILTIN_SCALARS = new Set(["String", "Int", "Float", "Boolean", "ID"]);
 
 /**
@@ -101,7 +108,8 @@ function renderType(t: TypeNode): { rendered: string; base: string } {
   return { rendered: t.name.value, base: t.name.value };
 }
 
-export function sdlToGraph(sdl: string): ParsedGraph {
+export function sdlToGraph(sdl: string, options: SdlToGraphOptions = {}): ParsedGraph {
+  const { hideRelayBoilerplate = true } = options;
   const nodes: GraphNodeData[] = [];
 
   if (!sdl.trim()) return { nodes: [], edges: [], error: null, warnings: [] };
@@ -246,37 +254,42 @@ export function sdlToGraph(sdl: string): ParsedGraph {
   // Two passes — Edges first, then Connections (which resolve through
   // their `edges` field's Edge type) — so a single lookup unwraps a
   // Connection straight to the node it carries.
-  const relayUnwrap = new Map<string, string>();
-  for (const n of nodes) {
-    if (n.kind !== "Object" || !n.name.endsWith("Edge")) continue;
-    const fields = n.fields ?? [];
-    const names = new Set(fields.map((f) => f.name));
-    if (!(names.has("node") && names.has("cursor"))) continue;
-    const nodeField = fields.find((f) => f.name === "node");
-    if (nodeField) relayUnwrap.set(n.name, nodeField.typeName);
-  }
-  for (const n of nodes) {
-    if (n.kind !== "Object" || !n.name.endsWith("Connection")) continue;
-    const fields = n.fields ?? [];
-    const names = new Set(fields.map((f) => f.name));
-    if (!(names.has("edges") && names.has("pageInfo"))) continue;
-    const edgesField = fields.find((f) => f.name === "edges");
-    if (!edgesField) continue;
-    const unwrapped = relayUnwrap.get(edgesField.typeName);
-    if (unwrapped) relayUnwrap.set(n.name, unwrapped);
-  }
+  // Only do this when boilerplate is hidden; otherwise we want fields
+  // to point at the actual Connection/Edge nodes so they appear linked
+  // in the graph.
+  if (hideRelayBoilerplate) {
+    const relayUnwrap = new Map<string, string>();
+    for (const n of nodes) {
+      if (n.kind !== "Object" || !n.name.endsWith("Edge")) continue;
+      const fields = n.fields ?? [];
+      const names = new Set(fields.map((f) => f.name));
+      if (!(names.has("node") && names.has("cursor"))) continue;
+      const nodeField = fields.find((f) => f.name === "node");
+      if (nodeField) relayUnwrap.set(n.name, nodeField.typeName);
+    }
+    for (const n of nodes) {
+      if (n.kind !== "Object" || !n.name.endsWith("Connection")) continue;
+      const fields = n.fields ?? [];
+      const names = new Set(fields.map((f) => f.name));
+      if (!(names.has("edges") && names.has("pageInfo"))) continue;
+      const edgesField = fields.find((f) => f.name === "edges");
+      if (!edgesField) continue;
+      const unwrapped = relayUnwrap.get(edgesField.typeName);
+      if (unwrapped) relayUnwrap.set(n.name, unwrapped);
+    }
 
-  // Rewrite each field's target type to the unwrapped node so graph
-  // edges and click-to-navigate skip the Connection/Edge wrappers.
-  // The displayed `type` string is left intact so the schema's actual
-  // shape is still readable in the panel and node sprites.
-  for (const n of nodes) {
-    if (!n.fields) continue;
-    for (const f of n.fields) {
-      const unwrapped = relayUnwrap.get(f.typeName);
-      if (unwrapped) {
-        f.isRelayConnection = true;
-        f.typeName = unwrapped;
+    // Rewrite each field's target type to the unwrapped node so graph
+    // edges and click-to-navigate skip the Connection/Edge wrappers.
+    // The displayed `type` string is left intact so the schema's actual
+    // shape is still readable in the panel and node sprites.
+    for (const n of nodes) {
+      if (!n.fields) continue;
+      for (const f of n.fields) {
+        const unwrapped = relayUnwrap.get(f.typeName);
+        if (unwrapped) {
+          f.isRelayConnection = true;
+          f.typeName = unwrapped;
+        }
       }
     }
   }
@@ -376,7 +389,9 @@ export function sdlToGraph(sdl: string): ParsedGraph {
   // Drop the Relay boilerplate nodes themselves (Node, PageInfo, and
   // every Connection/Edge we successfully unwrapped); any edges still
   // pointing at them are filtered out as dangling.
-  const keptNodes = nodes.filter((n) => !isRelayBoilerplate(n));
+  const keptNodes = hideRelayBoilerplate
+    ? nodes.filter((n) => !isRelayBoilerplate(n))
+    : nodes;
   const keptIds = new Set(keptNodes.map((n) => n.id));
   const edges = rawEdges.filter((e) => keptIds.has(e.target) && keptIds.has(e.source));
 

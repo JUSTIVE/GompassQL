@@ -27,8 +27,8 @@ import {
  *   Application.stage
  *    ├── gridTiling (TilingSprite) — dot grid, screen-space
  *    └── world (Container) — pan/zoom transform
- *         ├── edgeGraphics (Graphics) — all edges batched
- *         ├── arrowGraphics (Graphics) — all arrowheads
+ *         ├── edgeTileContainer (Container) — batched per-tile edge Graphics
+ *         ├── arrowTileContainer (Container) — batched per-tile arrow Graphics
  *         ├── nodeContainer (Container) — one Sprite per node
  *         ├── hoverGraphics (Graphics) — field row highlight
  *         └── focusGraphics (Graphics) — focus ring + hover ring
@@ -71,7 +71,11 @@ interface Props {
 interface EdgeGroupSpec {
   color: string;
   colorHex: number;
-  dash: number[];
+  /** Alpha multiplier applied on top of the dim/active opacity. Used
+   *  in place of dash patterns to softly distinguish edge kinds that
+   *  share a hue with another group (e.g. nullable vs non-null field
+   *  edges, both blue). */
+  alphaScale: number;
   dim: LaidEdge[];
   active: LaidEdge[];
 }
@@ -130,10 +134,34 @@ interface EdgeTile {
   col: number;
   row: number;
   groupLists: EdgeTileGroupLists[];
-  edgeGraphics: Graphics | null;
-  arrowGraphics: Graphics | null;
+  /** Edge Graphics broken into ≤ EDGES_PER_BATCH-edge sub-batches.
+   *  Each Graphics has bounded vertex count so a single tile never
+   *  uploads a multi-MB vertex buffer in one frame. */
+  edgeBatches: Graphics[];
+  arrowBatches: Graphics[];
+  /** Number of batches built so far. The remaining batches are
+   *  appended progressively across subsequent frames. */
+  builtBatches: number;
+  /** Total batches planned. -1 means "not yet computed" — gets filled
+   *  the first time the tile becomes visible (so we don't pay the
+   *  planning cost for off-screen tiles). */
+  totalBatches: number;
   lastSeenFrame: number;
 }
+
+// Max edges packed into a single Graphics. Aggressively small so a
+// single failed `stroke()` upload can never overrun the WebGL
+// scratch buffer — long polyline edges in a hub-heavy schema can
+// pack ~1k triangles per edge after tessellation, and at 16 edges
+// per batch we stay well under any per-draw limit even on low-end
+// integrated GPUs. The cost is more Graphics objects (and thus more
+// draw calls), which Pixi's batcher coalesces back to a similar
+// number of GPU submissions per frame.
+const EDGES_PER_BATCH = 16;
+// Max new batches built per animation frame, summed across all
+// tiles. Increased proportionally to the smaller batch size so
+// fill-in speed (edges per frame) stays the same as before.
+const TILE_BATCH_BUDGET_PER_FRAME = 24;
 
 // LOD tiers
 type SpriteLOD = "full" | "bar" | "chrome";
@@ -336,7 +364,7 @@ function bodyRowCount(n: LaidNode): number {
   if (d.kind === "Enum") return (d.values ?? []).length;
   if (d.kind === "Union") return (d.members ?? []).length;
   if (d.kind === "Scalar") return 1;
-  return (d.fields ?? []).length;
+  return (d.fields ?? []).length + (d.interfaces ?? []).length;
 }
 
 function drawNodeSprite(
@@ -464,6 +492,21 @@ function drawNodeSprite(
       }
       drawColoredType(ctx, f.type, w - 10, fy);
     }
+    const interfaces = n.data.interfaces ?? [];
+    if (interfaces.length > 0) {
+      const ifaceColor = KIND_COLORS.Interface;
+      for (let i = 0; i < interfaces.length; i++) {
+        const fy = bodyY + (fields.length + i) * ROW_H + 10;
+        const prefix = i === 0 ? "implements " : "& ";
+        ctx.font = `10px ${MONO}`;
+        ctx.fillStyle = mutedFg;
+        ctx.fillText(prefix, 10, fy);
+        const prefixW = ctx.measureText(prefix).width;
+        ctx.font = `600 10px ${MONO}`;
+        ctx.fillStyle = ifaceColor;
+        ctx.fillText(fitText(ctx, interfaces[i]!, w - 10 - (10 + prefixW)), 10 + prefixW, fy);
+      }
+    }
   }
 }
 
@@ -536,92 +579,6 @@ function cubicBezier(
   };
 }
 
-/**
- * Draw a dashed bezier path on a Pixi Graphics object.
- * Pixi v8 has no setLineDash, so we walk the curve parametrically
- * and alternate moveTo (gap) / lineTo (dash).
- */
-function drawDashedBezierEdge(
-  g: Graphics,
-  edge: LaidEdge,
-  dash: number[],
-  color: number,
-  alpha: number,
-  strokeWidth: number,
-) {
-  const STEPS = 20;
-  let arcLen = 0;
-  let dashIndex = 0;
-  let dashPos = 0;
-  let drawing = true; // start with dash
-
-  const points: Point[] = [];
-
-  // Collect all points along the bezier chain
-  let prevPt: Point = edge.start;
-  points.push(prevPt);
-  for (const seg of edge.segments) {
-    for (let i = 1; i <= STEPS; i++) {
-      const t = i / STEPS;
-      const pt = cubicBezier(prevPt, seg.c1, seg.c2, seg.end, t);
-      // approximate: use start and end of segment as p0
-      points.push(pt);
-    }
-    prevPt = seg.end;
-  }
-  if (edge.arrowTip) {
-    points.push(edge.arrowTip);
-  }
-
-  // Walk and dash
-  let penDown = false;
-  for (let i = 1; i < points.length; i++) {
-    const prev = points[i - 1]!;
-    const curr = points[i]!;
-    const segLen = Math.hypot(curr.x - prev.x, curr.y - prev.y);
-    if (segLen < 0.001) continue;
-
-    let consumed = 0;
-    while (consumed < segLen) {
-      const dashLen = dash[dashIndex % dash.length]!;
-      const remaining = dashLen - dashPos;
-      const available = segLen - consumed;
-      const advance = Math.min(remaining, available);
-      const t = consumed / segLen;
-      const nextT = (consumed + advance) / segLen;
-      const startPt = {
-        x: prev.x + (curr.x - prev.x) * t,
-        y: prev.y + (curr.y - prev.y) * t,
-      };
-      const endPt = {
-        x: prev.x + (curr.x - prev.x) * nextT,
-        y: prev.y + (curr.y - prev.y) * nextT,
-      };
-
-      if (drawing) {
-        if (!penDown) {
-          g.moveTo(startPt.x, startPt.y);
-          penDown = true;
-        }
-        g.lineTo(endPt.x, endPt.y);
-      } else {
-        penDown = false;
-        arcLen += advance;
-        void arcLen;
-      }
-
-      dashPos += advance;
-      consumed += advance;
-
-      if (dashPos >= dashLen) {
-        dashPos = 0;
-        dashIndex++;
-        drawing = !drawing;
-      }
-    }
-  }
-}
-
 /** Draw a solid bezier edge path on a Pixi Graphics object */
 function drawSolidBezierEdge(g: Graphics, edge: LaidEdge) {
   g.moveTo(edge.start.x, edge.start.y);
@@ -633,61 +590,87 @@ function drawSolidBezierEdge(g: Graphics, edge: LaidEdge) {
   }
 }
 
+const DIM_ALPHA = 0.1;
+const STROKE_W = 1.4;
+
 /**
- * Build the edge + arrow Graphics for a single tile. The scope of a
- * tile is bounded, so vertex-buffer size per Graphics stays small even
- * when the whole schema has 10k+ edges. Called lazily the first time a
- * tile enters the viewport; destroyed after it's been off-screen long.
+ * Build a single batch Graphics for a slice of edges belonging to one
+ * group (same color + alphaScale). Tile-build code calls this once
+ * per sub-batch so no individual Graphics ever holds more than
+ * EDGES_PER_BATCH worth of geometry — the GPU then never sees a
+ * single multi-megabyte vertex upload.
  */
-function buildEdgeTileGraphics(
-  tile: EdgeTile,
-  groups: EdgeGroupSpec[],
+function buildEdgeBatchGraphics(
+  slice: LaidEdge[],
+  group: EdgeGroupSpec,
+  alpha: number,
 ): { edge: Graphics; arrow: Graphics } {
   const edge = new Graphics();
   const arrow = new Graphics();
-  const DIM = 0.1;
-  const STROKE_W = 1.4;
+  const colorHex = group.colorHex;
+  const effAlpha = alpha * group.alphaScale;
 
+  edge.beginPath();
+  for (const e of slice) drawSolidBezierEdge(edge, e);
+  edge.stroke({ width: STROKE_W, color: colorHex, alpha: effAlpha });
+  arrow.beginPath();
+  for (const e of slice) drawArrowHead(arrow, e);
+  arrow.fill({ color: colorHex, alpha: effAlpha });
+
+  return { edge, arrow };
+}
+
+/**
+ * Total number of batches the tile will produce when fully built.
+ * Each group contributes ⌈dim/N⌉ + ⌈active/N⌉ batches.
+ */
+function plannedBatchCount(
+  tile: EdgeTile,
+  groups: EdgeGroupSpec[],
+): number {
+  let total = 0;
+  for (let gi = 0; gi < groups.length; gi++) {
+    const lists = tile.groupLists[gi];
+    if (!lists) continue;
+    total += Math.ceil(lists.dim.length / EDGES_PER_BATCH);
+    total += Math.ceil(lists.active.length / EDGES_PER_BATCH);
+  }
+  return total;
+}
+
+/**
+ * Build the `batchIdx`-th batch of the tile. Returns null when the
+ * index is past the tile's planned batches (defensive — the caller
+ * should already be gating on `totalBatches`).
+ */
+function buildEdgeTileBatch(
+  tile: EdgeTile,
+  groups: EdgeGroupSpec[],
+  batchIdx: number,
+): { edge: Graphics; arrow: Graphics } | null {
+  let idx = batchIdx;
   for (let gi = 0; gi < groups.length; gi++) {
     const group = groups[gi]!;
     const lists = tile.groupLists[gi];
     if (!lists) continue;
-    const colorHex = group.colorHex;
 
-    if (lists.dim.length > 0) {
-      if (group.dash.length > 0) {
-        for (const e of lists.dim) {
-          drawDashedBezierEdge(edge, e, group.dash, colorHex, DIM, STROKE_W);
-        }
-        edge.stroke({ width: STROKE_W, color: colorHex, alpha: DIM });
-      } else {
-        edge.beginPath();
-        for (const e of lists.dim) drawSolidBezierEdge(edge, e);
-        edge.stroke({ width: STROKE_W, color: colorHex, alpha: DIM });
-      }
-      arrow.beginPath();
-      for (const e of lists.dim) drawArrowHead(arrow, e);
-      arrow.fill({ color: colorHex, alpha: DIM });
+    const dimBatches = Math.ceil(lists.dim.length / EDGES_PER_BATCH);
+    if (idx < dimBatches) {
+      const start = idx * EDGES_PER_BATCH;
+      const end = Math.min(start + EDGES_PER_BATCH, lists.dim.length);
+      return buildEdgeBatchGraphics(lists.dim.slice(start, end), group, DIM_ALPHA);
     }
+    idx -= dimBatches;
 
-    if (lists.active.length > 0) {
-      if (group.dash.length > 0) {
-        for (const e of lists.active) {
-          drawDashedBezierEdge(edge, e, group.dash, colorHex, 1, STROKE_W);
-        }
-        edge.stroke({ width: STROKE_W, color: colorHex, alpha: 1 });
-      } else {
-        edge.beginPath();
-        for (const e of lists.active) drawSolidBezierEdge(edge, e);
-        edge.stroke({ width: STROKE_W, color: colorHex, alpha: 1 });
-      }
-      arrow.beginPath();
-      for (const e of lists.active) drawArrowHead(arrow, e);
-      arrow.fill({ color: colorHex, alpha: 1 });
+    const activeBatches = Math.ceil(lists.active.length / EDGES_PER_BATCH);
+    if (idx < activeBatches) {
+      const start = idx * EDGES_PER_BATCH;
+      const end = Math.min(start + EDGES_PER_BATCH, lists.active.length);
+      return buildEdgeBatchGraphics(lists.active.slice(start, end), group, 1);
     }
+    idx -= activeBatches;
   }
-
-  return { edge, arrow };
+  return null;
 }
 
 /** Draw arrowhead for an edge onto a Pixi Graphics already set up for fill */
@@ -871,23 +854,31 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
     const orch = orchestratorRef.current;
     if (!orch) return;
-    const layoutNodes = nodes.map((n) => ({
-      id: n.id,
-      width: estimateNodeWidth(
-        n.name,
+    const layoutNodes = nodes.map((n) => {
+      const interfaceRows: [string, string][] = (n.interfaces ?? []).map(
+        (iface, idx) => [(idx === 0 ? "implements " : "& ") + iface, ""],
+      );
+      const bodyRows: [string, string][] =
         n.kind === "Enum"
-          ? (n.values?.map((v) => [v.name, ""] as const) ?? [])
+          ? (n.values?.map((v): [string, string] => [v.name, ""]) ?? [])
           : n.kind === "Union"
-            ? (n.members?.map((m) => ["| " + m, ""] as const) ?? [])
-            : (n.fields?.map((x) => [x.name, x.typeName] as const) ?? []),
-      ),
-      height: estimateNodeHeight(
-        n.kind,
-        n.fields?.length ?? 0,
-        n.values?.length ?? 0,
-        n.members?.length ?? 0,
-      ),
-    }));
+            ? (n.members?.map((m): [string, string] => ["| " + m, ""]) ?? [])
+            : [
+                ...(n.fields?.map((x): [string, string] => [x.name, x.typeName]) ?? []),
+                ...interfaceRows,
+              ];
+      return {
+        id: n.id,
+        width: estimateNodeWidth(n.name, bodyRows),
+        height: estimateNodeHeight(
+          n.kind,
+          n.fields?.length ?? 0,
+          n.values?.length ?? 0,
+          n.members?.length ?? 0,
+          n.interfaces?.length ?? 0,
+        ),
+      };
+    });
     const id = ++requestIdRef.current;
     setIsPending(true);
     const request: OrchestratorRequest = {
@@ -995,12 +986,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   }, [edges, layoutResult, nodeById]);
 
   const edgeGroups = useMemo((): EdgeGroups => {
-    const buckets: [LaidEdge[], string, number, number[]][] = [
-      [[], "#6366f1", 0x6366f1, []],
-      [[], "#6366f1", 0x6366f1, [4, 3]],
-      [[], "#eab308", 0xeab308, []],
-      [[], "#64748b", 0x64748b, [6, 4]],
-      [[], "#f97316", 0xf97316, [3, 3]],
+    // Each bucket: [edges, hex string, hex int, alphaScale]. Groups
+    // that were previously dashed get a reduced alphaScale (~0.55) so
+    // they read as "softer" / secondary against the solid groups —
+    // visually mirrors the old dashed-vs-solid contrast without
+    // generating per-dash vertex spam in Pixi.
+    const buckets: [LaidEdge[], string, number, number][] = [
+      [[], "#6366f1", 0x6366f1, 1],     // [0] non-null field — solid blue
+      [[], "#6366f1", 0x6366f1, 0.45],  // [1] nullable field — soft blue
+      [[], "#eab308", 0xeab308, 1],     // [2] union member — solid amber
+      [[], "#64748b", 0x64748b, 0.55],  // [3] implements — soft gray
+      [[], "#f97316", 0xf97316, 0.55],  // [4] arg — soft orange
     ];
     for (const e of laidEdges) {
       if (e.kind === "implements") buckets[3]![0].push(e);
@@ -1010,12 +1006,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       else buckets[0]![0].push(e);
     }
     const shouldDim = focusId && focusId !== rootId;
-    const groups: EdgeGroupSpec[] = buckets.map(([edgeList, color, colorHex, dash]) => {
-      if (!shouldDim) return { color, colorHex, dash, dim: [], active: edgeList };
+    const groups: EdgeGroupSpec[] = buckets.map(([edgeList, color, colorHex, alphaScale]) => {
+      if (!shouldDim) return { color, colorHex, alphaScale, dim: [], active: edgeList };
       return {
         color,
         colorHex,
-        dash,
+        alphaScale,
         dim: edgeList.filter((e) => e.sourceId !== focusId && e.targetId !== focusId),
         active: edgeList.filter((e) => e.sourceId === focusId || e.targetId === focusId),
       };
@@ -1133,12 +1129,22 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const rowIdx = Math.floor((localY - bodyTop) / ROW_H);
       const data = n.data;
       if (data.kind === "Object" || data.kind === "Interface" || data.kind === "Input") {
-        const f = data.fields?.[rowIdx];
-        if (!f) return null;
-        const nav =
-          !BUILTIN_SCALARS.has(f.typeName) && nodeById.has(f.typeName) ? f.typeName : null;
-        const isRelayHover = !!f.isRelayConnection && localX > n.w - 44;
-        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav, isRelayHover };
+        const fields = data.fields ?? [];
+        if (rowIdx < fields.length) {
+          const f = fields[rowIdx]!;
+          const nav =
+            !BUILTIN_SCALARS.has(f.typeName) && nodeById.has(f.typeName) ? f.typeName : null;
+          const isRelayHover = !!f.isRelayConnection && localX > n.w - 44;
+          return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav, isRelayHover };
+        }
+        const interfaces = data.interfaces ?? [];
+        const ifaceIdx = rowIdx - fields.length;
+        if (ifaceIdx < interfaces.length) {
+          const ifaceName = interfaces[ifaceIdx]!;
+          const nav = nodeById.has(ifaceName) ? ifaceName : null;
+          return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav, isRelayHover: false };
+        }
+        return null;
       }
       if (data.kind === "Union") {
         const m = data.members?.[rowIdx];
@@ -1585,6 +1591,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           const tileStable =
             performance.now() - lastViewChangeAtRef.current >= MOTION_SETTLE_MS;
           const buildDeadline = performance.now() + TILE_BUILD_BUDGET_MS;
+          let batchesBuiltThisFrame = 0;
 
           for (const tile of tiles.values()) {
             const tileMinX = tile.col * TILE_SIZE;
@@ -1600,30 +1607,53 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
             if (intersects) {
               tile.lastSeenFrame = frame;
-              if (!tile.edgeGraphics) {
-                if (!tileStable) continue;
-                if (performance.now() >= buildDeadline) continue;
-                const built = buildEdgeTileGraphics(tile, liveGroups);
-                tile.edgeGraphics = built.edge;
-                tile.arrowGraphics = built.arrow;
-                scene.edgeTileContainer.addChild(tile.edgeGraphics);
-                scene.arrowTileContainer.addChild(tile.arrowGraphics);
+              // Lazily compute the batch plan the first time this tile
+              // shows up — saves the count work for tiles that never
+              // become visible.
+              if (tile.totalBatches < 0) {
+                tile.totalBatches = plannedBatchCount(tile, liveGroups);
               }
-              tile.edgeGraphics.visible = true;
-              if (tile.arrowGraphics) tile.arrowGraphics.visible = true;
+              // Build outstanding batches under the shared per-frame
+              // budget. Each iteration appends one Graphics; partial
+              // builds render as "edges fading in" — usually completes
+              // in 1-3 frames for typical tile density.
+              while (
+                tile.builtBatches < tile.totalBatches &&
+                tileStable &&
+                performance.now() < buildDeadline &&
+                batchesBuiltThisFrame < TILE_BATCH_BUDGET_PER_FRAME
+              ) {
+                const built = buildEdgeTileBatch(
+                  tile,
+                  liveGroups,
+                  tile.builtBatches,
+                );
+                tile.builtBatches += 1;
+                batchesBuiltThisFrame += 1;
+                if (!built) continue;
+                tile.edgeBatches.push(built.edge);
+                tile.arrowBatches.push(built.arrow);
+                scene.edgeTileContainer.addChild(built.edge);
+                scene.arrowTileContainer.addChild(built.arrow);
+              }
+              for (const g of tile.edgeBatches) g.visible = true;
+              for (const g of tile.arrowBatches) g.visible = true;
             } else {
-              if (tile.edgeGraphics) tile.edgeGraphics.visible = false;
-              if (tile.arrowGraphics) tile.arrowGraphics.visible = false;
+              for (const g of tile.edgeBatches) g.visible = false;
+              for (const g of tile.arrowBatches) g.visible = false;
               if (
-                tile.edgeGraphics &&
+                tile.edgeBatches.length > 0 &&
                 frame - tile.lastSeenFrame > TILE_EVICT_FRAMES
               ) {
-                tile.edgeGraphics.destroy();
-                tile.edgeGraphics = null;
-                if (tile.arrowGraphics) {
-                  tile.arrowGraphics.destroy();
-                  tile.arrowGraphics = null;
-                }
+                for (const g of tile.edgeBatches) g.destroy();
+                for (const g of tile.arrowBatches) g.destroy();
+                tile.edgeBatches = [];
+                tile.arrowBatches = [];
+                tile.builtBatches = 0;
+                // Mark for re-planning on next visibility — the group
+                // lists could change before the tile comes back into
+                // view (e.g. focus moved).
+                tile.totalBatches = -1;
               }
             }
           }
@@ -1981,7 +2011,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     scene.gridTiling.tileScale.set(1);
   }, [themeResolved]);
 
-  // Keep a reference to the latest edgeGroups (with colors/dashes) so
+  // Keep a reference to the latest edgeGroups (with colors/alphaScales) so
   // the ticker can rebuild a tile's Graphics on demand without closing
   // over a stale effect value.
   const edgeGroupsRef = useRef(edgeGroups);
@@ -1998,8 +2028,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     // Drop old tile Graphics. New grouping means existing vertex
     // buffers are invalid.
     for (const tile of edgeTilesRef.current.values()) {
-      tile.edgeGraphics?.destroy();
-      tile.arrowGraphics?.destroy();
+      for (const g of tile.edgeBatches) g.destroy();
+      for (const g of tile.arrowBatches) g.destroy();
     }
     edgeTilesRef.current.clear();
     scene.edgeTileContainer.removeChildren();
@@ -2027,8 +2057,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 dim: [],
                 active: [],
               })),
-              edgeGraphics: null,
-              arrowGraphics: null,
+              edgeBatches: [],
+              arrowBatches: [],
+              builtBatches: 0,
+              totalBatches: -1,
               lastSeenFrame: 0,
             };
             edgeTilesRef.current.set(key, tile);

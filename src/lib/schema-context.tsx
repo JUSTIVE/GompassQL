@@ -26,6 +26,8 @@ interface SchemaContextValue {
 
   hidePrimitiveFields: boolean;
   setHidePrimitiveFields: (v: boolean) => void;
+  hideRelayBoilerplate: boolean;
+  setHideRelayBoilerplate: (v: boolean) => void;
 }
 
 const EMPTY: ParsedGraph = { nodes: [], edges: [], error: null, warnings: [] };
@@ -60,8 +62,12 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
   const [rootType, setRootTypeState] = useState<string | null>(null);
   const [focusStack, setFocusStack] = useState<string[]>([]);
   const [hidePrimitiveFields, setHidePrimitiveFields] = useState(false);
+  const [hideRelayBoilerplate, setHideRelayBoilerplate] = useState(true);
 
-  const graph = useMemo(() => (sdl ? sdlToGraph(sdl) : EMPTY), [sdl]);
+  const graph = useMemo(
+    () => (sdl ? sdlToGraph(sdl, { hideRelayBoilerplate }) : EMPTY),
+    [sdl, hideRelayBoilerplate],
+  );
 
   const effectiveRoot = useMemo(() => {
     if (rootType && graph.nodes.some((n) => n.id === rootType)) return rootType;
@@ -215,6 +221,8 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     popTo,
     hidePrimitiveFields,
     setHidePrimitiveFields,
+    hideRelayBoilerplate,
+    setHideRelayBoilerplate,
   };
 
   return <SchemaContext.Provider value={value}>{children}</SchemaContext.Provider>;
