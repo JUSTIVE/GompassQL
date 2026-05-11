@@ -56,6 +56,11 @@ export interface OrchestratorRequest {
   edges: GraphEdgeData[];
   layoutNodes: LayoutNodeInput[];
   rootId?: string | null;
+  /** Fired as chunks complete. `done` counts leaf dot dispatches that
+   *  finished; `total` is the estimated dispatch count for the whole
+   *  request (computed before dispatching, based on CHUNK_TARGET_NODES).
+   *  Callers can use these to render a progress bar on huge schemas. */
+  onProgress?: (done: number, total: number) => void;
 }
 
 interface Pending {
@@ -361,16 +366,42 @@ export class LayoutOrchestrator {
     // post-layout. This keeps each GraphViz invocation modest so its
     // WASM heap never has to route polylines across more than a few
     // hundred nodes at once.
+    //
+    // Pre-compute an estimate of total leaf dispatches so the caller's
+    // progress callback can render a determinate bar from the start.
+    // Each multi-comp contributes ceil(nodeCount / CHUNK_TARGET_NODES)
+    // — an upper bound; actual leaf count tends to be a bit lower
+    // because some sub-chunks land below the threshold and stop
+    // recursing.
+    let chunksDone = 0;
+    let chunksTotal = 0;
+    for (const c of multiComps) {
+      chunksTotal += Math.max(
+        1,
+        Math.ceil(c.layoutNodes.length / CHUNK_TARGET_NODES),
+      );
+    }
+    if (req.onProgress) req.onProgress(0, chunksTotal);
+    const onLeaf = req.onProgress
+      ? () => {
+          chunksDone += 1;
+          // Clamp `done` so a slight under-estimate doesn't yield
+          // >100% progress mid-flight.
+          req.onProgress!(Math.min(chunksDone, chunksTotal), chunksTotal);
+        }
+      : undefined;
+
     const tDispatchStart = performance.now();
     const compResponses = await Promise.all(
       multiComps.map((c) => {
         const unions = c.nodes
           .filter((n) => n.kind === "Union")
           .map((n) => ({ id: n.id, members: n.members ?? [] }));
-        return this.chunkAndLayout(c.layoutNodes, c.edges, unions);
+        return this.chunkAndLayout(c.layoutNodes, c.edges, unions, onLeaf);
       }),
     );
     const tLayoutDone = performance.now();
+    if (req.onProgress) req.onProgress(chunksTotal, chunksTotal);
 
     // 4. Compose boxes: multi-comp results + singleton grid (if any)
     const boxes: BoxedResult[] = compResponses.map((r) =>
@@ -440,6 +471,7 @@ export class LayoutOrchestrator {
     layoutNodes: LayoutNodeInput[],
     edges: GraphEdgeData[],
     unions: UnionInput[],
+    onLeaf?: () => void,
   ): Promise<{
     result: LayoutResult;
     similarityMs: number;
@@ -473,6 +505,7 @@ export class LayoutOrchestrator {
         layoutNodes,
         rootId: null,
       });
+      onLeaf?.();
       return {
         result: resp.result,
         similarityMs: resp.timings.similarityMs,
@@ -502,8 +535,8 @@ export class LayoutOrchestrator {
     }
 
     const [left, right] = await Promise.all([
-      this.chunkAndLayout(leftNodes, leftEdges, unions),
-      this.chunkAndLayout(rightNodes, rightEdges, unions),
+      this.chunkAndLayout(leftNodes, leftEdges, unions, onLeaf),
+      this.chunkAndLayout(rightNodes, rightEdges, unions, onLeaf),
     ]);
 
     const placements = shelfPack([
@@ -512,11 +545,15 @@ export class LayoutOrchestrator {
     ]);
     const merged = mergeResults(placements);
 
-    // Synthesize a single-segment polyline path for each cross-chunk
-    // edge using the merged (post-pack) node positions. We exit the
-    // source's right edge (matches dot's `rankdir=LR` exit point) and
-    // enter the target's left edge. The c1/c2 control points are set
-    // to the same endpoints so the bezier renders as a straight line.
+    // Synthesize a single-segment cubic bezier path for each
+    // cross-chunk edge using the merged (post-pack) node positions.
+    // Exit the source's right edge / enter the target's left edge
+    // (matches dot's rankdir=LR exit/entry tangent). Control points
+    // are pulled along the +x / -x tangent direction by a fraction
+    // of the horizontal distance, so the curve gently arcs between
+    // chunks instead of stretching a straight diagonal across the
+    // schema — visually consistent with `splines: polyline` output
+    // dot produces for intra-chunk edges.
     if (crossEdges.length > 0) {
       const posById = new Map<string, PositionedNode>();
       for (const n of merged.nodes) posById.set(n.id, n);
@@ -528,6 +565,11 @@ export class LayoutOrchestrator {
         const sy = a.y;
         const tx = b.x - b.width / 2;
         const ty = b.y;
+        const dx = tx - sx;
+        // Tangent strength: 1/3 of the horizontal span, with a floor
+        // so tightly-spaced cross-edges still curve visibly and a
+        // ceiling so distant pairs don't balloon into huge arcs.
+        const tangent = Math.max(48, Math.min(Math.abs(dx) / 3, 280));
         merged.edgePaths.push({
           edgeId: e.id,
           source: e.source,
@@ -535,8 +577,8 @@ export class LayoutOrchestrator {
           start: { x: sx, y: sy },
           segments: [
             {
-              c1: { x: sx, y: sy },
-              c2: { x: tx, y: ty },
+              c1: { x: sx + tangent, y: sy },
+              c2: { x: tx - tangent, y: ty },
               end: { x: tx, y: ty },
             },
           ],

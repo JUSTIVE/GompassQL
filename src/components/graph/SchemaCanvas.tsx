@@ -1,5 +1,5 @@
 import { Application, Container, Graphics, NineSliceSprite, Sprite, Texture, TilingSprite } from "pixi.js";
-import { Loader2 } from "lucide-react";
+import { ArrowRight, Loader2, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { BezierSegment, LayoutResult } from "@/lib/layout";
 import {
@@ -13,6 +13,7 @@ import { useTheme } from "@/lib/theme";
 import {
   HEADER_H,
   KIND_COLORS,
+  KIND_STYLES,
   NODE_NAME_FONT,
   ROW_H,
   TOP_BODY_PAD,
@@ -53,11 +54,26 @@ interface LaidEdge {
   targetId: string;
   kind: GraphEdgeData["kind"];
   nullable: boolean;
+  /** Human-readable label — for field/arg edges this is the field
+   *  name, for implements/union edges the relationship word. Surfaced
+   *  in the edge hover tooltip. */
+  label?: string;
+  /** Per-edge opacity multiplier (1 = full). Edges incident to a
+   *  hub node (in-degree or out-degree ≥ HUB_FADE_DEGREE) get
+   *  HUB_FADE_ALPHA so hub fan-outs don't drown the canvas. */
+  hubFade?: number;
   start: Point;
   segments: BezierSegment[];
   arrowTip?: Point;
   bbox: { minX: number; minY: number; maxX: number; maxY: number };
 }
+
+/** A node whose in-degree OR out-degree reaches this is treated as
+ *  a hub. Set just above the typical Relay `Node` interface (1 per
+ *  implementor) so normal types stay at full opacity. */
+const HUB_FADE_DEGREE = 50;
+/** Alpha multiplier for edges incident to a hub node. */
+const HUB_FADE_ALPHA = 0.3;
 
 interface Props {
   nodes: GraphNodeData[];
@@ -255,6 +271,32 @@ function cssColorToHex(color: string): number {
     }
   }
   return 0xffffff;
+}
+
+/**
+ * Position-aware tooltip placement. Uses `right` / `bottom` anchors
+ * when the cursor is near the viewport's right / bottom edge so the
+ * bubble never gets clipped. Combined with `whitespace-nowrap` on the
+ * tooltip element, this guarantees the bubble fully wraps its text
+ * regardless of cursor position.
+ */
+function tooltipStyle(clientX: number, clientY: number): React.CSSProperties {
+  const PAD = 12;
+  const EDGE = 8;
+  if (typeof window === "undefined") {
+    return { left: clientX + PAD, top: clientY + PAD };
+  }
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const flipX = clientX > vw / 2;
+  const flipY = clientY > vh - 80;
+  return {
+    left: flipX ? undefined : clientX + PAD,
+    right: flipX ? vw - clientX + PAD : undefined,
+    top: flipY ? undefined : clientY + PAD,
+    bottom: flipY ? vh - clientY + PAD : undefined,
+    maxWidth: `calc(100vw - ${EDGE * 2}px)`,
+  };
 }
 
 // measureText cache
@@ -610,12 +652,35 @@ function buildEdgeBatchGraphics(
   const colorHex = group.colorHex;
   const effAlpha = alpha * group.alphaScale;
 
-  edge.beginPath();
-  for (const e of slice) drawSolidBezierEdge(edge, e);
-  edge.stroke({ width: STROKE_W, color: colorHex, alpha: effAlpha });
-  arrow.beginPath();
-  for (const e of slice) drawArrowHead(arrow, e);
-  arrow.fill({ color: colorHex, alpha: effAlpha });
+  // Split this slice into normal vs hub-faded edges so each gets its
+  // own stroke/fill call with the right alpha. Pixi Graphics supports
+  // multiple stroke styles in the same object via repeated
+  // beginPath / stroke pairs — keeps draw-call count low while still
+  // letting hub-incident edges render at a softer opacity.
+  const normal: LaidEdge[] = [];
+  const faded: LaidEdge[] = [];
+  for (const e of slice) {
+    if ((e.hubFade ?? 1) < 1) faded.push(e);
+    else normal.push(e);
+  }
+
+  if (normal.length > 0) {
+    edge.beginPath();
+    for (const e of normal) drawSolidBezierEdge(edge, e);
+    edge.stroke({ width: STROKE_W, color: colorHex, alpha: effAlpha });
+    arrow.beginPath();
+    for (const e of normal) drawArrowHead(arrow, e);
+    arrow.fill({ color: colorHex, alpha: effAlpha });
+  }
+  if (faded.length > 0) {
+    const fadeAlpha = effAlpha * HUB_FADE_ALPHA;
+    edge.beginPath();
+    for (const e of faded) drawSolidBezierEdge(edge, e);
+    edge.stroke({ width: STROKE_W, color: colorHex, alpha: fadeAlpha });
+    arrow.beginPath();
+    for (const e of faded) drawArrowHead(arrow, e);
+    arrow.fill({ color: colorHex, alpha: fadeAlpha });
+  }
 
   return { edge, arrow };
 }
@@ -726,6 +791,29 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
   const hoveredFieldRef = useRef<{ nodeId: string; fieldIndex: number; isRelayHover: boolean } | null>(null);
   const hoveredNodeRef = useRef<string | null>(null);
+  const hoveredEdgeRef = useRef<LaidEdge | null>(null);
+  // React state mirror — only updates on hover-change so we don't
+  // re-render on every mouse move. The label string drives both the
+  // tooltip render and the redraw of the highlight Graphics.
+  const [hoveredEdgeInfo, setHoveredEdgeInfo] = useState<{
+    label: string;
+    sourceId: string;
+    targetId: string;
+    kind: GraphEdgeData["kind"];
+  } | null>(null);
+  // Edge selected by click — dims everything except this edge and
+  // its two endpoint nodes. Mutually exclusive with node focus
+  // (clicking a node clears this, and vice versa).
+  const [focusedEdge, setFocusedEdge] = useState<LaidEdge | null>(null);
+  const [hoveredEdgeScreen, setHoveredEdgeScreen] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  // Node-name tooltip — only rendered at low LODs (bar / chrome)
+  // where the sprite no longer paints the type name.
+  const hoveredNodeForTipRef = useRef<string | null>(null);
+  const [hoveredNodeTip, setHoveredNodeTip] = useState<{
+    name: string;
+    kind: NodeKind;
+  } | null>(null);
+  const [hoveredNodeScreen, setHoveredNodeScreen] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [cursor, setCursor] = useState<"grab" | "pointer">("grab");
   const { resolved: themeResolved } = useTheme();
   const currentLodRef = useRef<SpriteLOD>("full");
@@ -735,6 +823,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // Layout state
   const [layoutResult, setLayoutResult] = useState<LayoutResult>(EMPTY_LAYOUT);
   const [isPending, setIsPending] = useState(nodes.length > 0);
+  const [layoutProgress, setLayoutProgress] = useState<{ done: number; total: number } | null>(null);
   const [lastTiming, setLastTiming] = useState<OrchestratorTimings | null>(null);
   const lastTimingRef = useRef<OrchestratorTimings | null>(null);
   const orchestratorRef = useRef<LayoutOrchestrator | null>(null);
@@ -747,6 +836,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     world: Container | null;
     edgeTileContainer: Container | null;
     arrowTileContainer: Container | null;
+    hoverEdgeGraphics: Graphics | null;
     nodeContainer: Container | null;
     hoverGraphics: Graphics | null;
     focusGraphics: Graphics | null;
@@ -755,6 +845,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     world: null,
     edgeTileContainer: null,
     arrowTileContainer: null,
+    hoverEdgeGraphics: null,
     nodeContainer: null,
     hoverGraphics: null,
     focusGraphics: null,
@@ -881,12 +972,19 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     });
     const id = ++requestIdRef.current;
     setIsPending(true);
+    setLayoutProgress(null);
     const request: OrchestratorRequest = {
       id,
       nodes,
       edges,
       layoutNodes,
       rootId: rootId ?? null,
+      onProgress: (done, total) => {
+        // Stale-request guard: a newer request may have been issued
+        // while this one was mid-flight.
+        if (id !== requestIdRef.current) return;
+        setLayoutProgress({ done, total });
+      },
     };
     orch
       .layout(request)
@@ -896,10 +994,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         setLastTiming(resp.timings);
         lastTimingRef.current = resp.timings;
         setIsPending(false);
+        setLayoutProgress(null);
       })
       .catch((err: Error) => {
         console.error("layout failed:", err.message);
         setIsPending(false);
+        setLayoutProgress(null);
       });
   }, [nodes, edges, rootId]);
 
@@ -976,11 +1076,33 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         targetId: e.target,
         kind: e.kind,
         nullable: e.nullable ?? false,
+        label: e.label,
         start,
         segments,
         arrowTip,
         bbox: { minX, minY, maxX, maxY },
       });
+    }
+
+    // Hub detection: any node with ≥ HUB_FADE_DEGREE incoming OR
+    // outgoing edges (counted on the rendered/laid-out edge set) is
+    // a hub. Edges touching a hub get a reduced opacity multiplier
+    // so the visual doesn't get dominated by hub fan-out / fan-in.
+    const outDeg = new Map<string, number>();
+    const inDeg = new Map<string, number>();
+    for (const le of out) {
+      outDeg.set(le.sourceId, (outDeg.get(le.sourceId) ?? 0) + 1);
+      inDeg.set(le.targetId, (inDeg.get(le.targetId) ?? 0) + 1);
+    }
+    const hubIds = new Set<string>();
+    for (const [id, d] of outDeg) if (d >= HUB_FADE_DEGREE) hubIds.add(id);
+    for (const [id, d] of inDeg) if (d >= HUB_FADE_DEGREE) hubIds.add(id);
+    if (hubIds.size > 0) {
+      for (const le of out) {
+        if (hubIds.has(le.sourceId) || hubIds.has(le.targetId)) {
+          le.hubFade = HUB_FADE_ALPHA;
+        }
+      }
     }
     return out;
   }, [edges, layoutResult, nodeById]);
@@ -1005,20 +1127,21 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       else if (e.kind === "field" && e.nullable) buckets[1]![0].push(e);
       else buckets[0]![0].push(e);
     }
-    const shouldDim = focusId && focusId !== rootId;
-    const groups: EdgeGroupSpec[] = buckets.map(([edgeList, color, colorHex, alphaScale]) => {
-      if (!shouldDim) return { color, colorHex, alphaScale, dim: [], active: edgeList };
-      return {
-        color,
-        colorHex,
-        alphaScale,
-        dim: edgeList.filter((e) => e.sourceId !== focusId && e.targetId !== focusId),
-        active: edgeList.filter((e) => e.sourceId === focusId || e.targetId === focusId),
-      };
-    });
-
+    // Dim mode precedence: an explicit edge selection (click) takes
+    // priority over the tree-panel node focus. Both keep the same
+    // dim-vs-active partition; only the predicate differs.
+    let activePred: ((e: LaidEdge) => boolean) | null = null;
     const dimNodeIds = new Set<string>();
-    if (shouldDim && focusId) {
+    if (focusedEdge) {
+      activePred = (e) => e === focusedEdge;
+      const keep = new Set<string>([focusedEdge.sourceId, focusedEdge.targetId]);
+      // Walk every laid-out node so isolated singletons get dimmed
+      // too, not just nodes that happen to participate in some edge.
+      for (const n of laidNodes) {
+        if (!keep.has(n.id)) dimNodeIds.add(n.id);
+      }
+    } else if (focusId && focusId !== rootId) {
+      activePred = (e) => e.sourceId === focusId || e.targetId === focusId;
       const connectedIds = new Set<string>([focusId]);
       for (const e of laidEdges) {
         if (e.sourceId === focusId) connectedIds.add(e.targetId);
@@ -1030,8 +1153,42 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       }
     }
 
+    const groups: EdgeGroupSpec[] = buckets.map(([edgeList, color, colorHex, alphaScale]) => {
+      if (!activePred) return { color, colorHex, alphaScale, dim: [], active: edgeList };
+      const pred = activePred;
+      return {
+        color,
+        colorHex,
+        alphaScale,
+        dim: edgeList.filter((e) => !pred(e)),
+        active: edgeList.filter((e) => pred(e)),
+      };
+    });
+
     return { groups, dimNodeIds };
-  }, [laidEdges, focusId, rootId]);
+  }, [laidEdges, laidNodes, focusId, rootId, focusedEdge]);
+
+  // The focused-edge reference becomes stale when laidEdges rebuilds
+  // (new layout / schema change). Clear it so the dim state doesn't
+  // get stuck on an orphan object.
+  useEffect(() => {
+    if (!focusedEdge) return;
+    if (!laidEdges.includes(focusedEdge)) setFocusedEdge(null);
+  }, [laidEdges, focusedEdge]);
+
+  // Ticker-accessible mirror of `focusedEdge`. The sprite sweep runs
+  // outside React render and needs to force full-LOD rendering for
+  // the focused edge's two endpoints regardless of the global zoom.
+  const focusedEdgeRef = useRef<LaidEdge | null>(focusedEdge);
+  focusedEdgeRef.current = focusedEdge;
+
+  // Whenever the focused edge changes, invalidate the sprite sweep's
+  // last-view cache so the next frame re-evaluates endpoints (which
+  // need a synchronous full-LOD build) and other sprites (which can
+  // drop back to the placeholder).
+  useEffect(() => {
+    lastSpriteSweepViewRef.current = { x: NaN, y: NaN, k: 0, lod: "full" };
+  }, [focusedEdge]);
 
   const bounds = useMemo(() => {
     if (laidNodes.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
@@ -1110,6 +1267,102 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       x: (clientX - rect.left - v.x) / v.k,
       y: (clientY - rect.top - v.y) / v.k,
     };
+  };
+
+  // Squared distance from point P to line segment AB. Cheap version
+  // used in the inner loop of edge hit-testing — compares against
+  // threshold² so we never need a sqrt.
+  const pointSegmentDistSq = (
+    px: number, py: number,
+    ax: number, ay: number,
+    bx: number, by: number,
+  ): number => {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    if (len2 < 0.0001) {
+      const ex = px - ax;
+      const ey = py - ay;
+      return ex * ex + ey * ey;
+    }
+    let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const cx = ax + t * dx;
+    const cy = ay + t * dy;
+    const ex = px - cx;
+    const ey = py - cy;
+    return ex * ex + ey * ey;
+  };
+
+  /**
+   * Returns the squared distance from (px, py) to the polyline
+   * sampled from the edge's bezier segments. Early-exits via bbox
+   * test so far-away edges cost a couple of comparisons.
+   */
+  const edgeDistSq = (px: number, py: number, edge: LaidEdge): number => {
+    const pad = 16;
+    if (
+      px < edge.bbox.minX - pad ||
+      px > edge.bbox.maxX + pad ||
+      py < edge.bbox.minY - pad ||
+      py > edge.bbox.maxY + pad
+    ) {
+      return Infinity;
+    }
+    const STEPS = 10;
+    let best = Infinity;
+    let prev = edge.start;
+    for (const seg of edge.segments) {
+      let segPrev = prev;
+      for (let i = 1; i <= STEPS; i++) {
+        const t = i / STEPS;
+        const pt = cubicBezier(prev, seg.c1, seg.c2, seg.end, t);
+        const d = pointSegmentDistSq(px, py, segPrev.x, segPrev.y, pt.x, pt.y);
+        if (d < best) best = d;
+        segPrev = pt;
+      }
+      prev = seg.end;
+    }
+    return best;
+  };
+
+  /**
+   * Find the closest edge to the cursor within EDGE_HOVER_PX screen
+   * pixels. Uses the edge-tile index for early rejection — only
+   * edges in the cursor's tile (and 8 neighbors) get distance-tested,
+   * which keeps the cost bounded on huge schemas.
+   */
+  const EDGE_HOVER_PX = 6;
+  const hitTestEdge = (worldX: number, worldY: number): LaidEdge | null => {
+    const v = viewRef.current;
+    const thresholdWorld = EDGE_HOVER_PX / v.k;
+    const threshSq = thresholdWorld * thresholdWorld;
+    const tcol = Math.floor(worldX / TILE_SIZE);
+    const trow = Math.floor(worldY / TILE_SIZE);
+    let best: LaidEdge | null = null;
+    let bestD = threshSq;
+    const seen = new Set<LaidEdge>();
+    for (let dc = -1; dc <= 1; dc++) {
+      for (let dr = -1; dr <= 1; dr++) {
+        const tile = edgeTilesRef.current.get(`${tcol + dc},${trow + dr}`);
+        if (!tile) continue;
+        for (const lists of tile.groupLists) {
+          for (const e of lists.active) {
+            if (seen.has(e)) continue;
+            seen.add(e);
+            const d = edgeDistSq(worldX, worldY, e);
+            if (d < bestD) { bestD = d; best = e; }
+          }
+          for (const e of lists.dim) {
+            if (seen.has(e)) continue;
+            seen.add(e);
+            const d = edgeDistSq(worldX, worldY, e);
+            if (d < bestD) { bestD = d; best = e; }
+          }
+        }
+      }
+    }
+    return best;
   };
 
   const hitTestField = (
@@ -1224,7 +1477,15 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
     const hit = hitTestField(world.x, world.y);
     const hoveredNode = hitTestNode(world.x, world.y);
-    if (onNavigate) setCursor(hit?.navigableTarget ? "pointer" : "grab");
+    if (onNavigate) {
+      const lowLod = currentLodRef.current !== "full";
+      // At low LOD the whole node card is the click target, so we
+      // show the pointer cursor on any node hover; at full LOD the
+      // pointer only appears on field rows with a navigable target.
+      setCursor(
+        (lowLod ? !!hoveredNode : !!hit?.navigableTarget) ? "pointer" : "grab",
+      );
+    }
     const prev = hoveredFieldRef.current;
     const same =
       prev !== null &&
@@ -1238,28 +1499,124 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         : null;
     }
     hoveredNodeRef.current = hoveredNode;
+
+    // Node-name tooltip data — always tracked here; the JSX shows it
+    // only at low LODs (bar / chrome) where the sprite doesn't paint
+    // the name. State update is gated on id changes so we don't
+    // re-render on every mouse move while parked over one node.
+    if (hoveredNode !== hoveredNodeForTipRef.current) {
+      hoveredNodeForTipRef.current = hoveredNode;
+      if (hoveredNode) {
+        const n = nodeById.get(hoveredNode);
+        if (n) setHoveredNodeTip({ name: n.data.name, kind: n.data.kind });
+        else setHoveredNodeTip(null);
+      } else {
+        setHoveredNodeTip(null);
+      }
+    }
+    if (hoveredNode) {
+      setHoveredNodeScreen({ x: e.clientX, y: e.clientY });
+    }
+
+    // Edge hover — only check when the cursor isn't already over a
+    // node card (the node would otherwise occlude the edge endpoint
+    // and edge hover would feel sticky on the node).
+    const edge = hoveredNode ? null : hitTestEdge(world.x, world.y);
+    const prevEdge = hoveredEdgeRef.current;
+    if (edge !== prevEdge) {
+      hoveredEdgeRef.current = edge;
+      if (edge && edge.label) {
+        setHoveredEdgeInfo({
+          label: edge.label,
+          sourceId: edge.sourceId,
+          targetId: edge.targetId,
+          kind: edge.kind,
+        });
+      } else {
+        setHoveredEdgeInfo(null);
+      }
+    }
+    if (edge && edge.label) {
+      setHoveredEdgeScreen({ x: e.clientX, y: e.clientY });
+    }
   };
 
   const endDrag = () => {
     dragRef.current.active = false;
     hoveredFieldRef.current = null;
     hoveredNodeRef.current = null;
+    if (hoveredEdgeRef.current !== null) {
+      hoveredEdgeRef.current = null;
+      setHoveredEdgeInfo(null);
+    }
+    if (hoveredNodeForTipRef.current !== null) {
+      hoveredNodeForTipRef.current = null;
+      setHoveredNodeTip(null);
+    }
   };
 
   const onClick = (e: React.MouseEvent) => {
     if (dragRef.current.moved) return;
     const world = screenToWorld(e.clientX, e.clientY);
     if (!world) return;
-    const fieldHit = hitTestFieldTarget(world.x, world.y);
-    if (fieldHit) { onNavigate?.(fieldHit); return; }
-    const nodeId = hitTestNodeHeader(world.x, world.y);
-    if (nodeId) { onNavigate?.(nodeId); return; }
+    const lowLod = currentLodRef.current !== "full";
+    if (lowLod) {
+      // Bar / chrome LOD: field text isn't rendered, so a field-row
+      // hit would point at something the user can't see. Treat the
+      // whole node card as one click target that selects the node.
+      const nodeId = hitTestNode(world.x, world.y);
+      if (nodeId) { setFocusedEdge(null); onNavigate?.(nodeId); return; }
+    } else {
+      const fieldHit = hitTestFieldTarget(world.x, world.y);
+      if (fieldHit) { setFocusedEdge(null); onNavigate?.(fieldHit); return; }
+      const nodeId = hitTestNodeHeader(world.x, world.y);
+      if (nodeId) { setFocusedEdge(null); onNavigate?.(nodeId); return; }
+    }
+    // Edge click — frame the view so both endpoint nodes are visible
+    // and the edge's midpoint is at screen center. Doesn't navigate,
+    // so the user can keep their focus context intact.
+    const edge = hitTestEdge(world.x, world.y);
+    if (edge) {
+      const a = nodeById.get(edge.sourceId);
+      const b = nodeById.get(edge.targetId);
+      if (a && b) {
+        const minX = Math.min(a.cx - a.w / 2, b.cx - b.w / 2);
+        const maxX = Math.max(a.cx + a.w / 2, b.cx + b.w / 2);
+        const minY = Math.min(a.cy - a.h / 2, b.cy - b.h / 2);
+        const maxY = Math.max(a.cy + a.h / 2, b.cy + b.h / 2);
+        const pad = 80;
+        const gW = maxX - minX + pad * 2;
+        const gH = maxY - minY + pad * 2;
+        // Cap zoom-in so a short edge between two small nodes doesn't
+        // explode them to fullscreen.
+        const k = Math.max(0.1, Math.min(size.w / gW, size.h / gH, 1.2));
+        const cx = (minX + maxX) / 2;
+        const cy = (minY + maxY) / 2;
+        viewRef.current = {
+          k,
+          x: size.w / 2 - cx * k,
+          y: size.h / 2 - cy * k,
+        };
+        // Clear the edge hover state so the highlight + tooltip don't
+        // stick around after the view moves out from under the cursor.
+        hoveredEdgeRef.current = null;
+        setHoveredEdgeInfo(null);
+        setFocusedEdge(edge);
+        return;
+      }
+    }
+    setFocusedEdge(null);
     onClearFocus?.();
   };
 
-  // Touch gestures
-  const hitTestRef = useRef(hitTestFieldTarget);
-  hitTestRef.current = hitTestFieldTarget;
+  // Touch gestures — wrap the click-target hit test so a tap at low
+  // LOD selects the whole node card (where field text isn't drawn).
+  const tapHitTest = (wx: number, wy: number): string | null => {
+    if (currentLodRef.current !== "full") return hitTestNode(wx, wy);
+    return hitTestFieldTarget(wx, wy) ?? hitTestNodeHeader(wx, wy);
+  };
+  const hitTestRef = useRef(tapHitTest);
+  hitTestRef.current = tapHitTest;
   const onNavigateRef = useRef(onNavigate);
   onNavigateRef.current = onNavigate;
 
@@ -1430,6 +1787,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
       const edgeTileContainer = new Container();
       const arrowTileContainer = new Container();
+      const hoverEdgeGraphics = new Graphics();
       const nodeContainer = new Container();
       nodeContainer.cullable = true;
       const hoverGraphics = new Graphics();
@@ -1437,6 +1795,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
       world.addChild(edgeTileContainer);
       world.addChild(arrowTileContainer);
+      // Highlight is between edges and nodes — drawn on top of every
+      // other edge in the tiles but covered by node cards, so the
+      // emphasized line reads cleanly without spilling onto nodes.
+      world.addChild(hoverEdgeGraphics);
       world.addChild(nodeContainer);
       world.addChild(hoverGraphics);
       world.addChild(focusGraphics);
@@ -1451,6 +1813,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         world,
         edgeTileContainer,
         arrowTileContainer,
+        hoverEdgeGraphics,
         nodeContainer,
         hoverGraphics,
         focusGraphics,
@@ -1694,6 +2057,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             if (!kindTex) {
               sprite.tint = cssColorToHex(KIND_COLORS[node.data.kind]);
             }
+            // Apply current focus-dim state so sprites created mid-
+            // focus (e.g. when the post-click sweep finally brings an
+            // endpoint into view) don't briefly flash at full alpha.
+            if (edgeGroupsRef.current.dimNodeIds.has(node.id)) {
+              sprite.alpha = 0.1;
+            }
             nodeContainer.addChild(sprite);
             nodeSpritesRef.current.set(node.id, sprite);
           }
@@ -1775,11 +2144,21 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   continue;
                 }
                 spriteLastSeenFrameRef.current.set(id, frameCounterRef.current);
+                // Endpoints of the currently-focused edge are
+                // always rendered at full LOD so the user can read
+                // type names + fields even after zooming out. The
+                // texture is built synchronously here (cheap — only
+                // up to 2 sprites) so we don't have to thread a
+                // mixed-LOD build queue.
+                const focusedE = focusedEdgeRef.current;
+                const forceFull =
+                  !!focusedE &&
+                  (focusedE.sourceId === id || focusedE.targetId === id);
                 // Non-full LOD: show the shared per-kind placeholder.
                 // Six uploads total, reused across every sprite of the
                 // same kind — cheap and gives a proper card silhouette
                 // instead of the old solid tinted rectangle.
-                if (lod !== "full") {
+                if (lod !== "full" && !forceFull) {
                   const kindTex = kindTextureCacheRef.current.get(
                     node.data.kind,
                   );
@@ -1793,11 +2172,35 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   }
                   continue;
                 }
-                const key = `${id}:${lod}`;
+                const effLod: SpriteLOD = forceFull ? "full" : lod;
+                const effDpr = forceFull ? spriteDprForLod("full") : dpr;
+                const key = `${id}:${effLod}`;
                 const cachedTex = textureCacheRef.current.get(key);
                 if (cachedTex) {
                   if (sprite.texture !== cachedTex) {
                     sprite.texture = cachedTex;
+                    sprite.tint = 0xffffff;
+                    sprite.leftWidth = 0;
+                    sprite.topHeight = 0;
+                    sprite.rightWidth = 0;
+                    sprite.bottomHeight = 0;
+                  }
+                } else if (forceFull) {
+                  // Synchronous build for focused endpoints — bypasses
+                  // the motion-settle gate and the build queue so the
+                  // selection feels immediate.
+                  const pw = Math.ceil(node.w * effDpr);
+                  const ph = Math.ceil(node.h * effDpr);
+                  const can = document.createElement("canvas");
+                  can.width = pw;
+                  can.height = ph;
+                  const c2d = can.getContext("2d");
+                  if (c2d) {
+                    c2d.setTransform(effDpr, 0, 0, effDpr, 0, 0);
+                    drawNodeSprite(c2d, node, spriteCtx, "full");
+                    const tex = Texture.from(can);
+                    textureCacheRef.current.set(key, tex);
+                    sprite.texture = tex;
                     sprite.tint = 0xffffff;
                     sprite.leftWidth = 0;
                     sprite.topHeight = 0;
@@ -1957,6 +2360,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         world: null,
         edgeTileContainer: null,
         arrowTileContainer: null,
+        hoverEdgeGraphics: null,
         nodeContainer: null,
         hoverGraphics: null,
         focusGraphics: null,
@@ -2137,6 +2541,33 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
   }, [edgeGroups]);
 
+  // Redraw the hovered-edge highlight whenever the hovered edge
+  // changes. The edge geometry itself lives on `hoveredEdgeRef`; the
+  // state mirror just serves as a render trigger.
+  useEffect(() => {
+    const g = sceneRef.current.hoverEdgeGraphics;
+    if (!g) return;
+    g.clear();
+    const e = hoveredEdgeRef.current;
+    if (!e) return;
+    const color =
+      e.kind === "implements"
+        ? 0x64748b
+        : e.kind === "union"
+          ? 0xeab308
+          : e.kind === "arg"
+            ? 0xf97316
+            : 0x6366f1;
+    g.moveTo(e.start.x, e.start.y);
+    for (const seg of e.segments) {
+      g.bezierCurveTo(seg.c1.x, seg.c1.y, seg.c2.x, seg.c2.y, seg.end.x, seg.end.y);
+    }
+    g.stroke({ width: 4, color, alpha: 1 });
+    g.beginPath();
+    drawArrowHead(g, e);
+    g.fill({ color, alpha: 1 });
+  }, [hoveredEdgeInfo]);
+
   // FPS + timing overlay state
   const fpsOverlayRef = useRef<HTMLDivElement>(null);
 
@@ -2163,20 +2594,161 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     >
       <div ref={pixiContainerRef} style={{ width: size.w, height: size.h }} />
 
+      {hoveredEdgeInfo && (() => {
+        const sourceKind = nodeById.get(hoveredEdgeInfo.sourceId)?.data.kind;
+        const targetKind = nodeById.get(hoveredEdgeInfo.targetId)?.data.kind;
+        return (
+          <div
+            className="pointer-events-none fixed z-50 whitespace-nowrap rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur"
+            style={tooltipStyle(hoveredEdgeScreen.x, hoveredEdgeScreen.y)}
+          >
+            <div className="flex items-center gap-2">
+              {sourceKind && (
+                <span
+                  className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
+                  style={{ backgroundColor: KIND_COLORS[sourceKind] }}
+                >
+                  {KIND_STYLES[sourceKind].label}
+                </span>
+              )}
+              {(hoveredEdgeInfo.kind === "field" || hoveredEdgeInfo.kind === "arg") && hoveredEdgeInfo.label ? (
+                <span>
+                  <span className="font-semibold">{hoveredEdgeInfo.sourceId}</span>
+                  <span className="text-muted-foreground">.</span>
+                  <span style={{ color: "#f59e0b" }}>{hoveredEdgeInfo.label}</span>
+                </span>
+              ) : (
+                <span className="font-semibold">{hoveredEdgeInfo.sourceId}</span>
+              )}
+              {hoveredEdgeInfo.kind === "implements" && (
+                <span className="text-muted-foreground italic">implements</span>
+              )}
+              {hoveredEdgeInfo.kind === "union" && (
+                <span className="text-muted-foreground">|</span>
+              )}
+              <ArrowRight className="h-3 w-3 text-muted-foreground" />
+              {targetKind && (
+                <span
+                  className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
+                  style={{ backgroundColor: KIND_COLORS[targetKind] }}
+                >
+                  {KIND_STYLES[targetKind].label}
+                </span>
+              )}
+              <span className="font-semibold">{hoveredEdgeInfo.targetId}</span>
+            </div>
+          </div>
+        );
+      })()}
+
+      {focusedEdge && (() => {
+        const e = focusedEdge;
+        const label = e.label ?? "";
+        const sourceKind = nodeById.get(e.sourceId)?.data.kind;
+        const targetKind = nodeById.get(e.targetId)?.data.kind;
+        return (
+          <div className="pointer-events-auto absolute bottom-4 left-1/2 z-20 max-w-[92vw] -translate-x-1/2 rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur">
+            <div className="flex flex-wrap items-center gap-2">
+              {sourceKind && (
+                <span
+                  className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
+                  style={{ backgroundColor: KIND_COLORS[sourceKind] }}
+                >
+                  {KIND_STYLES[sourceKind].label}
+                </span>
+              )}
+              {(e.kind === "field" || e.kind === "arg") && label ? (
+                <span>
+                  <span className="font-semibold">{e.sourceId}</span>
+                  <span className="text-muted-foreground">.</span>
+                  <span style={{ color: "#f59e0b" }}>{label}</span>
+                </span>
+              ) : (
+                <span className="font-semibold">{e.sourceId}</span>
+              )}
+              {e.kind === "implements" && (
+                <span className="text-muted-foreground italic">implements</span>
+              )}
+              {e.kind === "union" && (
+                <span className="text-muted-foreground">|</span>
+              )}
+              <ArrowRight className="h-3 w-3 text-muted-foreground" />
+              {targetKind && (
+                <span
+                  className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
+                  style={{ backgroundColor: KIND_COLORS[targetKind] }}
+                >
+                  {KIND_STYLES[targetKind].label}
+                </span>
+              )}
+              <span className="font-semibold">{e.targetId}</span>
+              <button
+                type="button"
+                onClick={(ev) => { ev.stopPropagation(); setFocusedEdge(null); }}
+                className="ml-2 rounded p-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
+                title="Clear edge focus"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {hoveredNodeTip && currentLodRef.current !== "full" && (
+        <div
+          className="pointer-events-none fixed z-50 flex items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-popover px-2 py-1 font-mono text-[11px] text-popover-foreground shadow-md"
+          style={tooltipStyle(hoveredNodeScreen.x, hoveredNodeScreen.y)}
+        >
+          <span
+            className="rounded px-1 py-0 text-[9px] uppercase tracking-wide"
+            style={{
+              backgroundColor: KIND_COLORS[hoveredNodeTip.kind],
+              color: "white",
+            }}
+          >
+            {KIND_STYLES[hoveredNodeTip.kind].label}
+          </span>
+          <span>{hoveredNodeTip.name}</span>
+        </div>
+      )}
+
       {isPending && (
         <div
           className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-background/60 backdrop-blur-sm"
           role="status"
           aria-live="polite"
         >
-          <div className="flex flex-col items-center gap-3 rounded-xl border border-border bg-card/90 px-6 py-5 shadow-lg">
+          <div className="flex w-72 flex-col items-center gap-3 rounded-xl border border-border bg-card/90 px-6 py-5 shadow-lg">
             <Loader2 className="h-7 w-7 animate-spin text-primary" />
             <div className="text-sm font-medium">
               Laying out {nodes.length.toLocaleString()} types…
             </div>
-            <div className="text-xs text-muted-foreground">
-              Large schemas may take a few seconds.
-            </div>
+            {layoutProgress && layoutProgress.total > 1 ? (
+              <>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-secondary">
+                  <div
+                    className="h-full rounded-full bg-primary transition-[width] duration-150"
+                    style={{
+                      width: `${Math.round(
+                        (layoutProgress.done / layoutProgress.total) * 100,
+                      )}%`,
+                    }}
+                  />
+                </div>
+                <div className="font-mono text-[10px] text-muted-foreground">
+                  {layoutProgress.done} / {layoutProgress.total} chunks ·{" "}
+                  {Math.round(
+                    (layoutProgress.done / layoutProgress.total) * 100,
+                  )}
+                  %
+                </div>
+              </>
+            ) : (
+              <div className="text-xs text-muted-foreground">
+                Large schemas may take a few seconds.
+              </div>
+            )}
           </div>
         </div>
       )}
