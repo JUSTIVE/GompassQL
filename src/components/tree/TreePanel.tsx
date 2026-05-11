@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Clock, Filter, Search, TriangleAlert, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Clock, Search, TriangleAlert, X } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
@@ -121,10 +121,6 @@ export function TreePanel() {
     pushFocus,
     popTo,
     name,
-    hidePrimitiveFields,
-    setHidePrimitiveFields,
-    hideRelayBoilerplate,
-    setHideRelayBoilerplate,
   } = useSchema();
   const [allTypesOpen, setAllTypesOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -395,36 +391,6 @@ export function TreePanel() {
               ⌘K
             </span>
           )}
-        </div>
-        {/* Filter toggles */}
-        <div className="mt-2 flex flex-wrap gap-1.5">
-          <button
-            type="button"
-            onClick={() => setHidePrimitiveFields(!hidePrimitiveFields)}
-            className={cn(
-              "flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors",
-              hidePrimitiveFields
-                ? "border-primary bg-primary/10 text-primary"
-                : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground",
-            )}
-          >
-            <Filter className="h-2.5 w-2.5" />
-            Hide primitives
-          </button>
-          <button
-            type="button"
-            onClick={() => setHideRelayBoilerplate(!hideRelayBoilerplate)}
-            className={cn(
-              "flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors",
-              hideRelayBoilerplate
-                ? "border-primary bg-primary/10 text-primary"
-                : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground",
-            )}
-            title="Hide the Relay Node interface, PageInfo, and *Edge / *Connection types"
-          >
-            <Filter className="h-2.5 w-2.5" />
-            Hide Relay
-          </button>
         </div>
       </div>
 

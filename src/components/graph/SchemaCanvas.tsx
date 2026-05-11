@@ -1,5 +1,5 @@
 import { Application, Container, Graphics, NineSliceSprite, Sprite, Texture, TilingSprite } from "pixi.js";
-import { ArrowRight, Loader2, X } from "lucide-react";
+import { ArrowRight, ChevronDown, ChevronUp, Filter, History, Loader2, Trash2, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { BezierSegment, LayoutResult } from "@/lib/layout";
 import {
@@ -9,7 +9,9 @@ import {
   type OrchestratorTimings,
 } from "@/lib/layout-orchestrator";
 import type { GraphEdgeData, GraphNodeData, NodeKind } from "@/lib/sdl-to-graph";
+import { useSchema } from "@/lib/schema-context";
 import { useTheme } from "@/lib/theme";
+import { cn } from "@/lib/utils";
 import {
   HEADER_H,
   KIND_COLORS,
@@ -179,10 +181,19 @@ const EDGES_PER_BATCH = 16;
 // fill-in speed (edges per frame) stays the same as before.
 const TILE_BATCH_BUDGET_PER_FRAME = 24;
 
-// LOD tiers
+// LOD tiers — thresholds tuned conservatively so the full-text
+// rendering survives further zoom-outs. Drop to the bar / chrome
+// placeholders only when the user is genuinely far enough away that
+// text would be illegible anyway.
 type SpriteLOD = "full" | "bar" | "chrome";
-const LOD_FULL = 0.22;
-const LOD_BAR = 0.07;
+const LOD_FULL = 0.06;
+const LOD_BAR = 0.02;
+// Zoom level below which individual field-row clicks stop being a
+// useful target — text is too small for precise pointing even
+// though the sprite still uses the full-LOD texture. Below this the
+// node-name tooltip appears and a node click frames the node
+// (instead of treating the click as a field hit).
+const FIELD_CLICK_MIN_ZOOM = 0.35;
 // Hysteresis: once inside a tier, require a slightly larger excursion
 // before exiting. Prevents oscillation (and its sprite rebuild cost)
 // when the user parks their zoom right on a boundary.
@@ -805,6 +816,77 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // its two endpoint nodes. Mutually exclusive with node focus
   // (clicking a node clears this, and vice versa).
   const [focusedEdge, setFocusedEdge] = useState<LaidEdge | null>(null);
+
+  // Click history — last 50 entries, newest first. Surfaces a quick
+  // "recently visited" jump list overlaid on the canvas.
+  type HistoryItem =
+    | { kind: "node"; id: string; nodeId: string; name: string; nodeKind: NodeKind; ts: number }
+    | {
+        kind: "edge";
+        id: string;
+        sourceId: string;
+        targetId: string;
+        label: string;
+        edgeKind: GraphEdgeData["kind"];
+        ts: number;
+      };
+  const HISTORY_CAP = 50;
+  const [clickHistory, setClickHistory] = useState<HistoryItem[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(true);
+  const [hoveredHistoryItem, setHoveredHistoryItem] = useState<HistoryItem | null>(null);
+  const [hoveredHistoryPos, setHoveredHistoryPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const pushHistory = (item: HistoryItem) => {
+    setClickHistory((prev) => {
+      // De-dupe by id against the most-recent entry so spamming the
+      // same row doesn't fill the list with duplicates.
+      if (prev[0]?.id === item.id) return prev;
+      return [item, ...prev.filter((p) => p.id !== item.id)].slice(0, HISTORY_CAP);
+    });
+  };
+  const removeFromHistory = (id: string) => {
+    setClickHistory((prev) => prev.filter((p) => p.id !== id));
+  };
+
+  /**
+   * Shared "focus this edge" action used by both the in-canvas edge
+   * click and the history-item click. Frames the two endpoint nodes
+   * to fit, sets focus state (which triggers dimming of everything
+   * else + full-LOD render of the endpoints), clears any in-flight
+   * hover, and bumps the entry to the top of the history.
+   */
+  const focusOnEdge = (edge: LaidEdge) => {
+    const a = nodeById.get(edge.sourceId);
+    const b = nodeById.get(edge.targetId);
+    if (a && b) {
+      const minX = Math.min(a.cx - a.w / 2, b.cx - b.w / 2);
+      const maxX = Math.max(a.cx + a.w / 2, b.cx + b.w / 2);
+      const minY = Math.min(a.cy - a.h / 2, b.cy - b.h / 2);
+      const maxY = Math.max(a.cy + a.h / 2, b.cy + b.h / 2);
+      const pad = 80;
+      const gW = maxX - minX + pad * 2;
+      const gH = maxY - minY + pad * 2;
+      const k = Math.max(0.1, Math.min(size.w / gW, size.h / gH, 1.2));
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+      viewRef.current = {
+        k,
+        x: size.w / 2 - cx * k,
+        y: size.h / 2 - cy * k,
+      };
+    }
+    hoveredEdgeRef.current = null;
+    setHoveredEdgeInfo(null);
+    setFocusedEdge(edge);
+    pushHistory({
+      kind: "edge",
+      id: `edge:${edge.sourceId}|${edge.targetId}|${edge.label ?? ""}|${edge.kind}`,
+      sourceId: edge.sourceId,
+      targetId: edge.targetId,
+      label: edge.label ?? "",
+      edgeKind: edge.kind,
+      ts: Date.now(),
+    });
+  };
   const [hoveredEdgeScreen, setHoveredEdgeScreen] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   // Node-name tooltip — only rendered at low LODs (bar / chrome)
   // where the sprite no longer paints the type name.
@@ -816,6 +898,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const [hoveredNodeScreen, setHoveredNodeScreen] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [cursor, setCursor] = useState<"grab" | "pointer">("grab");
   const { resolved: themeResolved } = useTheme();
+  const {
+    hidePrimitiveFields,
+    setHidePrimitiveFields,
+    hideRelayBoilerplate,
+    setHideRelayBoilerplate,
+  } = useSchema();
   const currentLodRef = useRef<SpriteLOD>("full");
   const [lodTick, setLodTick] = useState(0);
   const [appReady, setAppReady] = useState(false);
@@ -1478,7 +1566,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     const hit = hitTestField(world.x, world.y);
     const hoveredNode = hitTestNode(world.x, world.y);
     if (onNavigate) {
-      const lowLod = currentLodRef.current !== "full";
+      const lowLod =
+      currentLodRef.current !== "full" ||
+      viewRef.current.k < FIELD_CLICK_MIN_ZOOM;
       // At low LOD the whole node card is the click target, so we
       // show the pointer cursor on any node hover; at full LOD the
       // pointer only appears on field rows with a navigable target.
@@ -1559,51 +1649,60 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     if (dragRef.current.moved) return;
     const world = screenToWorld(e.clientX, e.clientY);
     if (!world) return;
-    const lowLod = currentLodRef.current !== "full";
+    const recordNodeClick = (id: string) => {
+      const n = nodeById.get(id);
+      if (n) {
+        pushHistory({
+          kind: "node",
+          id: `node:${id}`,
+          nodeId: id,
+          name: n.data.name,
+          nodeKind: n.data.kind,
+          ts: Date.now(),
+        });
+      }
+    };
+    const lowLod =
+      currentLodRef.current !== "full" ||
+      viewRef.current.k < FIELD_CLICK_MIN_ZOOM;
     if (lowLod) {
-      // Bar / chrome LOD: field text isn't rendered, so a field-row
-      // hit would point at something the user can't see. Treat the
-      // whole node card as one click target that selects the node.
+      // Field text is unreadable here, so the whole node card is the
+      // click target. Click frames the node — zooms in and centers
+      // so the user can immediately read its fields.
       const nodeId = hitTestNode(world.x, world.y);
-      if (nodeId) { setFocusedEdge(null); onNavigate?.(nodeId); return; }
+      if (nodeId) {
+        setFocusedEdge(null);
+        recordNodeClick(nodeId);
+        const n = nodeById.get(nodeId);
+        if (n) {
+          const pad = 120;
+          const fitK = Math.min(
+            size.w / (n.w + pad * 2),
+            size.h / (n.h + pad * 2),
+            1.4,
+          );
+          const targetK = Math.max(FIELD_CLICK_MIN_ZOOM * 1.6, fitK);
+          viewRef.current = {
+            k: targetK,
+            x: size.w / 2 - n.cx * targetK,
+            y: size.h / 2 - n.cy * targetK,
+          };
+        }
+        return;
+      }
     } else {
       const fieldHit = hitTestFieldTarget(world.x, world.y);
-      if (fieldHit) { setFocusedEdge(null); onNavigate?.(fieldHit); return; }
+      if (fieldHit) { setFocusedEdge(null); recordNodeClick(fieldHit); onNavigate?.(fieldHit); return; }
       const nodeId = hitTestNodeHeader(world.x, world.y);
-      if (nodeId) { setFocusedEdge(null); onNavigate?.(nodeId); return; }
+      if (nodeId) { setFocusedEdge(null); recordNodeClick(nodeId); onNavigate?.(nodeId); return; }
     }
     // Edge click — frame the view so both endpoint nodes are visible
     // and the edge's midpoint is at screen center. Doesn't navigate,
     // so the user can keep their focus context intact.
     const edge = hitTestEdge(world.x, world.y);
     if (edge) {
-      const a = nodeById.get(edge.sourceId);
-      const b = nodeById.get(edge.targetId);
-      if (a && b) {
-        const minX = Math.min(a.cx - a.w / 2, b.cx - b.w / 2);
-        const maxX = Math.max(a.cx + a.w / 2, b.cx + b.w / 2);
-        const minY = Math.min(a.cy - a.h / 2, b.cy - b.h / 2);
-        const maxY = Math.max(a.cy + a.h / 2, b.cy + b.h / 2);
-        const pad = 80;
-        const gW = maxX - minX + pad * 2;
-        const gH = maxY - minY + pad * 2;
-        // Cap zoom-in so a short edge between two small nodes doesn't
-        // explode them to fullscreen.
-        const k = Math.max(0.1, Math.min(size.w / gW, size.h / gH, 1.2));
-        const cx = (minX + maxX) / 2;
-        const cy = (minY + maxY) / 2;
-        viewRef.current = {
-          k,
-          x: size.w / 2 - cx * k,
-          y: size.h / 2 - cy * k,
-        };
-        // Clear the edge hover state so the highlight + tooltip don't
-        // stick around after the view moves out from under the cursor.
-        hoveredEdgeRef.current = null;
-        setHoveredEdgeInfo(null);
-        setFocusedEdge(edge);
-        return;
-      }
+      focusOnEdge(edge);
+      return;
     }
     setFocusedEdge(null);
     onClearFocus?.();
@@ -1612,7 +1711,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // Touch gestures — wrap the click-target hit test so a tap at low
   // LOD selects the whole node card (where field text isn't drawn).
   const tapHitTest = (wx: number, wy: number): string | null => {
-    if (currentLodRef.current !== "full") return hitTestNode(wx, wy);
+    if (
+      currentLodRef.current !== "full" ||
+      viewRef.current.k < FIELD_CLICK_MIN_ZOOM
+    ) {
+      return hitTestNode(wx, wy);
+    }
     return hitTestFieldTarget(wx, wy) ?? hitTestNodeHeader(wx, wy);
   };
   const hitTestRef = useRef(tapHitTest);
@@ -2594,6 +2698,290 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     >
       <div ref={pixiContainerRef} style={{ width: size.w, height: size.h }} />
 
+      <div
+        className="pointer-events-auto absolute left-4 top-4 z-20 flex items-center gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-opacity duration-150 hover:opacity-100"
+        onMouseMove={(ev) => ev.stopPropagation()}
+        onClick={(ev) => ev.stopPropagation()}
+      >
+        <button
+          type="button"
+          onClick={() => setHidePrimitiveFields(!hidePrimitiveFields)}
+          className={cn(
+            "flex cursor-pointer items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors",
+            hidePrimitiveFields
+              ? "border-primary bg-primary/10 text-primary"
+              : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground",
+          )}
+        >
+          <Filter className="h-2.5 w-2.5" />
+          Hide primitives
+        </button>
+        <button
+          type="button"
+          onClick={() => setHideRelayBoilerplate(!hideRelayBoilerplate)}
+          className={cn(
+            "flex cursor-pointer items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors",
+            hideRelayBoilerplate
+              ? "border-primary bg-primary/10 text-primary"
+              : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground",
+          )}
+          title="Hide the Relay Node interface, PageInfo, and *Edge / *Connection types"
+        >
+          <Filter className="h-2.5 w-2.5" />
+          Hide Relay
+        </button>
+      </div>
+
+      {clickHistory.length > 0 && (
+        <div
+          className="pointer-events-auto absolute right-4 top-4 z-20 flex w-64 max-w-[40vw] flex-col rounded-lg border border-border bg-popover/95 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-opacity duration-150 hover:opacity-100"
+          // Swallow mouse moves so the canvas's hover hit-tests don't
+          // fire while the cursor is on the history panel. Click is
+          // swallowed too so the canvas's onClick doesn't treat a
+          // panel-button click as "click on empty space" and immediately
+          // clear the focus state our handler just set.
+          onMouseMove={(ev) => ev.stopPropagation()}
+          onClick={(ev) => ev.stopPropagation()}
+          onMouseEnter={() => {
+            hoveredFieldRef.current = null;
+            hoveredNodeRef.current = null;
+            if (hoveredEdgeRef.current !== null) {
+              hoveredEdgeRef.current = null;
+              setHoveredEdgeInfo(null);
+            }
+            if (hoveredNodeForTipRef.current !== null) {
+              hoveredNodeForTipRef.current = null;
+              setHoveredNodeTip(null);
+            }
+          }}
+        >
+          <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+            <History className="h-3 w-3 text-muted-foreground" />
+            <span className="flex-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+              Recent ({clickHistory.length})
+            </span>
+            <button
+              type="button"
+              onClick={() => setClickHistory([])}
+              className="rounded p-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
+              title="Clear history"
+            >
+              <Trash2 className="h-3 w-3" />
+            </button>
+            <button
+              type="button"
+              onClick={() => setHistoryOpen((v) => !v)}
+              className="rounded p-1 text-muted-foreground hover:bg-secondary hover:text-foreground"
+              title={historyOpen ? "Collapse" : "Expand"}
+            >
+              {historyOpen ? (
+                <ChevronUp className="h-3 w-3" />
+              ) : (
+                <ChevronDown className="h-3 w-3" />
+              )}
+            </button>
+          </div>
+          {historyOpen && (
+            <ul className="max-h-[60vh] overflow-auto py-1">
+              {clickHistory.map((item) => {
+                if (item.kind === "node") {
+                  const style = KIND_STYLES[item.nodeKind];
+                  return (
+                    <li key={`${item.id}:${item.ts}`} className="group flex items-center transition-colors hover:bg-secondary/60">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setFocusedEdge(null);
+                          onNavigate?.(item.nodeId);
+                        }}
+                        onMouseEnter={(ev) => {
+                          setHoveredHistoryItem(item);
+                          setHoveredHistoryPos({ x: ev.clientX, y: ev.clientY });
+                        }}
+                        onMouseMove={(ev) =>
+                          setHoveredHistoryPos({ x: ev.clientX, y: ev.clientY })
+                        }
+                        onMouseLeave={() => setHoveredHistoryItem(null)}
+                        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-3 py-1.5 text-left"
+                      >
+                        <span
+                          className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
+                          style={{ backgroundColor: KIND_COLORS[item.nodeKind] }}
+                        >
+                          {style.label}
+                        </span>
+                        <span className="truncate">{item.name}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          removeFromHistory(item.id);
+                        }}
+                        className="mr-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-foreground group-hover:opacity-100"
+                        title="Remove from history"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </li>
+                  );
+                }
+                const sourceKind = nodeById.get(item.sourceId)?.data.kind;
+                const targetKind = nodeById.get(item.targetId)?.data.kind;
+                return (
+                  <li key={`${item.id}:${item.ts}`} className="group flex items-center transition-colors hover:bg-secondary/60">
+                    <button
+                      type="button"
+                      onMouseEnter={(ev) => {
+                        setHoveredHistoryItem(item);
+                        setHoveredHistoryPos({ x: ev.clientX, y: ev.clientY });
+                      }}
+                      onMouseMove={(ev) =>
+                        setHoveredHistoryPos({ x: ev.clientX, y: ev.clientY })
+                      }
+                      onMouseLeave={() => setHoveredHistoryItem(null)}
+                      onClick={() => {
+                        // Re-locate the edge in the current layout
+                        // (the original LaidEdge reference may be
+                        // stale after a re-layout). Falls back to
+                        // navigating to the source type if not found.
+                        const live = laidEdges.find(
+                          (e) =>
+                            e.sourceId === item.sourceId &&
+                            e.targetId === item.targetId &&
+                            (e.label ?? "") === item.label &&
+                            e.kind === item.edgeKind,
+                        );
+                        if (live) focusOnEdge(live);
+                        else onNavigate?.(item.sourceId);
+                      }}
+                      className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 px-3 py-1.5 text-left"
+                    >
+                      {sourceKind && (
+                        <span
+                          className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
+                          style={{ backgroundColor: KIND_COLORS[sourceKind] }}
+                        >
+                          {KIND_STYLES[sourceKind].label}
+                        </span>
+                      )}
+                      <span className="min-w-0 flex-1 truncate">
+                        {(item.edgeKind === "field" || item.edgeKind === "arg") && item.label ? (
+                          <>
+                            {item.sourceId}
+                            <span className="text-muted-foreground">.</span>
+                            <span style={{ color: "#f59e0b" }}>{item.label}</span>
+                          </>
+                        ) : item.edgeKind === "implements" ? (
+                          <>
+                            <span className="text-muted-foreground italic">↳ </span>
+                            {item.targetId}
+                          </>
+                        ) : item.edgeKind === "union" ? (
+                          <>
+                            {item.sourceId}
+                            <span className="text-muted-foreground"> | </span>
+                            {item.targetId}
+                          </>
+                        ) : (
+                          item.label || `${item.sourceId} → ${item.targetId}`
+                        )}
+                      </span>
+                      <ArrowRight className="h-3 w-3 shrink-0 text-muted-foreground" />
+                      {targetKind && (
+                        <span
+                          className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
+                          style={{ backgroundColor: KIND_COLORS[targetKind] }}
+                        >
+                          {KIND_STYLES[targetKind].label}
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        removeFromHistory(item.id);
+                      }}
+                      className="mr-2 shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-foreground group-hover:opacity-100"
+                      title="Remove from history"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {hoveredHistoryItem && (() => {
+        const item = hoveredHistoryItem;
+        if (item.kind === "node") {
+          return (
+            <div
+              className="pointer-events-none fixed z-50 whitespace-nowrap rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur"
+              style={tooltipStyle(hoveredHistoryPos.x, hoveredHistoryPos.y)}
+            >
+              <div className="flex items-center gap-2">
+                <span
+                  className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
+                  style={{ backgroundColor: KIND_COLORS[item.nodeKind] }}
+                >
+                  {KIND_STYLES[item.nodeKind].label}
+                </span>
+                <span className="font-semibold">{item.name}</span>
+              </div>
+            </div>
+          );
+        }
+        const sourceKind = nodeById.get(item.sourceId)?.data.kind;
+        const targetKind = nodeById.get(item.targetId)?.data.kind;
+        return (
+          <div
+            className="pointer-events-none fixed z-50 whitespace-nowrap rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur"
+            style={tooltipStyle(hoveredHistoryPos.x, hoveredHistoryPos.y)}
+          >
+            <div className="flex items-center gap-2">
+              {sourceKind && (
+                <span
+                  className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
+                  style={{ backgroundColor: KIND_COLORS[sourceKind] }}
+                >
+                  {KIND_STYLES[sourceKind].label}
+                </span>
+              )}
+              {(item.edgeKind === "field" || item.edgeKind === "arg") && item.label ? (
+                <span>
+                  <span className="font-semibold">{item.sourceId}</span>
+                  <span className="text-muted-foreground">.</span>
+                  <span style={{ color: "#f59e0b" }}>{item.label}</span>
+                </span>
+              ) : (
+                <span className="font-semibold">{item.sourceId}</span>
+              )}
+              {item.edgeKind === "implements" && (
+                <span className="text-muted-foreground italic">implements</span>
+              )}
+              {item.edgeKind === "union" && (
+                <span className="text-muted-foreground">|</span>
+              )}
+              <ArrowRight className="h-3 w-3 text-muted-foreground" />
+              {targetKind && (
+                <span
+                  className="rounded px-1 py-0 text-[9px] uppercase tracking-wide text-white"
+                  style={{ backgroundColor: KIND_COLORS[targetKind] }}
+                >
+                  {KIND_STYLES[targetKind].label}
+                </span>
+              )}
+              <span className="font-semibold">{item.targetId}</span>
+            </div>
+          </div>
+        );
+      })()}
+
       {hoveredEdgeInfo && (() => {
         const sourceKind = nodeById.get(hoveredEdgeInfo.sourceId)?.data.kind;
         const targetKind = nodeById.get(hoveredEdgeInfo.targetId)?.data.kind;
@@ -2695,7 +3083,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         );
       })()}
 
-      {hoveredNodeTip && currentLodRef.current !== "full" && (
+      {hoveredNodeTip &&
+        (currentLodRef.current !== "full" ||
+          viewRef.current.k < FIELD_CLICK_MIN_ZOOM) && (
         <div
           className="pointer-events-none fixed z-50 flex items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-popover px-2 py-1 font-mono text-[11px] text-popover-foreground shadow-md"
           style={tooltipStyle(hoveredNodeScreen.x, hoveredNodeScreen.y)}
