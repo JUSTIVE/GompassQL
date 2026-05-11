@@ -16,11 +16,14 @@ export function reachableFrom(
     if (r !== rootId && nodes.some((n) => n.id === r)) excluded.add(r);
   }
 
-  // Forward adjacency (field / union / arg edges).
+  // Forward adjacency (field / union / arg / implements edges). Implements
+  // edges flow Interface → ConcreteType, so adj already surfaces every
+  // implementor when its interface is visited.
   const adj = new Map<string, string[]>();
-  // Reverse adjacency for implements: reaching an interface also surfaces
-  // its concrete implementors (edges are ConcreteType → Interface, so we
-  // need the reverse to discover implementors when the interface is visited).
+  // Reverse adjacency for implements: reaching a concrete type also
+  // surfaces the interface(s) it implements. Without this, a BFS rooted
+  // at (or arriving via) a concrete type would never traverse "up" to
+  // the interface — there's no forward edge in that direction.
   const implRev = new Map<string, string[]>();
 
   for (const e of edges) {

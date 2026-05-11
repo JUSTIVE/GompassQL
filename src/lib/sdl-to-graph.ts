@@ -346,10 +346,15 @@ export function sdlToGraph(sdl: string): ParsedGraph {
     }
     if (n.interfaces) {
       for (const i of n.interfaces) {
+        // Direction: Interface → ConcreteType. Reads as "this interface
+        // is implemented by these types". Makes dot place the interface
+        // as the rank parent and its implementors fan out to the right,
+        // visually emphasizing the interface as a hub. Reachability is
+        // preserved by the reverse-adjacency lookup in reachable.ts.
         rawEdges.push({
-          id: `${n.name}-impl-${i}`,
-          source: n.name,
-          target: i,
+          id: `${i}-impl-${n.name}`,
+          source: i,
+          target: n.name,
           label: "implements",
           kind: "implements",
         });

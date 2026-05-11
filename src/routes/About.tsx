@@ -83,7 +83,7 @@ const GRAPH_TECHNIQUES: TechItem[] = [
   {
     title: "BFS reachability with implements back-traversal",
     description:
-      "Reachable types are found via BFS over field/union/arg edges. implements edges are also traversed in reverse: reaching an interface automatically surfaces all its concrete implementors.",
+      "Reachable types are found via BFS over field/union/arg/implements edges. Implements edges flow Interface → ConcreteType, so visiting an interface surfaces its implementors directly; a reverse adjacency handles the case where a concrete type is visited first and needs to climb back to its interface.",
   },
   {
     title: "Relay Connection unwrapping",
