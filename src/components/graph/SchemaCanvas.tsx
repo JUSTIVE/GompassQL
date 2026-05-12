@@ -3105,16 +3105,23 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
       {isPending && (
         <div
-          className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-background/60 backdrop-blur-sm"
+          className="pointer-events-auto absolute inset-0 z-30 flex cursor-wait items-center justify-center bg-background/60 backdrop-blur-sm"
           role="status"
           aria-live="polite"
+          // Block all canvas interactions while a layout is in-flight
+          // so hover hit-tests / clicks don't fire against stale
+          // (mid-rebuild) positions.
+          onMouseMove={(ev) => ev.stopPropagation()}
+          onMouseDown={(ev) => ev.stopPropagation()}
+          onClick={(ev) => ev.stopPropagation()}
+          onWheel={(ev) => ev.stopPropagation()}
         >
           <div className="flex w-72 flex-col items-center gap-3 rounded-xl border border-border bg-card/90 px-6 py-5 shadow-lg">
             <Loader2 className="h-7 w-7 animate-spin text-primary" />
             <div className="text-sm font-medium">
               Laying out {nodes.length.toLocaleString()} types…
             </div>
-            {layoutProgress && layoutProgress.total > 1 ? (
+            {layoutProgress && layoutProgress.total > 0 ? (
               <>
                 <div className="h-1.5 w-full overflow-hidden rounded-full bg-secondary">
                   <div
