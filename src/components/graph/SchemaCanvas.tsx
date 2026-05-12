@@ -1,5 +1,5 @@
 import { Application, Container, Graphics, NineSliceSprite, Sprite, Texture, TilingSprite } from "pixi.js";
-import { ArrowRight, ChevronDown, ChevronUp, Filter, History, Loader2, Trash2, X } from "lucide-react";
+import { ArrowRight, ChevronDown, ChevronUp, Filter, History, Loader2, Microscope, Trash2, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { BezierSegment, LayoutResult } from "@/lib/layout";
 import {
@@ -390,10 +390,19 @@ function drawColoredType(
   typeStr: string,
   rightX: number,
   y: number,
+  /** Primitive (built-in scalar) types get a desaturated muted amber
+   *  to visually de-emphasize them against custom types that the
+   *  user typically cares more about. */
+  primitive: boolean = false,
+  /** Extra alpha multiplier — used to fade the type when the row is
+   *  deprecated, matching the fade applied to the field name. */
+  baseAlpha: number = 1,
 ) {
   const w = cachedTextWidth(ctx, typeStr);
-  ctx.fillStyle = "#f59e0b";
+  ctx.fillStyle = primitive ? "#b08c5a" : "#f59e0b";
+  ctx.globalAlpha = (primitive ? 0.7 : 1) * baseAlpha;
   ctx.fillText(typeStr, rightX - w, y);
+  ctx.globalAlpha = 1;
 }
 
 const RELAY_COLOR = "#F26A03";
@@ -458,6 +467,37 @@ function drawNodeSprite(
   ctx.lineTo(w, HEADER_H);
   ctx.stroke();
   ctx.globalAlpha = 1;
+
+  // Implements section background — a violet wash (matching the
+  // Interface kind color) over the bottom of the card so the
+  // `implements X` rows visually read as a separate sub-section
+  // distinct from the field list.
+  if (n.data.kind === "Object" || n.data.kind === "Interface") {
+    const interfaceCount = n.data.interfaces?.length ?? 0;
+    if (interfaceCount > 0) {
+      const fieldCount = n.data.fields?.length ?? 0;
+      const implTop = HEADER_H + TOP_BODY_PAD + fieldCount * ROW_H - 2;
+      // Clip to the rounded card shape so the violet doesn't spill
+      // past the bottom corner curves.
+      ctx.save();
+      roundRect(ctx, 0, 0, w, h, 6);
+      ctx.clip();
+      ctx.fillStyle = KIND_COLORS.Interface;
+      ctx.globalAlpha = 0.1;
+      ctx.fillRect(0, implTop, w, h - implTop);
+      ctx.globalAlpha = 1;
+      ctx.restore();
+      // Thin divider above the implements section.
+      ctx.strokeStyle = KIND_COLORS.Interface;
+      ctx.globalAlpha = 0.4;
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(0, implTop);
+      ctx.lineTo(w, implTop);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
 
   if (lod === "bar") {
     const avail = w - 16;
@@ -524,40 +564,52 @@ function drawNodeSprite(
     for (let i = 0; i < fields.length; i++) {
       const f = fields[i]!;
       const fy = bodyY + i * ROW_H + 10;
+      const depAlpha = f.isDeprecated ? 0.4 : 1;
       ctx.fillStyle = fgColor;
-      ctx.globalAlpha = f.isDeprecated ? 0.4 : 1;
+      ctx.globalAlpha = depAlpha;
       ctx.fillText(f.name, 10, fy);
       if (f.isDeprecated) {
         const nameW = ctx.measureText(f.name).width;
+        const typeW = cachedTextWidth(ctx, f.type);
         ctx.strokeStyle = fgColor;
         ctx.lineWidth = 0.75;
         ctx.beginPath();
+        // Strikethrough name and type so the entire row reads as
+        // deprecated, not just the field name.
         ctx.moveTo(10, fy - 3.5);
         ctx.lineTo(10 + nameW, fy - 3.5);
+        ctx.moveTo(w - 10 - typeW, fy - 3.5);
+        ctx.lineTo(w - 10, fy - 3.5);
         ctx.stroke();
       }
       ctx.globalAlpha = 1;
       if (f.isRelayConnection) {
         const typeW = ctx.measureText(f.type).width;
         const iconCx = w - 10 - typeW - 8;
+        ctx.globalAlpha = depAlpha;
         drawRelayIcon(ctx, iconCx, fy - 2);
+        ctx.globalAlpha = 1;
         ctx.font = `10px ${MONO}`;
       }
-      drawColoredType(ctx, f.type, w - 10, fy);
+      drawColoredType(ctx, f.type, w - 10, fy, BUILTIN_SCALARS.has(f.typeName), depAlpha);
     }
     const interfaces = n.data.interfaces ?? [];
     if (interfaces.length > 0) {
       const ifaceColor = KIND_COLORS.Interface;
+      // Vertically center the implements list inside the violet
+      // section so a single interface name doesn't hug the divider.
+      // The "implements" / "&" prefix is dropped — the violet
+      // background already communicates that these are
+      // implementations.
+      const sectionTop = bodyY + fields.length * ROW_H + 2;
+      const sectionH = h - sectionTop;
+      const blockH = interfaces.length * ROW_H;
+      const centerOffset = Math.max(0, Math.floor((sectionH - blockH) / 2));
+      ctx.font = `600 10px ${MONO}`;
+      ctx.fillStyle = ifaceColor;
       for (let i = 0; i < interfaces.length; i++) {
-        const fy = bodyY + (fields.length + i) * ROW_H + 10;
-        const prefix = i === 0 ? "implements " : "& ";
-        ctx.font = `10px ${MONO}`;
-        ctx.fillStyle = mutedFg;
-        ctx.fillText(prefix, 10, fy);
-        const prefixW = ctx.measureText(prefix).width;
-        ctx.font = `600 10px ${MONO}`;
-        ctx.fillStyle = ifaceColor;
-        ctx.fillText(fitText(ctx, interfaces[i]!, w - 10 - (10 + prefixW)), 10 + prefixW, fy);
+        const fy = sectionTop + centerOffset + i * ROW_H + 10;
+        ctx.fillText(fitText(ctx, interfaces[i]!, w - 20), 10, fy);
       }
     }
   }
@@ -835,6 +887,37 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   const [historyOpen, setHistoryOpen] = useState(true);
   const [hoveredHistoryItem, setHoveredHistoryItem] = useState<HistoryItem | null>(null);
   const [hoveredHistoryPos, setHoveredHistoryPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+
+  // Investigate mode — when active, only items matching the
+  // predicate render at full opacity in orange; everything else
+  // fades to a muted gray. Designed to be extended with more checks
+  // (e.g. unused types, deprecation, complexity) — `description`
+  // is the first one and highlights nodes whose own description or
+  // any of whose fields/values lack a description.
+  type InvestigateMode = "off" | "description";
+  const [investigateMode, setInvestigateMode] = useState<InvestigateMode>("off");
+
+  // Description coverage % across every documentable item — nodes,
+  // their fields, and enum values. Shown next to the "Missing
+  // descriptions" toggle so the user knows at a glance how well the
+  // schema is documented.
+  const descriptionCoverage = useMemo(() => {
+    let total = 0;
+    let documented = 0;
+    for (const n of nodes) {
+      total += 1;
+      if (n.description?.trim()) documented += 1;
+      for (const f of n.fields ?? []) {
+        total += 1;
+        if (f.description?.trim()) documented += 1;
+      }
+      for (const v of n.values ?? []) {
+        total += 1;
+        if (v.description?.trim()) documented += 1;
+      }
+    }
+    return total === 0 ? 1 : documented / total;
+  }, [nodes]);
   const pushHistory = (item: HistoryItem) => {
     setClickHistory((prev) => {
       // De-dupe by id against the most-recent entry so spamming the
@@ -926,6 +1009,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     arrowTileContainer: Container | null;
     hoverEdgeGraphics: Graphics | null;
     nodeContainer: Container | null;
+    investigateOverlay: Graphics | null;
     hoverGraphics: Graphics | null;
     focusGraphics: Graphics | null;
   }>({
@@ -935,6 +1019,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     arrowTileContainer: null,
     hoverEdgeGraphics: null,
     nodeContainer: null,
+    investigateOverlay: null,
     hoverGraphics: null,
     focusGraphics: null,
   });
@@ -1035,7 +1120,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     if (!orch) return;
     const layoutNodes = nodes.map((n) => {
       const interfaceRows: [string, string][] = (n.interfaces ?? []).map(
-        (iface, idx) => [(idx === 0 ? "implements " : "& ") + iface, ""],
+        (iface): [string, string] => [iface, ""],
       );
       const bodyRows: [string, string][] =
         n.kind === "Enum"
@@ -1195,6 +1280,55 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     return out;
   }, [edges, layoutResult, nodeById]);
 
+  /**
+   * Investigate-mode predicate evaluation. Returns three sets:
+   *   - nodeIds: nodes that match in any way (kept at full opacity)
+   *   - nodeOutline: nodes whose OWN description is missing (gets a
+   *     full-node orange outline)
+   *   - rowsByNode: per-node set of row indices whose specific
+   *     field/value description is missing (gets a thin orange row
+   *     stripe so the user can see exactly which rows are missing)
+   * Memoized on the raw node list because the predicate doesn't
+   * depend on layout, only on schema content.
+   */
+  const investigateMatch = useMemo<
+    | {
+        nodeIds: Set<string>;
+        nodeOutline: Set<string>;
+        rowsByNode: Map<string, Set<number>>;
+      }
+    | null
+  >(() => {
+    if (investigateMode === "off") return null;
+    const nodeIds = new Set<string>();
+    const nodeOutline = new Set<string>();
+    const rowsByNode = new Map<string, Set<number>>();
+    if (investigateMode === "description") {
+      for (const n of nodes) {
+        let matched = false;
+        if (!n.description?.trim()) {
+          nodeOutline.add(n.id);
+          matched = true;
+        }
+        const rows = new Set<number>();
+        const fields = n.fields ?? [];
+        for (let i = 0; i < fields.length; i++) {
+          if (!fields[i]!.description?.trim()) rows.add(i);
+        }
+        const values = n.values ?? [];
+        for (let i = 0; i < values.length; i++) {
+          if (!values[i]!.description?.trim()) rows.add(i);
+        }
+        if (rows.size > 0) {
+          rowsByNode.set(n.id, rows);
+          matched = true;
+        }
+        if (matched) nodeIds.add(n.id);
+      }
+    }
+    return { nodeIds, nodeOutline, rowsByNode };
+  }, [investigateMode, nodes]);
+
   const edgeGroups = useMemo((): EdgeGroups => {
     // Each bucket: [edges, hex string, hex int, alphaScale]. Groups
     // that were previously dashed get a reduced alphaScale (~0.55) so
@@ -1253,8 +1387,24 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       };
     });
 
+    // Investigate mode overrides the active/dim partition for edges
+    // — we don't highlight edges at all, so every edge moves into
+    // the dim list. Node dimming stacks with any focus state so
+    // non-matched nodes also fade out.
+    if (investigateMatch) {
+      for (const g of groups) {
+        if (g.active.length > 0) {
+          g.dim = g.dim.length === 0 ? g.active : g.dim.concat(g.active);
+          g.active = [];
+        }
+      }
+      for (const n of laidNodes) {
+        if (!investigateMatch.nodeIds.has(n.id)) dimNodeIds.add(n.id);
+      }
+    }
+
     return { groups, dimNodeIds };
-  }, [laidEdges, laidNodes, focusId, rootId, focusedEdge]);
+  }, [laidEdges, laidNodes, focusId, rootId, focusedEdge, investigateMatch]);
 
   // The focused-edge reference becomes stale when laidEdges rebuilds
   // (new layout / schema change). Clear it so the dim state doesn't
@@ -1894,6 +2044,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const hoverEdgeGraphics = new Graphics();
       const nodeContainer = new Container();
       nodeContainer.cullable = true;
+      const investigateOverlay = new Graphics();
       const hoverGraphics = new Graphics();
       const focusGraphics = new Graphics();
 
@@ -1904,6 +2055,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       // emphasized line reads cleanly without spilling onto nodes.
       world.addChild(hoverEdgeGraphics);
       world.addChild(nodeContainer);
+      // Investigate overlay sits above nodes so its orange outlines
+      // pop over the (possibly dimmed) cards.
+      world.addChild(investigateOverlay);
       world.addChild(hoverGraphics);
       world.addChild(focusGraphics);
 
@@ -1919,6 +2073,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         arrowTileContainer,
         hoverEdgeGraphics,
         nodeContainer,
+        investigateOverlay,
         hoverGraphics,
         focusGraphics,
       };
@@ -1976,7 +2131,29 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               const nodeLeft = n.cx - n.w / 2;
               const nodeTop = n.cy - n.h / 2;
               const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
-              const hy = nodeTop + bodyTop + hoveredField.fieldIndex * ROW_H;
+              const fields = n.data.fields ?? [];
+              const interfaces = n.data.interfaces ?? [];
+              let hy: number;
+              if (
+                hoveredField.fieldIndex >= fields.length &&
+                interfaces.length > 0
+              ) {
+                // Hovered row lives in the implements section, which
+                // is vertically centered inside its violet band —
+                // mirror the same offset used by drawNodeSprite so
+                // the highlight tracks the rendered text.
+                const ifaceIdx = hoveredField.fieldIndex - fields.length;
+                const sectionTop = bodyTop + fields.length * ROW_H + 2;
+                const sectionH = n.h - sectionTop;
+                const blockH = interfaces.length * ROW_H;
+                const centerOffset = Math.max(
+                  0,
+                  Math.floor((sectionH - blockH) / 2),
+                );
+                hy = nodeTop + sectionTop + centerOffset + ifaceIdx * ROW_H;
+              } else {
+                hy = nodeTop + bodyTop + hoveredField.fieldIndex * ROW_H;
+              }
               const hpad = 4;
               scene.hoverGraphics.roundRect(nodeLeft + hpad, hy, n.w - hpad * 2, ROW_H, 3);
               scene.hoverGraphics.fill({ color: fgHex, alpha: 0.07 });
@@ -2466,6 +2643,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         arrowTileContainer: null,
         hoverEdgeGraphics: null,
         nodeContainer: null,
+        investigateOverlay: null,
         hoverGraphics: null,
         focusGraphics: null,
       };
@@ -2645,6 +2823,50 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     }
   }, [edgeGroups]);
 
+  // Redraw the investigate-mode overlay whenever the match set or
+  // node layout changes. Two layers of highlight:
+  //   1. Per-row orange fill on each field/value whose description
+  //      is missing (so the user can spot specific rows).
+  //   2. Outline around the whole node when its own description
+  //      (not just rows) is missing.
+  useEffect(() => {
+    const g = sceneRef.current.investigateOverlay;
+    if (!g) return;
+    g.clear();
+    if (!investigateMatch) return;
+
+    // Row stripes first (drawn underneath the outline if both apply
+    // to the same node).
+    const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
+    for (const n of laidNodes) {
+      const rows = investigateMatch.rowsByNode.get(n.id);
+      if (!rows) continue;
+      const left = n.cx - n.w / 2 + 4;
+      const top = n.cy - n.h / 2;
+      const width = n.w - 8;
+      for (const rowIdx of rows) {
+        const y = top + bodyTop + rowIdx * ROW_H;
+        g.roundRect(left, y, width, ROW_H, 3);
+      }
+    }
+    g.fill({ color: 0xf97316, alpha: 0.22 });
+
+    // Outline pass on top.
+    g.beginPath();
+    const PAD = 4;
+    for (const n of laidNodes) {
+      if (!investigateMatch.nodeOutline.has(n.id)) continue;
+      g.roundRect(
+        n.cx - n.w / 2 - PAD,
+        n.cy - n.h / 2 - PAD,
+        n.w + PAD * 2,
+        n.h + PAD * 2,
+        8,
+      );
+    }
+    g.stroke({ width: 3, color: 0xf97316, alpha: 0.95 });
+  }, [investigateMatch, laidNodes]);
+
   // Redraw the hovered-edge highlight whenever the hovered edge
   // changes. The edge geometry itself lives on `hoveredEdgeRef`; the
   // state mirror just serves as a render trigger.
@@ -2730,6 +2952,49 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           <Filter className="h-2.5 w-2.5" />
           Hide Relay
         </button>
+      </div>
+
+      <div
+        className="pointer-events-auto absolute left-4 top-14 z-20 flex flex-col gap-1.5 rounded-lg border border-border bg-popover/95 px-2 py-1.5 font-mono text-xs text-popover-foreground opacity-40 shadow-lg backdrop-blur transition-opacity duration-150 hover:opacity-100"
+        onMouseMove={(ev) => ev.stopPropagation()}
+        onClick={(ev) => ev.stopPropagation()}
+      >
+        <div className="flex items-center gap-1.5">
+          <Microscope className="h-3 w-3 shrink-0 text-muted-foreground" />
+          <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            Investigate
+          </span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() =>
+              setInvestigateMode((m) => (m === "description" ? "off" : "description"))
+            }
+            className={cn(
+              "flex cursor-pointer items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors",
+              investigateMode === "description"
+                ? "border-orange-500 bg-orange-500/10 text-orange-500"
+                : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground",
+            )}
+            title="Highlight nodes whose descriptions are missing"
+          >
+            Missing descriptions
+          </button>
+          <span
+            className={cn(
+              "rounded-full px-1.5 py-0.5 text-[10px] tabular-nums",
+              descriptionCoverage >= 0.9
+                ? "bg-emerald-500/10 text-emerald-500"
+                : descriptionCoverage >= 0.5
+                  ? "bg-amber-500/10 text-amber-500"
+                  : "bg-rose-500/10 text-rose-500",
+            )}
+            title={`${(descriptionCoverage * 100).toFixed(1)}% of documentable items have a description`}
+          >
+            {Math.round(descriptionCoverage * 100)}%
+          </span>
+        </div>
       </div>
 
       {clickHistory.length > 0 && (
