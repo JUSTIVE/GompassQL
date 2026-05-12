@@ -4,6 +4,7 @@ import {
   ChevronDown,
   ChevronRight,
   History,
+  Link2,
   Sparkles,
   Trash2,
   TriangleAlert,
@@ -14,6 +15,13 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { SdlEditor } from "@/components/SdlEditor";
 import { Button } from "@/components/ui/button";
+import {
+  deleteFileHandle,
+  getFileHandle,
+  isFileSystemAccessSupported,
+  readLinkedFile,
+  saveFileHandle,
+} from "@/lib/file-handles";
 import { SAMPLE_SDL } from "@/lib/sample-sdl";
 import { useSchema } from "@/lib/schema-context";
 import { sdlToGraph } from "@/lib/sdl-to-graph";
@@ -21,6 +29,7 @@ import {
   addOrUpdateEntry,
   clearHistory,
   formatTimestamp,
+  hashSdl,
   type HistoryEntry,
   loadHistory,
   removeEntry,
@@ -50,6 +59,18 @@ export function LandingRoute() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  // Linked-file state — set when the current SDL was loaded via the
+  // File System Access API. Kept across edits so the Visualize step
+  // knows to refetch the latest disk content before navigating.
+  const [linkedFile, setLinkedFile] = useState<{
+    name: string;
+    handle: FileSystemFileHandle;
+    /** Hash of the SDL that was last read from this handle — lets
+     *  us decide whether the file changed on disk since the last
+     *  load and keep the history entry's hash in sync. */
+    lastHash: string;
+  } | null>(null);
+  const fsaSupported = isFileSystemAccessSupported();
 
   useEffect(() => {
     setHistory(loadHistory());
@@ -95,8 +116,54 @@ export function LandingRoute() {
       setDerivedName(nameFromFile(file));
       setError(null);
       setWarnings([]);
+      // One-shot upload — disconnect any prior link.
+      setLinkedFile(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to read file.");
+    }
+  };
+
+  /**
+   * Pick a file via the File System Access API and remember the
+   * handle so we can re-read the same file later. Falls back to a
+   * one-shot read on browsers without the API (Firefox/Safari).
+   */
+  const pickLinkedFile = async () => {
+    if (!fsaSupported) {
+      fileInputRef.current?.click();
+      return;
+    }
+    try {
+      const picker = (window as unknown as {
+        showOpenFilePicker: (opts?: {
+          types?: { description: string; accept: Record<string, string[]> }[];
+          multiple?: boolean;
+        }) => Promise<FileSystemFileHandle[]>;
+      }).showOpenFilePicker;
+      const picked = await picker({
+        multiple: false,
+        types: [
+          {
+            description: "GraphQL SDL",
+            accept: {
+              "text/plain": [".graphql", ".graphqls", ".gql", ".sdl", ".txt"],
+            },
+          },
+        ],
+      });
+      const handle = picked[0];
+      if (!handle) return;
+      const file = await handle.getFile();
+      const text = await file.text();
+      setSdl(text);
+      setDerivedName(handle.name.replace(SDL_EXT_RE, "") || handle.name);
+      setError(null);
+      setWarnings([]);
+      setLinkedFile({ name: handle.name, handle, lastHash: hashSdl(text) });
+    } catch (e) {
+      // User cancelled (AbortError) is silent; otherwise surface.
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      setError(e instanceof Error ? e.message : "Failed to open file.");
     }
   };
 
@@ -158,7 +225,44 @@ export function LandingRoute() {
     return { sdl: trimmed, name: derivedName ?? defaultName() };
   };
 
-  const visualize = () => {
+  const visualize = async () => {
+    // For linked schemas, refetch the on-disk content first so the
+    // visualization reflects the latest version even when the
+    // editor still shows a stale snapshot. Skipped silently when the
+    // user has declined permission or the handle is invalid.
+    if (linkedFile) {
+      const fresh = await readLinkedFile(linkedFile.handle);
+      if (fresh !== null && fresh !== sdl) {
+        setSdl(fresh);
+      }
+      const finalSdl = fresh ?? sdl;
+      const trimmed = finalSdl.trim();
+      if (!trimmed) {
+        setError("Linked file is empty.");
+        return;
+      }
+      const graph = sdlToGraph(trimmed);
+      if (graph.error) {
+        setError(graph.error);
+        return;
+      }
+      const name = derivedName ?? defaultName();
+      const fileName = linkedFile.name;
+      const newHash = hashSdl(trimmed);
+      setSchema({ sdl: trimmed, name });
+      setHistory((h) => addOrUpdateEntry(h, trimmed, name, fileName));
+      // Save the handle keyed by the new hash so a future revisit of
+      // this entry refetches the same file.
+      await saveFileHandle(newHash, linkedFile.handle);
+      // If the on-disk content drifted from the previous hash, clean
+      // up the old IndexedDB row.
+      if (newHash !== linkedFile.lastHash) {
+        await deleteFileHandle(linkedFile.lastHash);
+      }
+      setLinkedFile({ ...linkedFile, lastHash: newHash });
+      navigate({ to: "/view" });
+      return;
+    }
     const v = validate();
     if (!v) return;
     setSchema({ sdl: v.sdl, name: v.name });
@@ -166,15 +270,48 @@ export function LandingRoute() {
     navigate({ to: "/view" });
   };
 
-  const loadFromHistory = (entry: HistoryEntry) => {
+  const loadFromHistory = async (entry: HistoryEntry) => {
+    // If the entry is linked to a file handle, re-request permission
+    // and refetch the latest content. Fall back to the cached SDL
+    // when the user declines or the file is gone.
+    if (entry.linkedFile) {
+      const handle = await getFileHandle(entry.hash);
+      if (handle) {
+        const fresh = await readLinkedFile(handle);
+        if (fresh !== null) {
+          setSdl(fresh);
+          setDerivedName(entry.name);
+          setError(null);
+          setWarnings([]);
+          setLinkedFile({
+            name: entry.linkedFile,
+            handle,
+            lastHash: entry.hash,
+          });
+          return;
+        }
+      }
+      // Permission denied or handle vanished — surface a soft notice
+      // and fall through to loading the cached SDL.
+      setError(
+        `Couldn't re-read linked file "${entry.linkedFile}" — showing the last cached copy. Re-link to refresh.`,
+      );
+    } else {
+      setLinkedFile(null);
+    }
     setSdl(entry.sdl);
     setDerivedName(entry.name);
-    setError(null);
+    if (!entry.linkedFile) {
+      setError(null);
+    }
     setWarnings([]);
   };
 
   const deleteHistoryEntry = (hash: string) => {
     setHistory((h) => removeEntry(h, hash));
+    // Also drop any IndexedDB handle keyed by the same hash so we
+    // don't leak file handles forever.
+    void deleteFileHandle(hash);
   };
 
   const resetHistory = () => {
@@ -217,6 +354,19 @@ export function LandingRoute() {
           <Upload className="h-3.5 w-3.5" />
           Open file
         </Button>
+        {fsaSupported && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="gap-1"
+            onClick={() => void pickLinkedFile()}
+            title="Link a file — Visualize re-reads the latest disk content each time"
+          >
+            <Link2 className="h-3.5 w-3.5" />
+            Link file
+          </Button>
+        )}
         <Button
           type="button"
           variant="outline"
@@ -232,7 +382,12 @@ export function LandingRoute() {
           Load sample
         </Button>
         {derivedName && (
-          <span className="ml-1 truncate text-xs text-muted-foreground">
+          <span className="ml-1 flex items-center gap-1 truncate text-xs text-muted-foreground">
+            {linkedFile && (
+              <Link2
+                className="h-3 w-3 shrink-0 text-primary"
+              />
+            )}
             {derivedName}
           </span>
         )}
@@ -278,11 +433,16 @@ export function LandingRoute() {
                 >
                   <button
                     type="button"
-                    onClick={() => loadFromHistory(entry)}
+                    onClick={() => void loadFromHistory(entry)}
                     className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left"
                   >
-                    <span className="w-full truncate text-sm font-medium">
-                      {entry.name}
+                    <span className="flex w-full items-center gap-1 truncate text-sm font-medium">
+                      {entry.linkedFile && (
+                        <Link2
+                          className="h-3 w-3 shrink-0 text-primary"
+                        />
+                      )}
+                      <span className="truncate">{entry.name}</span>
                     </span>
                     <span className="text-[11px] text-muted-foreground">
                       {entry.updatedAt !== entry.createdAt ? "updated " : "added "}

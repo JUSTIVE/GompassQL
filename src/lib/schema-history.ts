@@ -2,6 +2,13 @@ export interface HistoryEntry {
   hash: string;
   sdl: string;
   name: string;
+  /** Set when the schema was linked to a local file via the File
+   *  System Access API. Stores the original file name for display;
+   *  the actual `FileSystemFileHandle` lives in IndexedDB keyed by
+   *  `hash` (see `lib/file-handles.ts`). When present we re-read
+   *  the file content on revisit so the canvas tracks the latest
+   *  on-disk version. */
+  linkedFile?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -53,14 +60,28 @@ export function addOrUpdateEntry(
   entries: HistoryEntry[],
   sdl: string,
   name: string,
+  linkedFile?: string,
 ): HistoryEntry[] {
   const hash = hashSdl(sdl);
   const now = Date.now();
   const existing = entries.find((e) => e.hash === hash);
   const rest = entries.filter((e) => e.hash !== hash);
   const next: HistoryEntry = existing
-    ? { ...existing, name, sdl, updatedAt: now }
-    : { hash, sdl, name, createdAt: now, updatedAt: now };
+    ? {
+        ...existing,
+        name,
+        sdl,
+        updatedAt: now,
+        ...(linkedFile !== undefined ? { linkedFile } : {}),
+      }
+    : {
+        hash,
+        sdl,
+        name,
+        createdAt: now,
+        updatedAt: now,
+        ...(linkedFile !== undefined ? { linkedFile } : {}),
+      };
   const merged = [next, ...rest].slice(0, MAX_ENTRIES);
   save(merged);
   return merged;
