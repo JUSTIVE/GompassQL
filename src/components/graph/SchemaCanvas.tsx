@@ -2563,9 +2563,21 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
             Math.abs(v.k - prev.k) / Math.max(0.0001, prev.k) > 0.05 ||
             lod !== prev.lod;
 
-          if (viewMoved) {
-            lastSpriteSweepViewRef.current = { x: v.x, y: v.y, k: v.k, lod };
-            lastViewChangeAtRef.current = performance.now();
+          // The sweep iterates while the view actually moved OR while a
+          // focus-jump is still draining its create/build queues. The
+          // second clause is the long-distance navigation fix: on
+          // frame 1 of a focus pan the sweep discovers in-view nodes
+          // with no sprite yet and pushes them to the create queue.
+          // On frame 2+ the create queue produces sprites with
+          // placeholder textures. Without re-entering the sweep,
+          // those sprites would never be queued for full-LOD texture
+          // build, so they'd stay on the kind placeholder forever.
+          if (viewMoved || focusJumpPendingRef.current) {
+            if (viewMoved) {
+              lastSpriteSweepViewRef.current = { x: v.x, y: v.y, k: v.k, lod };
+              lastViewChangeAtRef.current = performance.now();
+            }
+            ticksSweptRef.current++;
 
             const vpMinX = -v.x / v.k - SPRITE_VIEW_PADDING;
             const vpMinY = -v.y / v.k - SPRITE_VIEW_PADDING;
@@ -2663,6 +2675,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   // Synchronous build for focused endpoints — bypasses
                   // the motion-settle gate and the build queue so the
                   // selection feels immediate.
+                  syncBuildCountRef.current++;
                   const pw = Math.ceil(node.w * effDpr);
                   const ph = Math.ceil(node.h * effDpr);
                   const can = document.createElement("canvas");
@@ -2793,14 +2806,26 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               textureCacheRef.current.delete(key);
             }
             spriteBuildQueueRef.current = null;
-            focusJumpPendingRef.current = false;
+            // Only clear the focus-jump flag once sprite *creation*
+            // is also done — long-distance jumps queue tens of new
+            // sprites that take several frames to materialize, and
+            // each must re-enter the sweep to get its full-LOD
+            // texture queued. Clearing the flag too early would lock
+            // the late arrivals on their placeholder textures.
+            const createPending =
+              !!spriteCreateQueueRef.current &&
+              spriteCreateQueueRef.current.length > 0;
+            if (!createPending) focusJumpPendingRef.current = false;
           }
         } else if (!buildQ && focusJumpPendingRef.current) {
-          // Nothing to drain (e.g. focus pan put no new sprites into
-          // the queue because every in-view sprite already had a
-          // cached full-LOD texture). Clear the flag so we don't
-          // bypass motion-settle on the next pan/zoom.
-          focusJumpPendingRef.current = false;
+          // Nothing currently queued for build. Clear the flag only
+          // when sprite creation is also idle; otherwise the sprites
+          // still being created on subsequent frames will need to
+          // re-enter the sweep to queue their textures.
+          const createPending =
+            !!spriteCreateQueueRef.current &&
+            spriteCreateQueueRef.current.length > 0;
+          if (!createPending) focusJumpPendingRef.current = false;
         }
 
         // FPS sampling
@@ -2884,6 +2909,59 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // empty), so state updates need this ref to be seen.
   const laidNodesRef = useRef(laidNodes);
   laidNodesRef.current = laidNodes;
+
+  // Diagnostic counters for the e2e test.
+  const spriteResetCountRef = useRef(0);
+  const ticksSweptRef = useRef(0);
+  const syncBuildCountRef = useRef(0);
+
+  // Debug introspection hook — lets the Playwright e2e test verify
+  // post-navigation LOD/texture state without screen-scraping pixels.
+  // Read-only; no production code path consumes it.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const w = window as unknown as { __gqlCanvas?: unknown };
+    w.__gqlCanvas = {
+      getLod: () => currentLodRef.current,
+      getView: () => ({ ...viewRef.current }),
+      getTextureKeys: () => [...textureCacheRef.current.keys()],
+      getSpriteIds: () => [...nodeSpritesRef.current.keys()],
+      getLaidNodeCount: () => laidNodesRef.current.length,
+      getFocusId: () => focusIdRef.current,
+      isFocusJumpPending: () => focusJumpPendingRef.current,
+      getSpriteResetCount: () => spriteResetCountRef.current,
+      getTicksSwept: () => ticksSweptRef.current,
+      getSyncBuildCount: () => syncBuildCountRef.current,
+      /** Test-only: drive a navigation through the same code path
+       *  that a canvas return-type click or a tree-panel field
+       *  click uses. */
+      navigate: (id: string) => onNavigateRef.current?.(id),
+      getInViewNodeIds: () => {
+        const v = viewRef.current;
+        const sw = size.w;
+        const sh = size.h;
+        const vpMinX = -v.x / v.k - SPRITE_VIEW_PADDING;
+        const vpMinY = -v.y / v.k - SPRITE_VIEW_PADDING;
+        const vpMaxX = (sw - v.x) / v.k + SPRITE_VIEW_PADDING;
+        const vpMaxY = (sh - v.y) / v.k + SPRITE_VIEW_PADDING;
+        return laidNodesRef.current
+          .filter(
+            (n) =>
+              !(
+                n.cx + n.w / 2 < vpMinX ||
+                n.cx - n.w / 2 > vpMaxX ||
+                n.cy + n.h / 2 < vpMinY ||
+                n.cy - n.h / 2 > vpMaxY
+              ),
+          )
+          .map((n) => n.id);
+      },
+    };
+    return () => {
+      const w2 = window as unknown as { __gqlCanvas?: unknown };
+      w2.__gqlCanvas = undefined;
+    };
+  }, [size.w, size.h]);
 
   // Resize Pixi renderer
   useEffect(() => {
@@ -3020,6 +3098,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     spriteLastSeenFrameRef.current.clear();
     spriteBuildQueueRef.current = null;
     spriteCreateQueueRef.current = null;
+    spriteResetCountRef.current++;
   }, [laidNodes, themeResolved]);
 
   // Dim/undim node sprites when focus changes — lightweight alpha-only
