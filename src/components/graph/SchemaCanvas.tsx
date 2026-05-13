@@ -15,6 +15,7 @@ import { tooltipStyle } from "@/lib/tooltip-pos";
 import { cn } from "@/lib/utils";
 import {
   HEADER_H,
+  IMPL_SECTION_GAP,
   KIND_COLORS,
   KIND_STYLES,
   NODE_NAME_FONT,
@@ -22,6 +23,8 @@ import {
   TOP_BODY_PAD,
   estimateNodeHeight,
   estimateNodeWidth,
+  headerHFor,
+  rowHFor,
 } from "./node-style";
 
 /**
@@ -45,6 +48,15 @@ interface LaidNode {
   cy: number;
   w: number;
   h: number;
+  /** Per-node row height. Equals the base ROW_H when the
+   *  "Show descriptions" toggle is off, or ROW_H_WITH_DESC when on
+   *  so each field row reserves space for an inline description
+   *  line beneath its name. */
+  rowH: number;
+  /** Per-node header height. Equals HEADER_H by default, or
+   *  HEADER_H_WITH_DESC when "Show descriptions" is on so the
+   *  type's own description fits below the type name. */
+  headerH: number;
 }
 
 interface Point {
@@ -429,6 +441,9 @@ function drawNodeSprite(
 ) {
   const w = n.w;
   const h = n.h;
+  const rowH = n.rowH;
+  const headerH = n.headerH;
+  const showDesc = rowH !== ROW_H;
   const color = KIND_COLORS[n.data.kind];
 
   if (lod === "chrome") {
@@ -447,7 +462,7 @@ function drawNodeSprite(
   ctx.stroke();
   ctx.globalAlpha = 1;
 
-  roundRectTopOnly(ctx, 0, 0, w, HEADER_H, 6);
+  roundRectTopOnly(ctx, 0, 0, w, headerH, 6);
   ctx.fillStyle = color;
   ctx.fill();
 
@@ -455,8 +470,8 @@ function drawNodeSprite(
   ctx.globalAlpha = 0.4;
   ctx.lineWidth = 0.75;
   ctx.beginPath();
-  ctx.moveTo(0, HEADER_H);
-  ctx.lineTo(w, HEADER_H);
+  ctx.moveTo(0, headerH);
+  ctx.lineTo(w, headerH);
   ctx.stroke();
   ctx.globalAlpha = 1;
 
@@ -468,7 +483,12 @@ function drawNodeSprite(
     const interfaceCount = n.data.interfaces?.length ?? 0;
     if (interfaceCount > 0) {
       const fieldCount = n.data.fields?.length ?? 0;
-      const implTop = HEADER_H + TOP_BODY_PAD + fieldCount * ROW_H - 2;
+      // Add a gap between the last field and the implements section
+      // when the node has both — mirrors the extra height baked in
+      // by `estimateNodeHeight`. With no fields, the violet section
+      // starts right after the header (no gap to insert).
+      const implGap = fieldCount > 0 ? IMPL_SECTION_GAP : 0;
+      const implTop = headerH + TOP_BODY_PAD + fieldCount * rowH - 2 + implGap;
       // Clip to the rounded card shape so the violet doesn't spill
       // past the bottom corner curves.
       ctx.save();
@@ -500,10 +520,10 @@ function drawNodeSprite(
     ctx.fill();
     ctx.globalAlpha = 1;
 
-    const bodyY = HEADER_H + TOP_BODY_PAD - 2;
+    const bodyY = headerH + TOP_BODY_PAD - 2;
     const rowCount = bodyRowCount(n);
     for (let i = 0; i < rowCount; i++) {
-      const fy = bodyY + i * ROW_H + 3;
+      const fy = bodyY + i * rowH + 3;
       const ff = BAR_FIELD_FRACS[i % BAR_FIELD_FRACS.length]!;
       const tf = BAR_TYPE_FRACS[i % BAR_TYPE_FRACS.length]!;
       const typeBarW = avail * tf;
@@ -531,20 +551,51 @@ function drawNodeSprite(
   ctx.fillStyle = "#ffffff";
   ctx.fillText(fitText(ctx, n.data.name, w - 16), 8, 30);
 
-  const bodyY = HEADER_H + TOP_BODY_PAD - 2;
+  // Type-level description rendered in the header when the toggle is
+  // on. One regular line, white-on-color-header, left-aligned with
+  // the type name above it, truncated to fit.
+  if (showDesc && n.data.description?.trim()) {
+    ctx.font = `9px ${MONO}`;
+    ctx.fillStyle = "#ffffff";
+    ctx.globalAlpha = 0.75;
+    ctx.fillText(fitText(ctx, n.data.description.replace(/\s+/g, " ").trim(), w - 16), 8, 42);
+    ctx.globalAlpha = 1;
+  }
+
+  const bodyY = headerH + TOP_BODY_PAD - 2;
+  const drawRowDesc = (desc: string | undefined | null, fy: number) => {
+    if (!showDesc || !desc) return;
+    ctx.save();
+    ctx.font = `9px ${MONO}`;
+    ctx.fillStyle = mutedFg;
+    ctx.globalAlpha = 0.7;
+    // Match the field-name's x=10 left margin so the description
+    // sits flush under its row's name (no longer indented).
+    ctx.fillText(
+      fitText(ctx, desc.replace(/\s+/g, " ").trim(), w - 20),
+      10,
+      fy + 11,
+    );
+    ctx.restore();
+  };
   if (n.data.kind === "Enum") {
     ctx.font = `10px ${MONO}`;
     ctx.fillStyle = mutedFg;
     const values = n.data.values ?? [];
     for (let i = 0; i < values.length; i++) {
-      ctx.fillText(values[i]!.name, 10, bodyY + i * ROW_H + 10);
+      const v = values[i]!;
+      const fy = bodyY + i * rowH + 10;
+      ctx.font = `10px ${MONO}`;
+      ctx.fillStyle = mutedFg;
+      ctx.fillText(v.name, 10, fy);
+      drawRowDesc(v.description, fy);
     }
   } else if (n.data.kind === "Union") {
     ctx.font = `10px ${MONO}`;
     ctx.fillStyle = mutedFg;
     const members = n.data.members ?? [];
     for (let i = 0; i < members.length; i++) {
-      ctx.fillText("| " + members[i]!, 10, bodyY + i * ROW_H + 10);
+      ctx.fillText("| " + members[i]!, 10, bodyY + i * rowH + 10);
     }
   } else if (n.data.kind === "Scalar") {
     ctx.font = `italic 10px ${MONO}`;
@@ -555,8 +606,9 @@ function drawNodeSprite(
     ctx.font = `10px ${MONO}`;
     for (let i = 0; i < fields.length; i++) {
       const f = fields[i]!;
-      const fy = bodyY + i * ROW_H + 10;
+      const fy = bodyY + i * rowH + 10;
       const depAlpha = f.isDeprecated ? 0.4 : 1;
+      ctx.font = `10px ${MONO}`;
       ctx.fillStyle = fgColor;
       ctx.globalAlpha = depAlpha;
       ctx.fillText(f.name, 10, fy);
@@ -584,6 +636,7 @@ function drawNodeSprite(
         ctx.font = `10px ${MONO}`;
       }
       drawColoredType(ctx, f.type, w - 10, fy, BUILTIN_SCALARS.has(f.typeName), depAlpha);
+      drawRowDesc(f.description, fy);
     }
     const interfaces = n.data.interfaces ?? [];
     if (interfaces.length > 0) {
@@ -593,14 +646,15 @@ function drawNodeSprite(
       // The "implements" / "&" prefix is dropped — the violet
       // background already communicates that these are
       // implementations.
-      const sectionTop = bodyY + fields.length * ROW_H + 2;
+      const implGap = fields.length > 0 ? IMPL_SECTION_GAP : 0;
+      const sectionTop = bodyY + fields.length * rowH + 2 + implGap;
       const sectionH = h - sectionTop;
-      const blockH = interfaces.length * ROW_H;
+      const blockH = interfaces.length * rowH;
       const centerOffset = Math.max(0, Math.floor((sectionH - blockH) / 2));
       ctx.font = `600 10px ${MONO}`;
       ctx.fillStyle = ifaceColor;
       for (let i = 0; i < interfaces.length; i++) {
-        const fy = sectionTop + centerOffset + i * ROW_H + 10;
+        const fy = sectionTop + centerOffset + i * rowH + 10;
         ctx.fillText(fitText(ctx, interfaces[i]!, w - 20), 10, fy);
       }
     }
@@ -987,6 +1041,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     pinnedField,
     setPinnedField,
   } = useSchema();
+  // "Show descriptions" toggle. When on, every node card reserves
+  // an extra italic line under each field name and an extra block
+  // under the type name in the header so the SDL descriptions
+  // render inline. Layout has to re-run on toggle (node heights
+  // change) — this is tracked via the layout effect's deps below.
+  const [showGraphDescriptions, setShowGraphDescriptions] = useState(false);
   const currentLodRef = useRef<SpriteLOD>("full");
   const [lodTick, setLodTick] = useState(0);
   const [appReady, setAppReady] = useState(false);
@@ -1149,6 +1209,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           n.values?.length ?? 0,
           n.members?.length ?? 0,
           n.interfaces?.length ?? 0,
+          showGraphDescriptions,
         ),
       };
     });
@@ -1183,11 +1244,13 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         setIsPending(false);
         setLayoutProgress(null);
       });
-  }, [nodes, edges, rootId]);
+  }, [nodes, edges, rootId, showGraphDescriptions]);
 
   const laidNodes = useMemo<LaidNode[]>(() => {
     const byId = new Map<string, GraphNodeData>();
     for (const n of nodes) byId.set(n.id, n);
+    const rowH = rowHFor(showGraphDescriptions);
+    const headerH = headerHFor(showGraphDescriptions);
     return layoutResult.nodes
       .filter((p) => byId.has(p.id))
       .map((p) => ({
@@ -1197,8 +1260,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         cy: p.y,
         w: p.width,
         h: p.height,
+        rowH,
+        headerH,
       }));
-  }, [layoutResult, nodes]);
+  }, [layoutResult, nodes, showGraphDescriptions]);
 
   const nodeById = useMemo(() => {
     const m = new Map<string, LaidNode>();
@@ -1224,7 +1289,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
       if (e.kind === "field" && e.sourceFieldIndex != null && b.cx > a.cx && segments.length > 0) {
         const exitX = a.cx + a.w / 2;
-        const exitY = a.cy - a.h / 2 + HEADER_H + TOP_BODY_PAD - 2 + e.sourceFieldIndex * ROW_H + 6;
+        const exitY = a.cy - a.h / 2 + a.headerH + TOP_BODY_PAD - 2 + e.sourceFieldIndex * a.rowH + 6;
         const origC1 = segments[0]!.c1;
         const tangentLen = Math.hypot(origC1.x - start.x, origC1.y - start.y);
         const c1Offset = Math.max(tangentLen, 32);
@@ -1653,9 +1718,9 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       if (worldX < left || worldX > right || worldY < top || worldY > bottom) continue;
       const localX = worldX - left;
       const localY = worldY - top;
-      const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
+      const bodyTop = n.headerH + TOP_BODY_PAD - 2;
       if (localY < bodyTop) return null;
-      const rowIdx = Math.floor((localY - bodyTop) / ROW_H);
+      const rowIdx = Math.floor((localY - bodyTop) / n.rowH);
       const data = n.data;
       if (data.kind === "Object" || data.kind === "Interface" || data.kind === "Input") {
         const fields = data.fields ?? [];
@@ -1673,7 +1738,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           const rtLeft = n.w - 10 - typeTextW - relayW - HIT_PAD_X;
           const rtRight = n.w - 10 + HIT_PAD_X;
           const isReturnTypeHover = localX >= rtLeft && localX <= rtRight;
-          const rowY = bodyTop + rowIdx * ROW_H;
+          const rowY = bodyTop + rowIdx * n.rowH;
           return {
             nodeId: n.id,
             fieldIndex: rowIdx,
@@ -1685,7 +1750,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               x: rtLeft,
               y: rowY,
               w: rtRight - rtLeft,
-              h: ROW_H,
+              h: n.rowH,
             },
           };
         }
@@ -1745,7 +1810,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const left = n.cx - n.w / 2;
       const right = n.cx + n.w / 2;
       const top = n.cy - n.h / 2;
-      if (worldX >= left && worldX <= right && worldY >= top && worldY <= top + HEADER_H) {
+      if (worldX >= left && worldX <= right && worldY >= top && worldY <= top + n.headerH) {
         return n.id;
       }
     }
@@ -2290,7 +2355,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               const fgHex = cssColorToHex(getComputedCssVar("--foreground", "#0f172a"));
               const nodeLeft = n.cx - n.w / 2;
               const nodeTop = n.cy - n.h / 2;
-              const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
+              const bodyTop = n.headerH + TOP_BODY_PAD - 2;
               const fields = n.data.fields ?? [];
               const interfaces = n.data.interfaces ?? [];
               let hy: number;
@@ -2303,19 +2368,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                 // mirror the same offset used by drawNodeSprite so
                 // the highlight tracks the rendered text.
                 const ifaceIdx = hoveredField.fieldIndex - fields.length;
-                const sectionTop = bodyTop + fields.length * ROW_H + 2;
+                const implGap = fields.length > 0 ? IMPL_SECTION_GAP : 0;
+                const sectionTop = bodyTop + fields.length * n.rowH + 2 + implGap;
                 const sectionH = n.h - sectionTop;
-                const blockH = interfaces.length * ROW_H;
+                const blockH = interfaces.length * n.rowH;
                 const centerOffset = Math.max(
                   0,
                   Math.floor((sectionH - blockH) / 2),
                 );
-                hy = nodeTop + sectionTop + centerOffset + ifaceIdx * ROW_H;
+                hy = nodeTop + sectionTop + centerOffset + ifaceIdx * n.rowH;
               } else {
-                hy = nodeTop + bodyTop + hoveredField.fieldIndex * ROW_H;
+                hy = nodeTop + bodyTop + hoveredField.fieldIndex * n.rowH;
               }
               const hpad = 4;
-              scene.hoverGraphics.roundRect(nodeLeft + hpad, hy, n.w - hpad * 2, ROW_H, 3);
+              scene.hoverGraphics.roundRect(nodeLeft + hpad, hy, n.w - hpad * 2, n.rowH, 3);
               scene.hoverGraphics.fill({ color: fgHex, alpha: 0.07 });
 
               // Distinct return-type hover effect — only fires when
@@ -2936,6 +3002,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
        *  that a canvas return-type click or a tree-panel field
        *  click uses. */
       navigate: (id: string) => onNavigateRef.current?.(id),
+      /** Test-only: per-node row + header heights, so an e2e test
+       *  can verify that toggling "Show descriptions" actually
+       *  re-laid the graph with the larger row sizes. */
+      getNodeDimensions: () =>
+        laidNodesRef.current.map((n) => ({
+          id: n.id,
+          rowH: n.rowH,
+          headerH: n.headerH,
+          w: n.w,
+          h: n.h,
+        })),
       getInViewNodeIds: () => {
         const v = viewRef.current;
         const sw = size.w;
@@ -3141,20 +3218,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     if (!pinnedField) return;
     const n = nodeById.get(pinnedField.typeId);
     if (!n) return;
-    const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
+    const bodyTop = n.headerH + TOP_BODY_PAD - 2;
     const nodeLeft = n.cx - n.w / 2;
     const nodeTop = n.cy - n.h / 2;
     const fields = n.data.fields ?? [];
     if (pinnedField.fieldIndex < 0 || pinnedField.fieldIndex >= fields.length) {
       return;
     }
-    const y = nodeTop + bodyTop + pinnedField.fieldIndex * ROW_H;
+    const y = nodeTop + bodyTop + pinnedField.fieldIndex * n.rowH;
     const pad = 2;
     g.roundRect(
       nodeLeft + pad,
       y - pad,
       n.w - pad * 2,
-      ROW_H + pad * 2,
+      n.rowH + pad * 2,
       4,
     );
     g.stroke({ width: 2, color: 0xf97316, alpha: 0.95 });
@@ -3174,16 +3251,16 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
     // Row stripes first (drawn underneath the outline if both apply
     // to the same node).
-    const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
     for (const n of laidNodes) {
       const rows = investigateMatch.rowsByNode.get(n.id);
       if (!rows) continue;
+      const bodyTop = n.headerH + TOP_BODY_PAD - 2;
       const left = n.cx - n.w / 2 + 4;
       const top = n.cy - n.h / 2;
       const width = n.w - 8;
       for (const rowIdx of rows) {
-        const y = top + bodyTop + rowIdx * ROW_H;
-        g.roundRect(left, y, width, ROW_H, 3);
+        const y = top + bodyTop + rowIdx * n.rowH;
+        g.roundRect(left, y, width, n.rowH, 3);
       }
     }
     g.fill({ color: 0xf97316, alpha: 0.22 });
@@ -3288,6 +3365,20 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         >
           <Filter className="h-2.5 w-2.5" />
           Hide Relay
+        </button>
+        <button
+          type="button"
+          onClick={() => setShowGraphDescriptions((v) => !v)}
+          className={cn(
+            "flex cursor-pointer items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors",
+            showGraphDescriptions
+              ? "border-primary bg-primary/10 text-primary"
+              : "border-border text-muted-foreground hover:border-border/80 hover:text-foreground",
+          )}
+          title="Render SDL descriptions inline on each node card (taller rows; re-runs layout)"
+        >
+          <Filter className="h-2.5 w-2.5" />
+          Show descriptions
         </button>
       </div>
 

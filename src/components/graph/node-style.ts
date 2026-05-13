@@ -78,6 +78,27 @@ export const HEADER_H = 42;
 export const ROW_H = 14;
 export const TOP_BODY_PAD = 8;
 export const BOTTOM_PAD = 10;
+/** Vertical gap inserted between the last field row and the
+ *  violet `implements` section. Without it the section pressed up
+ *  against the previous field's description text — adding a small
+ *  breathing strip makes the two zones read as separate. */
+export const IMPL_SECTION_GAP = 8;
+
+// Description-mode dimensions. When the "Show descriptions" toggle is
+// on, every field row gets an extra italic line below the name and the
+// header carries a wrapped type-description block beneath the type
+// name. These reserve the extra vertical space deterministically (one
+// description line per row, regardless of whether the row's
+// description is empty) so the layout stays predictable.
+export const ROW_H_WITH_DESC = 26;
+export const HEADER_H_WITH_DESC = HEADER_H + 14;
+
+export function rowHFor(showDescriptions: boolean): number {
+  return showDescriptions ? ROW_H_WITH_DESC : ROW_H;
+}
+export function headerHFor(showDescriptions: boolean): number {
+  return showDescriptions ? HEADER_H_WITH_DESC : HEADER_H;
+}
 
 export function estimateNodeHeight(
   kind: NodeKind,
@@ -85,7 +106,10 @@ export function estimateNodeHeight(
   valueCount = 0,
   memberCount = 0,
   interfaceCount = 0,
+  showDescriptions = false,
 ): number {
+  const rowH = rowHFor(showDescriptions);
+  const headerH = headerHFor(showDescriptions);
   const rows =
     kind === "Enum"
       ? valueCount
@@ -94,8 +118,17 @@ export function estimateNodeHeight(
         : kind === "Scalar"
           ? 0
           : fieldCount + interfaceCount;
-  const body = rows === 0 ? 14 : rows * ROW_H;
-  return HEADER_H + TOP_BODY_PAD + body + BOTTOM_PAD;
+  const body = rows === 0 ? rowH : rows * rowH;
+  // Add a small gap between the last field row and the implements
+  // section so they don't collide visually (only applies when the
+  // node actually has both fields AND interfaces).
+  const implGap =
+    (kind === "Object" || kind === "Interface") &&
+    interfaceCount > 0 &&
+    fieldCount > 0
+      ? IMPL_SECTION_GAP
+      : 0;
+  return headerH + TOP_BODY_PAD + body + implGap + BOTTOM_PAD;
 }
 
 /** Font used for the name row in a node header — referenced from both
