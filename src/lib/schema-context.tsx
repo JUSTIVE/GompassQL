@@ -28,6 +28,13 @@ interface SchemaContextValue {
   setHidePrimitiveFields: (v: boolean) => void;
   hideRelayBoilerplate: boolean;
   setHideRelayBoilerplate: (v: boolean) => void;
+
+  /** Field row pinned via tree-panel click. The canvas overlays an
+   *  orange highlight on this exact row so the user can see which
+   *  field they were inspecting on the source node, even after
+   *  navigating to the field's target type. */
+  pinnedField: { typeId: string; fieldName: string; fieldIndex: number } | null;
+  setPinnedField: (v: { typeId: string; fieldName: string; fieldIndex: number } | null) => void;
 }
 
 const EMPTY: ParsedGraph = { nodes: [], edges: [], error: null, warnings: [] };
@@ -63,6 +70,9 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
   const [focusStack, setFocusStack] = useState<string[]>([]);
   const [hidePrimitiveFields, setHidePrimitiveFields] = useState(false);
   const [hideRelayBoilerplate, setHideRelayBoilerplate] = useState(true);
+  const [pinnedField, setPinnedField] = useState<
+    SchemaContextValue["pinnedField"]
+  >(null);
 
   const graph = useMemo(
     () => (sdl ? sdlToGraph(sdl, { hideRelayBoilerplate }) : EMPTY),
@@ -223,6 +233,8 @@ export function SchemaProvider({ children }: { children: React.ReactNode }) {
     setHidePrimitiveFields,
     hideRelayBoilerplate,
     setHideRelayBoilerplate,
+    pinnedField,
+    setPinnedField,
   };
 
   return <SchemaContext.Provider value={value}>{children}</SchemaContext.Provider>;

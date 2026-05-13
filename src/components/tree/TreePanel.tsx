@@ -4,6 +4,7 @@ import { KIND_STYLES } from "@/components/graph/node-style";
 import { Badge } from "@/components/ui/badge";
 import { useSchema } from "@/lib/schema-context";
 import type { GraphNodeData, NodeKind } from "@/lib/sdl-to-graph";
+import { tooltipStyle } from "@/lib/tooltip-pos";
 import { ColoredType } from "@/lib/type-colors";
 import { cn } from "@/lib/utils";
 
@@ -691,6 +692,7 @@ function TypeDetail({
   onNavigate: (id: string) => void;
   nodesById: Map<string, GraphNodeData>;
 }) {
+  const { setPinnedField } = useSchema();
   const style = KIND_STYLES[node.kind];
 
   const chainNavigable = (typeName: string) =>
@@ -772,7 +774,7 @@ function TypeDetail({
         </p>
       ) : (
         <ul className="space-y-0.5 font-mono text-xs">
-          {node.fields?.map((f) => {
+          {node.fields?.map((f, fieldIndex) => {
             // Only show the return type in the chain — Input args are
             // visible on hover via the argsDetail list, not inline.
             const chain: ChainItem[] = [
@@ -793,6 +795,13 @@ function TypeDetail({
                   isDeprecated={f.isDeprecated}
                   deprecationReason={f.deprecationReason}
                   onNavigate={onNavigate}
+                  onPin={() =>
+                    setPinnedField({
+                      typeId: node.id,
+                      fieldName: f.name,
+                      fieldIndex,
+                    })
+                  }
                 />
               </li>
             );
@@ -821,6 +830,7 @@ function FieldRow({
   isDeprecated,
   deprecationReason,
   onNavigate,
+  onPin,
 }: {
   label: string;
   chain: ChainItem[];
@@ -829,14 +839,40 @@ function FieldRow({
   isDeprecated?: boolean;
   deprecationReason?: string;
   onNavigate: (id: string) => void;
+  /** Called whenever the row itself is clicked — used to pin this
+   *  field's highlight on the canvas. Independent of navigation:
+   *  pinning happens even on non-navigable types so the user can
+   *  pin a field with a scalar return. */
+  onPin?: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
+  const [tipPos, setTipPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const requiredArgCount = args?.filter((a) => a.type.endsWith("!")).length ?? 0;
   const hasArgs = (args?.length ?? 0) > 0;
-  // Args are rendered as inner buttons, so we must use div mode (not
-  // button mode) whenever args are present to avoid button-in-button.
-  const single = chain.length === 1 && !hasArgs ? chain[0]! : null;
 
+  // Custom tooltip rendered when the row is hovered. Replaces the
+  // native `title` attribute so the bubble matches the rest of the
+  // app's popovers (font, theme, edge-aware placement) and can show
+  // colored type segments rather than plain text.
+  const tooltipEl = hovered ? (
+    <div
+      className="pointer-events-none fixed z-50 whitespace-nowrap rounded-lg border border-border bg-popover/95 px-3 py-2 font-mono text-xs text-popover-foreground shadow-lg backdrop-blur"
+      style={tooltipStyle(tipPos.x, tipPos.y)}
+    >
+      <span className="font-semibold">{label}</span>
+      {chain.length > 0 && (
+        <>
+          <span className="text-muted-foreground">: </span>
+          {chain.map((c, i) => (
+            <Fragment key={i}>
+              {i > 0 && <span className="text-muted-foreground"> → </span>}
+              <ColoredType type={c.label} />
+            </Fragment>
+          ))}
+        </>
+      )}
+    </div>
+  ) : null;
   const arityBadge = hasArgs ? (
     <span className="font-mono text-[10px] text-muted-foreground/60">
       ({requiredArgCount}/{args!.length})
@@ -877,77 +913,61 @@ function FieldRow({
       <button
         type="button"
         onClick={(e) => { e.stopPropagation(); onNavigate(item.typeName); }}
-        className="flex items-center gap-0.5 rounded px-1 hover:bg-secondary/80"
+        className="group/chip flex min-w-0 items-center gap-0.5 rounded px-1 ring-1 ring-transparent transition-colors hover:bg-primary/15 hover:ring-primary/40"
+        title={item.label}
       >
         {item.isRelayConnection && item.label && (
           <RelayIcon className="h-2.5 w-2.5 shrink-0 opacity-80" />
         )}
-        {item.label ? <ColoredType type={item.label} /> : null}
-        <ChevronRight className="h-3 w-3 text-muted-foreground" />
+        {item.label ? (
+          <span className="min-w-0 truncate">
+            <ColoredType type={item.label} />
+          </span>
+        ) : null}
+        <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground transition-transform group-hover/chip:translate-x-0.5 group-hover/chip:text-primary" />
       </button>
     ) : (
-      <span className="flex items-center gap-0.5">
+      <span
+        className="flex min-w-0 items-center gap-0.5"
+        title={item.label}
+      >
         {item.isRelayConnection && item.label && (
           <RelayIcon className="h-2.5 w-2.5 shrink-0 opacity-80" />
         )}
-        {item.label ? <ColoredType type={item.label} /> : null}
+        {item.label ? (
+          <span className="min-w-0 truncate">
+            <ColoredType type={item.label} />
+          </span>
+        ) : null}
       </span>
     );
-
-  if (single) {
-    return (
-      <button
-        type="button"
-        disabled={!single.navigable}
-        onClick={() => single.navigable && onNavigate(single.typeName)}
-        onMouseEnter={() => setHovered(true)}
-        onMouseLeave={() => setHovered(false)}
-        className={cn(
-          "group flex w-full flex-col gap-0.5 rounded px-2 py-1 text-left",
-          single.navigable ? "cursor-pointer hover:bg-secondary/60" : "cursor-default",
-          isDeprecated && "opacity-60",
-        )}
-      >
-        <span className="flex w-full items-center justify-between gap-2">
-          <span className={cn("flex min-w-0 items-center gap-1 truncate text-foreground", isDeprecated && "line-through decoration-muted-foreground/50")}>
-            {label}
-            {arityBadge}
-          </span>
-          <span className={cn("flex shrink-0 items-center gap-1", single.navigable && "group-hover:opacity-80")}>
-            {single.isRelayConnection && single.label && (
-              <RelayIcon className="h-2.5 w-2.5 shrink-0 opacity-80" />
-            )}
-            {single.label ? <ColoredType type={single.label} /> : null}
-            {single.navigable && <ChevronRight className="h-3 w-3 text-muted-foreground" />}
-          </span>
-        </span>
-        {deprecatedNote}
-        {description && (
-          <span className="font-sans text-[11px] leading-snug text-muted-foreground">
-            {description}
-          </span>
-        )}
-        {argsDetail}
-      </button>
-    );
-  }
-
+  // Row is a div with two clickable regions: the outer area pins the
+  // field (focusing the canvas on its owner type), while the inner
+  // type chip(s) navigate to the return type. Buttons in args / chips
+  // stop propagation so they don't also fire the row's pin handler.
   return (
+    <>
+    {tooltipEl}
     <div
-      className={cn("flex w-full flex-col gap-0.5 rounded px-2 py-1 hover:bg-secondary/60", isDeprecated && "opacity-60")}
-      onMouseEnter={() => setHovered(true)}
+      className={cn("flex w-full cursor-pointer flex-col gap-0.5 rounded px-2 py-1 hover:bg-secondary/60", isDeprecated && "opacity-60")}
+      onMouseEnter={(ev) => {
+        setHovered(true);
+        setTipPos({ x: ev.clientX, y: ev.clientY });
+      }}
+      onMouseMove={(ev) => setTipPos({ x: ev.clientX, y: ev.clientY })}
       onMouseLeave={() => setHovered(false)}
+      onClick={() => onPin?.()}
     >
       <span className="flex w-full items-center justify-between gap-2">
-        <span className={cn("flex min-w-0 items-center gap-1 truncate text-foreground", isDeprecated && "line-through decoration-muted-foreground/50")}>
-          {label}
+        <span className={cn("flex min-w-0 items-center gap-1 text-foreground", isDeprecated && "line-through decoration-muted-foreground/50")}>
+          <span className="truncate">{label}</span>
           {arityBadge}
         </span>
-        <span className="flex shrink-0 items-center gap-1">
+        <span className="flex min-w-0 items-center justify-end gap-1 [flex-shrink:2]">
           {chain.map((item, i) => (
             <Fragment key={i}>
               {i > 0 && (
-                <span className="text-[10px] text-muted-foreground/50">→</span>
+                <span className="shrink-0 text-[10px] text-muted-foreground/50">→</span>
               )}
               {typeChip(item)}
             </Fragment>
@@ -962,6 +982,7 @@ function FieldRow({
       )}
       {argsDetail}
     </div>
+    </>
   );
 }
 

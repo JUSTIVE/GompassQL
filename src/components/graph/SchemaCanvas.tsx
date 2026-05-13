@@ -11,6 +11,7 @@ import {
 import type { GraphEdgeData, GraphNodeData, NodeKind } from "@/lib/sdl-to-graph";
 import { useSchema } from "@/lib/schema-context";
 import { useTheme } from "@/lib/theme";
+import { tooltipStyle } from "@/lib/tooltip-pos";
 import { cn } from "@/lib/utils";
 import {
   HEADER_H,
@@ -284,32 +285,6 @@ function cssColorToHex(color: string): number {
   return 0xffffff;
 }
 
-/**
- * Position-aware tooltip placement. Uses `right` / `bottom` anchors
- * when the cursor is near the viewport's right / bottom edge so the
- * bubble never gets clipped. Combined with `whitespace-nowrap` on the
- * tooltip element, this guarantees the bubble fully wraps its text
- * regardless of cursor position.
- */
-function tooltipStyle(clientX: number, clientY: number): React.CSSProperties {
-  const PAD = 12;
-  const EDGE = 8;
-  if (typeof window === "undefined") {
-    return { left: clientX + PAD, top: clientY + PAD };
-  }
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-  const flipX = clientX > vw / 2;
-  const flipY = clientY > vh - 80;
-  return {
-    left: flipX ? undefined : clientX + PAD,
-    right: flipX ? vw - clientX + PAD : undefined,
-    top: flipY ? undefined : clientY + PAD,
-    bottom: flipY ? vh - clientY + PAD : undefined,
-    maxWidth: `calc(100vw - ${EDGE * 2}px)`,
-  };
-}
-
 // measureText cache
 const typeWidthCache = new Map<string, number>();
 const fitTextCache = new Map<string, string>();
@@ -320,6 +295,23 @@ function cachedTextWidth(ctx: CanvasRenderingContext2D, text: string): number {
   w = ctx.measureText(text).width;
   typeWidthCache.set(text, w);
   return w;
+}
+
+// Module-level measurement ctx pinned to the field-type font so the
+// hit-test can locate the right-aligned return-type label without
+// touching a rendering canvas. Reuses `typeWidthCache` since the cache
+// is keyed by text and the field-type font is the only one cached.
+let fieldTypeMeasureCtx: CanvasRenderingContext2D | null = null;
+function fieldTypeTextWidth(text: string): number {
+  if (!fieldTypeMeasureCtx) {
+    if (typeof document === "undefined") return 0;
+    const c = document.createElement("canvas");
+    const ctx = c.getContext("2d");
+    if (!ctx) return 0;
+    ctx.font = `10px ${MONO}`;
+    fieldTypeMeasureCtx = ctx;
+  }
+  return cachedTextWidth(fieldTypeMeasureCtx, text);
 }
 
 function fitText(ctx: CanvasRenderingContext2D, s: string, maxWidth: number): string {
@@ -852,7 +844,13 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     moved: false,
   });
 
-  const hoveredFieldRef = useRef<{ nodeId: string; fieldIndex: number; isRelayHover: boolean } | null>(null);
+  const hoveredFieldRef = useRef<{
+    nodeId: string;
+    fieldIndex: number;
+    isRelayHover: boolean;
+    isReturnTypeHover: boolean;
+    returnTypeRect: { x: number; y: number; w: number; h: number } | null;
+  } | null>(null);
   const hoveredNodeRef = useRef<string | null>(null);
   const hoveredEdgeRef = useRef<LaidEdge | null>(null);
   // React state mirror — only updates on hover-change so we don't
@@ -986,6 +984,8 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     setHidePrimitiveFields,
     hideRelayBoilerplate,
     setHideRelayBoilerplate,
+    pinnedField,
+    setPinnedField,
   } = useSchema();
   const currentLodRef = useRef<SpriteLOD>("full");
   const [lodTick, setLodTick] = useState(0);
@@ -1010,6 +1010,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     hoverEdgeGraphics: Graphics | null;
     nodeContainer: Container | null;
     investigateOverlay: Graphics | null;
+    pinFieldGraphics: Graphics | null;
     hoverGraphics: Graphics | null;
     focusGraphics: Graphics | null;
   }>({
@@ -1020,6 +1021,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     hoverEdgeGraphics: null,
     nodeContainer: null,
     investigateOverlay: null,
+    pinFieldGraphics: null,
     hoverGraphics: null,
     focusGraphics: null,
   });
@@ -1064,6 +1066,13 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // and crash the renderer. Once the view has been stable for
   // `MOTION_SETTLE_MS` we resume building progressively.
   const lastViewChangeAtRef = useRef(0);
+  // Set to true when the view jumps in one go because of an explicit
+  // focus change (tree-panel or canvas click → navigation). For one
+  // frame after the jump the ticker bypasses the motion-settle gate
+  // and drains the texture build queue with a larger budget so the
+  // user doesn't sit on chrome/bar placeholders for ~150 ms. Cleared
+  // by the drain loop once the queue is empty.
+  const focusJumpPendingRef = useRef(false);
 
   // Progressive sprite build queue — filled by the node useEffect,
   // drained by the ticker a few nodes per frame (budget-limited).
@@ -1472,6 +1481,19 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           x: size.w / 2 - n.cx * k,
           y: size.h / 2 - n.cy * k,
         };
+        // Explicit LOD refresh — the view just jumped in one frame
+        // from whatever the user was browsing to a focused-on-target
+        // view at k≥FOCUS_MIN_ZOOM. Update `currentLodRef` now
+        // (instead of waiting for the ticker to notice next frame)
+        // and mark the build queue to bypass motion-settle so the
+        // newly-in-view sprites don't sit on their low-LOD
+        // placeholders for ~150 ms after the jump.
+        const newLod = computeLOD(k, currentLodRef.current);
+        if (newLod !== currentLodRef.current) {
+          currentLodRef.current = newLod;
+          setLodTick((t) => t + 1);
+        }
+        focusJumpPendingRef.current = true;
       }
     }
   }, [laidNodes, size, bounds, focusId, nodeById]);
@@ -1603,10 +1625,26 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     return best;
   };
 
-  const hitTestField = (
-    worldX: number,
-    worldY: number,
-  ): { nodeId: string; fieldIndex: number; navigableTarget: string | null; isRelayHover: boolean } | null => {
+  interface FieldHit {
+    nodeId: string;
+    fieldIndex: number;
+    /** Name of the field if the row is a real field row. Null for
+     *  interface / union member / enum-value rows where the "row" is
+     *  itself the type. */
+    fieldName: string | null;
+    navigableTarget: string | null;
+    isRelayHover: boolean;
+    /** True when the pointer sits over the right-aligned return-type
+     *  label (or, for union/interface rows, anywhere on the row since
+     *  the row IS the type). Used to decide click action (pin field
+     *  vs. navigate to return type) and to show a distinct hover. */
+    isReturnTypeHover: boolean;
+    /** Pixel rect (in world-space, relative to the node origin) of
+     *  the return-type label — used by the hover overlay to paint a
+     *  ring around just that label. Null when no label exists. */
+    returnTypeRect: { x: number; y: number; w: number; h: number } | null;
+  }
+  const hitTestField = (worldX: number, worldY: number): FieldHit | null => {
     for (const n of laidNodes) {
       const left = n.cx - n.w / 2;
       const right = n.cx + n.w / 2;
@@ -1626,14 +1664,47 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           const nav =
             !BUILTIN_SCALARS.has(f.typeName) && nodeById.has(f.typeName) ? f.typeName : null;
           const isRelayHover = !!f.isRelayConnection && localX > n.w - 44;
-          return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav, isRelayHover };
+          // Return-type label is right-aligned at `n.w - 10` in the
+          // drawNodeSprite layout. Pad the hit region a few pixels so
+          // the click target isn't pixel-thin.
+          const typeTextW = fieldTypeTextWidth(f.type);
+          const HIT_PAD_X = 4;
+          const relayW = f.isRelayConnection ? 12 : 0;
+          const rtLeft = n.w - 10 - typeTextW - relayW - HIT_PAD_X;
+          const rtRight = n.w - 10 + HIT_PAD_X;
+          const isReturnTypeHover = localX >= rtLeft && localX <= rtRight;
+          const rowY = bodyTop + rowIdx * ROW_H;
+          return {
+            nodeId: n.id,
+            fieldIndex: rowIdx,
+            fieldName: f.name,
+            navigableTarget: nav,
+            isRelayHover,
+            isReturnTypeHover,
+            returnTypeRect: {
+              x: rtLeft,
+              y: rowY,
+              w: rtRight - rtLeft,
+              h: ROW_H,
+            },
+          };
         }
         const interfaces = data.interfaces ?? [];
         const ifaceIdx = rowIdx - fields.length;
         if (ifaceIdx < interfaces.length) {
           const ifaceName = interfaces[ifaceIdx]!;
           const nav = nodeById.has(ifaceName) ? ifaceName : null;
-          return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav, isRelayHover: false };
+          return {
+            nodeId: n.id,
+            fieldIndex: rowIdx,
+            fieldName: null,
+            navigableTarget: nav,
+            isRelayHover: false,
+            // Implements rows are the type itself — the whole row
+            // navigates and shows the return-type hover treatment.
+            isReturnTypeHover: !!nav,
+            returnTypeRect: null,
+          };
         }
         return null;
       }
@@ -1641,20 +1712,33 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         const m = data.members?.[rowIdx];
         if (!m) return null;
         const nav = !BUILTIN_SCALARS.has(m) && nodeById.has(m) ? m : null;
-        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: nav, isRelayHover: false };
+        return {
+          nodeId: n.id,
+          fieldIndex: rowIdx,
+          fieldName: null,
+          navigableTarget: nav,
+          isRelayHover: false,
+          isReturnTypeHover: !!nav,
+          returnTypeRect: null,
+        };
       }
       if (data.kind === "Enum") {
         const v = data.values?.[rowIdx];
         if (!v) return null;
-        return { nodeId: n.id, fieldIndex: rowIdx, navigableTarget: null, isRelayHover: false };
+        return {
+          nodeId: n.id,
+          fieldIndex: rowIdx,
+          fieldName: null,
+          navigableTarget: null,
+          isRelayHover: false,
+          isReturnTypeHover: false,
+          returnTypeRect: null,
+        };
       }
       return null;
     }
     return null;
   };
-
-  const hitTestFieldTarget = (worldX: number, worldY: number): string | null =>
-    hitTestField(worldX, worldY)?.navigableTarget ?? null;
 
   const hitTestNodeHeader = (worldX: number, worldY: number): string | null => {
     for (const n of laidNodes) {
@@ -1719,12 +1803,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const lowLod =
       currentLodRef.current !== "full" ||
       viewRef.current.k < FIELD_CLICK_MIN_ZOOM;
-      // At low LOD the whole node card is the click target, so we
-      // show the pointer cursor on any node hover; at full LOD the
-      // pointer only appears on field rows with a navigable target.
-      setCursor(
-        (lowLod ? !!hoveredNode : !!hit?.navigableTarget) ? "pointer" : "grab",
-      );
+      // At low LOD the whole node card is the click target. At full
+      // LOD the pointer appears whenever the cursor is on a field row
+      // (which is always clickable — pins the field) or on a node
+      // header (navigates to that node).
+      const fullLodPointer = !!hit || !!hitTestNodeHeader(world.x, world.y);
+      setCursor((lowLod ? !!hoveredNode : fullLodPointer) ? "pointer" : "grab");
     }
     const prev = hoveredFieldRef.current;
     const same =
@@ -1732,10 +1816,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       hit !== null &&
       prev.nodeId === hit.nodeId &&
       prev.fieldIndex === hit.fieldIndex &&
-      prev.isRelayHover === hit.isRelayHover;
+      prev.isRelayHover === hit.isRelayHover &&
+      prev.isReturnTypeHover === hit.isReturnTypeHover;
     if (!same) {
       hoveredFieldRef.current = hit
-        ? { nodeId: hit.nodeId, fieldIndex: hit.fieldIndex, isRelayHover: hit.isRelayHover }
+        ? {
+            nodeId: hit.nodeId,
+            fieldIndex: hit.fieldIndex,
+            isRelayHover: hit.isRelayHover,
+            isReturnTypeHover: hit.isReturnTypeHover,
+            returnTypeRect: hit.returnTypeRect,
+          }
         : null;
     }
     hoveredNodeRef.current = hoveredNode;
@@ -1841,8 +1932,37 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         return;
       }
     } else {
-      const fieldHit = hitTestFieldTarget(world.x, world.y);
-      if (fieldHit) { setFocusedEdge(null); recordNodeClick(fieldHit); onNavigate?.(fieldHit); return; }
+      const hit = hitTestField(world.x, world.y);
+      if (hit) {
+        // Click on the right-aligned return-type label → navigate to
+        // the field's target type. Anywhere else on the row →
+        // pin the field and frame the canvas onto its owner type so
+        // the user can keep inspecting the source while seeing the
+        // highlight stay on the row.
+        if (hit.isReturnTypeHover && hit.navigableTarget) {
+          setFocusedEdge(null);
+          recordNodeClick(hit.navigableTarget);
+          onNavigate?.(hit.navigableTarget);
+          return;
+        }
+        if (hit.fieldName) {
+          setFocusedEdge(null);
+          setPinnedField({
+            typeId: hit.nodeId,
+            fieldName: hit.fieldName,
+            fieldIndex: hit.fieldIndex,
+          });
+          return;
+        }
+        // Union/interface row without a separate "name" — click acts
+        // as navigate when target is available.
+        if (hit.navigableTarget) {
+          setFocusedEdge(null);
+          recordNodeClick(hit.navigableTarget);
+          onNavigate?.(hit.navigableTarget);
+          return;
+        }
+      }
       const nodeId = hitTestNodeHeader(world.x, world.y);
       if (nodeId) { setFocusedEdge(null); recordNodeClick(nodeId); onNavigate?.(nodeId); return; }
     }
@@ -1855,24 +1975,51 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       return;
     }
     setFocusedEdge(null);
+    setPinnedField(null);
     onClearFocus?.();
   };
 
   // Touch gestures — wrap the click-target hit test so a tap at low
   // LOD selects the whole node card (where field text isn't drawn).
-  const tapHitTest = (wx: number, wy: number): string | null => {
+  // Returns either a navigation target id, a pin instruction, or null.
+  type TapAction =
+    | { kind: "navigate"; id: string }
+    | { kind: "pin"; typeId: string; fieldName: string; fieldIndex: number }
+    | null;
+  const tapHitTest = (wx: number, wy: number): TapAction => {
     if (
       currentLodRef.current !== "full" ||
       viewRef.current.k < FIELD_CLICK_MIN_ZOOM
     ) {
-      return hitTestNode(wx, wy);
+      const id = hitTestNode(wx, wy);
+      return id ? { kind: "navigate", id } : null;
     }
-    return hitTestFieldTarget(wx, wy) ?? hitTestNodeHeader(wx, wy);
+    const hit = hitTestField(wx, wy);
+    if (hit) {
+      if (hit.isReturnTypeHover && hit.navigableTarget) {
+        return { kind: "navigate", id: hit.navigableTarget };
+      }
+      if (hit.fieldName) {
+        return {
+          kind: "pin",
+          typeId: hit.nodeId,
+          fieldName: hit.fieldName,
+          fieldIndex: hit.fieldIndex,
+        };
+      }
+      if (hit.navigableTarget) {
+        return { kind: "navigate", id: hit.navigableTarget };
+      }
+    }
+    const header = hitTestNodeHeader(wx, wy);
+    return header ? { kind: "navigate", id: header } : null;
   };
   const hitTestRef = useRef(tapHitTest);
   hitTestRef.current = tapHitTest;
   const onNavigateRef = useRef(onNavigate);
   onNavigateRef.current = onNavigate;
+  const setPinnedFieldRef = useRef(setPinnedField);
+  setPinnedFieldRef.current = setPinnedField;
 
   useEffect(() => {
     const el = containerRef.current;
@@ -1962,15 +2109,22 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         const wasTap = mode === "pan" && !panMoved && ended.length > 0;
         mode = "none";
         if (!wasTap) return;
-        const onNav = onNavigateRef.current;
-        if (!onNav) return;
         const t = ended[ended.length - 1]!;
         const rect = el.getBoundingClientRect();
         const v = viewRef.current;
         const wx = (t.clientX - rect.left - v.x) / v.k;
         const wy = (t.clientY - rect.top - v.y) / v.k;
-        const hit = hitTestRef.current(wx, wy);
-        if (hit) onNav(hit);
+        const action = hitTestRef.current(wx, wy);
+        if (!action) return;
+        if (action.kind === "navigate") {
+          onNavigateRef.current?.(action.id);
+        } else {
+          setPinnedFieldRef.current({
+            typeId: action.typeId,
+            fieldName: action.fieldName,
+            fieldIndex: action.fieldIndex,
+          });
+        }
       }
     };
 
@@ -2045,6 +2199,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       const nodeContainer = new Container();
       nodeContainer.cullable = true;
       const investigateOverlay = new Graphics();
+      const pinFieldGraphics = new Graphics();
       const hoverGraphics = new Graphics();
       const focusGraphics = new Graphics();
 
@@ -2058,6 +2213,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       // Investigate overlay sits above nodes so its orange outlines
       // pop over the (possibly dimmed) cards.
       world.addChild(investigateOverlay);
+      // Pinned-field highlight sits above the node sprite so it's
+      // visible on top of the field text, but below the focus ring
+      // so focus state stays the dominant visual.
+      world.addChild(pinFieldGraphics);
       world.addChild(hoverGraphics);
       world.addChild(focusGraphics);
 
@@ -2074,6 +2233,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         hoverEdgeGraphics,
         nodeContainer,
         investigateOverlay,
+        pinFieldGraphics,
         hoverGraphics,
         focusGraphics,
       };
@@ -2157,6 +2317,32 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               const hpad = 4;
               scene.hoverGraphics.roundRect(nodeLeft + hpad, hy, n.w - hpad * 2, ROW_H, 3);
               scene.hoverGraphics.fill({ color: fgHex, alpha: 0.07 });
+
+              // Distinct return-type hover effect — only fires when
+              // the pointer is on the right-aligned type label of a
+              // field row. Drawn as a colored fill + soft outline
+              // around just the type chip so users see the type as a
+              // separate click target (click → navigate) vs. the rest
+              // of the row (click → pin field on owner type).
+              if (hoveredField.isReturnTypeHover && hoveredField.returnTypeRect) {
+                const r = hoveredField.returnTypeRect;
+                scene.hoverGraphics.roundRect(
+                  nodeLeft + r.x,
+                  nodeTop + r.y,
+                  r.w,
+                  r.h,
+                  3,
+                );
+                scene.hoverGraphics.fill({ color: 0xf59e0b, alpha: 0.22 });
+                scene.hoverGraphics.roundRect(
+                  nodeLeft + r.x,
+                  nodeTop + r.y,
+                  r.w,
+                  r.h,
+                  3,
+                );
+                scene.hoverGraphics.stroke({ width: 1, color: 0xf59e0b, alpha: 0.9 });
+              }
             }
           }
         }
@@ -2233,6 +2419,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
           // dies from rapid vertex-buffer uploads during a fast pan.
           const TILE_BUILD_BUDGET_MS = 2;
           const tileStable =
+            focusJumpPendingRef.current ||
             performance.now() - lastViewChangeAtRef.current >= MOTION_SETTLE_MS;
           const buildDeadline = performance.now() + TILE_BUILD_BUDGET_MS;
           let batchesBuiltThisFrame = 0;
@@ -2425,16 +2612,22 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
                   continue;
                 }
                 spriteLastSeenFrameRef.current.set(id, frameCounterRef.current);
-                // Endpoints of the currently-focused edge are
+                // Endpoints of the currently-focused edge AND the
+                // currently-focused node (the navigation target) are
                 // always rendered at full LOD so the user can read
-                // type names + fields even after zooming out. The
-                // texture is built synchronously here (cheap — only
-                // up to 2 sprites) so we don't have to thread a
-                // mixed-LOD build queue.
+                // type names + fields even after zooming out, and so
+                // a click-to-navigate doesn't briefly leave the
+                // target on its low-LOD placeholder while the build
+                // queue waits for motion-settle. The texture is
+                // built synchronously here (cheap — at most 3
+                // sprites) so we don't have to thread a mixed-LOD
+                // build queue.
                 const focusedE = focusedEdgeRef.current;
+                const focusedNodeId = focusIdRef.current;
                 const forceFull =
-                  !!focusedE &&
-                  (focusedE.sourceId === id || focusedE.targetId === id);
+                  (!!focusedE &&
+                    (focusedE.sourceId === id || focusedE.targetId === id)) ||
+                  focusedNodeId === id;
                 // Non-full LOD: show the shared per-kind placeholder.
                 // Six uploads total, reused across every sprite of the
                 // same kind — cheap and gives a proper card silhouette
@@ -2538,11 +2731,21 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         // so we wait for MOTION_SETTLE_MS of no significant view
         // change before resuming. Sprites stay on their tint
         // placeholder until then.
+        //
+        // Exception: when a one-shot focus jump just happened (an
+        // explicit navigation, not a continuous pan), bypass the
+        // gate and give a larger per-frame budget so the user sees
+        // the newly-focused area at full LOD within ~1 frame instead
+        // of waiting out the 150 ms settle. The flag stays set until
+        // the queue drains, so even spillover sprites in subsequent
+        // frames don't pay the gate.
         const buildQ = spriteBuildQueueRef.current;
+        const focusJumping = focusJumpPendingRef.current;
         const motionStable =
+          focusJumping ||
           performance.now() - lastViewChangeAtRef.current >= MOTION_SETTLE_MS;
         if (buildQ && buildQ.nodes.length > 0 && motionStable) {
-          const deadline = performance.now() + 4;
+          const deadline = performance.now() + (focusJumping ? 30 : 4);
           const lodCap = maxTextureCacheFor(buildQ.lod);
           while (buildQ.nodes.length > 0 && performance.now() < deadline) {
             if (textureCacheRef.current.size >= lodCap) break;
@@ -2590,7 +2793,14 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
               textureCacheRef.current.delete(key);
             }
             spriteBuildQueueRef.current = null;
+            focusJumpPendingRef.current = false;
           }
+        } else if (!buildQ && focusJumpPendingRef.current) {
+          // Nothing to drain (e.g. focus pan put no new sprites into
+          // the queue because every in-view sprite already had a
+          // cached full-LOD texture). Clear the flag so we don't
+          // bypass motion-settle on the next pan/zoom.
+          focusJumpPendingRef.current = false;
         }
 
         // FPS sampling
@@ -2644,6 +2854,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         hoverEdgeGraphics: null,
         nodeContainer: null,
         investigateOverlay: null,
+        pinFieldGraphics: null,
         hoverGraphics: null,
         focusGraphics: null,
       };
@@ -2822,6 +3033,53 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       sprite.alpha = dimNodeIds.has(id) ? DIM : 1;
     }
   }, [edgeGroups]);
+
+  // When a field is pinned (tree-panel click), frame the canvas
+  // view onto the owner type's node — centers it and lifts the zoom
+  // to at least FIELD_CLICK_MIN_ZOOM so the pinned row is legible.
+  // Re-fires on every pin change so clicking the same field again
+  // (or another field of the same type) re-centers.
+  useEffect(() => {
+    if (!pinnedField) return;
+    const n = nodeById.get(pinnedField.typeId);
+    if (!n) return;
+    const targetK = Math.max(viewRef.current.k, FIELD_CLICK_MIN_ZOOM * 1.4);
+    viewRef.current = {
+      k: targetK,
+      x: size.w / 2 - n.cx * targetK,
+      y: size.h / 2 - n.cy * targetK,
+    };
+  }, [pinnedField, nodeById, size.w, size.h]);
+
+  // Pinned-field highlight — draws a persistent orange ring around
+  // the specific field row a user clicked in the tree panel. Reads
+  // pinnedField from schema-context. Re-runs whenever the pin or
+  // layout (laidNodes) changes.
+  useEffect(() => {
+    const g = sceneRef.current.pinFieldGraphics;
+    if (!g) return;
+    g.clear();
+    if (!pinnedField) return;
+    const n = nodeById.get(pinnedField.typeId);
+    if (!n) return;
+    const bodyTop = HEADER_H + TOP_BODY_PAD - 2;
+    const nodeLeft = n.cx - n.w / 2;
+    const nodeTop = n.cy - n.h / 2;
+    const fields = n.data.fields ?? [];
+    if (pinnedField.fieldIndex < 0 || pinnedField.fieldIndex >= fields.length) {
+      return;
+    }
+    const y = nodeTop + bodyTop + pinnedField.fieldIndex * ROW_H;
+    const pad = 2;
+    g.roundRect(
+      nodeLeft + pad,
+      y - pad,
+      n.w - pad * 2,
+      ROW_H + pad * 2,
+      4,
+    );
+    g.stroke({ width: 2, color: 0xf97316, alpha: 0.95 });
+  }, [pinnedField, nodeById]);
 
   // Redraw the investigate-mode overlay whenever the match set or
   // node layout changes. Two layers of highlight:
