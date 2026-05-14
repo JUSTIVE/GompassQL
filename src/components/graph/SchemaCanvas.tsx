@@ -2330,11 +2330,23 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         scene.world.position.set(v.x, v.y);
         scene.world.scale.set(v.k, v.k);
 
-        // Detect LOD change → trigger node/edge rebuild
+        // Detect LOD change → trigger node/edge rebuild. Whenever
+        // the LOD steps up into "full" (most often: right after the
+        // initial auto-fit resolves the user's first zoom-in, or
+        // when zooming back in from chrome / bar), arm the focus-
+        // jump bypass so the texture build queue drains on the
+        // next frame instead of waiting out the 150 ms motion-
+        // settle gate. Without this the freshly-mounted canvas
+        // sits on kind-placeholder textures for an extra beat
+        // after the user starts inspecting it.
         const newLod = computeLOD(v.k, currentLodRef.current);
         if (newLod !== currentLodRef.current) {
+          const prevLod = currentLodRef.current;
           currentLodRef.current = newLod;
           setLodTick((t) => t + 1);
+          if (newLod === "full" && prevLod !== "full") {
+            focusJumpPendingRef.current = true;
+          }
         }
 
         // Sync grid tiling
