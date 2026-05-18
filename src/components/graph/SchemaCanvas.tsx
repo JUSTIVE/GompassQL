@@ -588,7 +588,12 @@ function drawNodeSprite(
       ctx.font = `10px ${MONO}`;
       ctx.fillStyle = mutedFg;
       ctx.fillText(v.name, 10, fy);
-      drawRowDesc(v.description, fy);
+      // Deprecated values without a description fall back to the
+      // @deprecated reason so the row still gets an inline note.
+      drawRowDesc(
+        v.description ?? (v.isDeprecated ? v.deprecationReason : undefined),
+        fy,
+      );
     }
   } else if (n.data.kind === "Union") {
     ctx.font = `10px ${MONO}`;
@@ -636,7 +641,10 @@ function drawNodeSprite(
         ctx.font = `10px ${MONO}`;
       }
       drawColoredType(ctx, f.type, w - 10, fy, BUILTIN_SCALARS.has(f.typeName), depAlpha);
-      drawRowDesc(f.description, fy);
+      drawRowDesc(
+        f.description ?? (f.isDeprecated ? f.deprecationReason : undefined),
+        fy,
+      );
     }
     const interfaces = n.data.interfaces ?? [];
     if (interfaces.length > 0) {
@@ -961,11 +969,18 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
       if (n.description?.trim()) documented += 1;
       for (const f of n.fields ?? []) {
         total += 1;
-        if (f.description?.trim()) documented += 1;
+        // A deprecated field with a deprecationReason is treated as
+        // documented — the reason explains the field's purpose for
+        // coverage purposes.
+        if (f.description?.trim() || (f.isDeprecated && f.deprecationReason?.trim())) {
+          documented += 1;
+        }
       }
       for (const v of n.values ?? []) {
         total += 1;
-        if (v.description?.trim()) documented += 1;
+        if (v.description?.trim() || (v.isDeprecated && v.deprecationReason?.trim())) {
+          documented += 1;
+        }
       }
     }
     return total === 0 ? 1 : documented / total;
@@ -1046,7 +1061,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
   // under the type name in the header so the SDL descriptions
   // render inline. Layout has to re-run on toggle (node heights
   // change) — this is tracked via the layout effect's deps below.
-  const [showGraphDescriptions, setShowGraphDescriptions] = useState(false);
+  const [showGraphDescriptions, setShowGraphDescriptions] = useState(true);
   const currentLodRef = useRef<SpriteLOD>("full");
   const [lodTick, setLodTick] = useState(0);
   const [appReady, setAppReady] = useState(false);
@@ -1387,11 +1402,17 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         const rows = new Set<number>();
         const fields = n.fields ?? [];
         for (let i = 0; i < fields.length; i++) {
-          if (!fields[i]!.description?.trim()) rows.add(i);
+          const f = fields[i]!;
+          if (!f.description?.trim() && !(f.isDeprecated && f.deprecationReason?.trim())) {
+            rows.add(i);
+          }
         }
         const values = n.values ?? [];
         for (let i = 0; i < values.length; i++) {
-          if (!values[i]!.description?.trim()) rows.add(i);
+          const v = values[i]!;
+          if (!v.description?.trim() && !(v.isDeprecated && v.deprecationReason?.trim())) {
+            rows.add(i);
+          }
         }
         if (rows.size > 0) {
           rowsByNode.set(n.id, rows);
