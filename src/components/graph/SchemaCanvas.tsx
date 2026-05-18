@@ -1082,6 +1082,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     world: Container | null;
     edgeTileContainer: Container | null;
     arrowTileContainer: Container | null;
+    focusEdgeGraphics: Graphics | null;
     hoverEdgeGraphics: Graphics | null;
     nodeContainer: Container | null;
     investigateOverlay: Graphics | null;
@@ -1093,6 +1094,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     world: null,
     edgeTileContainer: null,
     arrowTileContainer: null,
+    focusEdgeGraphics: null,
     hoverEdgeGraphics: null,
     nodeContainer: null,
     investigateOverlay: null,
@@ -1431,10 +1433,10 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     // visually mirrors the old dashed-vs-solid contrast without
     // generating per-dash vertex spam in Pixi.
     const buckets: [LaidEdge[], string, number, number][] = [
-      [[], "#6366f1", 0x6366f1, 1],     // [0] non-null field — solid blue
-      [[], "#6366f1", 0x6366f1, 0.45],  // [1] nullable field — soft blue
+      [[], "#3b82f6", 0x3b82f6, 1],     // [0] non-null field — solid blue
+      [[], "#3b82f6", 0x3b82f6, 0.45],  // [1] nullable field — soft blue
       [[], "#eab308", 0xeab308, 1],     // [2] union member — solid amber
-      [[], "#64748b", 0x64748b, 0.55],  // [3] implements — soft gray
+      [[], "#8b5cf6", 0x8b5cf6, 0.55],  // [3] implements — soft violet
       [[], "#f97316", 0xf97316, 0.55],  // [4] arg — soft orange
     ];
     for (const e of laidEdges) {
@@ -2281,6 +2283,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
       const edgeTileContainer = new Container();
       const arrowTileContainer = new Container();
+      const focusEdgeGraphics = new Graphics();
       const hoverEdgeGraphics = new Graphics();
       const nodeContainer = new Container();
       nodeContainer.cullable = true;
@@ -2291,6 +2294,11 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
 
       world.addChild(edgeTileContainer);
       world.addChild(arrowTileContainer);
+      // Focused-edge bold stroke sits above the edge tiles so the
+      // selected line reads thicker than its neighbors. Hover overlay
+      // goes on top of focus so hovering still paints the brighter
+      // emphasis even when an edge is already focused.
+      world.addChild(focusEdgeGraphics);
       // Highlight is between edges and nodes — drawn on top of every
       // other edge in the tiles but covered by node cards, so the
       // emphasized line reads cleanly without spilling onto nodes.
@@ -2316,6 +2324,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         world,
         edgeTileContainer,
         arrowTileContainer,
+        focusEdgeGraphics,
         hoverEdgeGraphics,
         nodeContainer,
         investigateOverlay,
@@ -2975,6 +2984,7 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
         world: null,
         edgeTileContainer: null,
         arrowTileContainer: null,
+        focusEdgeGraphics: null,
         hoverEdgeGraphics: null,
         nodeContainer: null,
         investigateOverlay: null,
@@ -3325,12 +3335,12 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     if (!e) return;
     const color =
       e.kind === "implements"
-        ? 0x64748b
+        ? 0x8b5cf6
         : e.kind === "union"
           ? 0xeab308
           : e.kind === "arg"
             ? 0xf97316
-            : 0x6366f1;
+            : 0x3b82f6;
     g.moveTo(e.start.x, e.start.y);
     for (const seg of e.segments) {
       g.bezierCurveTo(seg.c1.x, seg.c1.y, seg.c2.x, seg.c2.y, seg.end.x, seg.end.y);
@@ -3340,6 +3350,34 @@ export function SchemaCanvas({ nodes, edges, focusId, rootId, onNavigate, onClea
     drawArrowHead(g, e);
     g.fill({ color, alpha: 1 });
   }, [hoveredEdgeInfo]);
+
+  // Bold stroke overlay for the currently-focused edge so the
+  // selected line stands out from the surrounding (dimmed) edges.
+  // Drawn beneath the hover overlay so hovering still wins the visual
+  // emphasis when both states apply to the same edge.
+  useEffect(() => {
+    const g = sceneRef.current.focusEdgeGraphics;
+    if (!g) return;
+    g.clear();
+    const e = focusedEdge;
+    if (!e) return;
+    const color =
+      e.kind === "implements"
+        ? 0x8b5cf6
+        : e.kind === "union"
+          ? 0xeab308
+          : e.kind === "arg"
+            ? 0xf97316
+            : 0x3b82f6;
+    g.moveTo(e.start.x, e.start.y);
+    for (const seg of e.segments) {
+      g.bezierCurveTo(seg.c1.x, seg.c1.y, seg.c2.x, seg.c2.y, seg.end.x, seg.end.y);
+    }
+    g.stroke({ width: 5, color, alpha: 1 });
+    g.beginPath();
+    drawArrowHead(g, e);
+    g.fill({ color, alpha: 1 });
+  }, [focusedEdge]);
 
   // FPS + timing overlay state
   const fpsOverlayRef = useRef<HTMLDivElement>(null);
